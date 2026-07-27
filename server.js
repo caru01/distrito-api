@@ -29,6 +29,14 @@ const pool = new Pool({
     rejectUnauthorized: false
   }
 });
+pool.connect()
+  .then(client => {
+    console.log('✅ Conectado a Neon correctamente');
+    client.release();
+  })
+  .catch(err => {
+    console.error('❌ Error conectando a Neon:', err);
+  });
 
 const FINAL_ORDER_STATUSES = new Set(['Entregado', 'Completado']);
 
@@ -166,8 +174,8 @@ async function createInventoryMovement(client, data) {
       (inventory_id, lot_id, branch_id, movement_type, quantity, unit_cost, balance_after, reference_type, reference_id, notes, created_by)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
     [data.inventoryId, data.lotId || null, data.branchId || 1, data.type, data.quantity, data.unitCost || 0,
-      data.balanceAfter ?? null, data.referenceType || null, data.referenceId ? String(data.referenceId) : null,
-      data.notes || null, data.createdBy || 'Administrador']
+    data.balanceAfter ?? null, data.referenceType || null, data.referenceId ? String(data.referenceId) : null,
+    data.notes || null, data.createdBy || 'Administrador']
   );
   return rows[0];
 }
@@ -261,7 +269,7 @@ pool.query = async function (text, params) {
       lastError = err;
       // Si el error es de sintaxis (código que empieza con 42), fallar de inmediato
       if (err.code && err.code.startsWith('42')) throw err;
-      
+
       console.warn(`[Neon DB] Intento ${i + 1}/${MAX_RETRIES} falló. Reintentando en ${1000 * (i + 1)}ms... Error: ${err.message}`);
       // Esperar 1 segundo en el primer intento, 2 en el segundo...
       await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
@@ -295,7 +303,7 @@ app.get('/api/pedidos/init', async (req, res) => {
 
     const { rows: products } = await pool.query("SELECT * FROM pedidos_app_products WHERE status = 'Activo' ORDER BY id DESC");
     const { rows: categories } = await pool.query("SELECT * FROM pedidos_app_categories WHERE status = 'Activa' ORDER BY id ASC");
-    
+
     // Asumimos que settings es solo una fila
     let settingsRow = { whatsapp_number: '', nequi_number: '', bancolombia_number: '' };
     try {
@@ -324,7 +332,7 @@ app.get('/api/pedidos/init', async (req, res) => {
   } catch (error) {
     console.error('Error fetching init data:', error);
     // Fallback a los datos de prueba si la tabla no existe (42P01)
-    if (error.code === '42P01') { 
+    if (error.code === '42P01') {
       return res.json({
         status: 'ok',
         products: seedProducts.map((p, i) => ({ id: i + 1, ...p })),
@@ -343,7 +351,7 @@ const isDateClosed = async (isoDate) => {
     const d = isoDate.split('T')[0];
     const res = await pool.query("SELECT id FROM pedidos_app_closures WHERE start_date <= $1 AND end_date >= $2 AND status = 'Cerrado'", [d, d]);
     return res.rows.length > 0;
-  } catch(e) { return false; }
+  } catch (e) { return false; }
 };
 
 app.post('/api/pedidos/checkout', async (req, res) => {
@@ -354,23 +362,23 @@ app.post('/api/pedidos/checkout', async (req, res) => {
     }
 
     const { customer, cart, total } = req.body;
-    
+
     // Si no hay DB, retornar un ID falso para que el frontend siga
     if (!process.env.DATABASE_URL) {
       return res.json({ status: 'ok', order_id: Math.floor(Math.random() * 1000) });
     }
-    
+
     let customDateStr = req.body.created_at || (customer && customer.created_at);
     let customDate = null;
     if (customDateStr) {
       if (customDateStr.length === 10) customDateStr += 'T12:00:00-05:00';
       customDate = new Date(customDateStr).toISOString();
     }
-    
+
     if (customDate && await isDateClosed(customDate)) {
       return res.status(403).json({ error: 'El período contable para esta fecha ya está cerrado.' });
     }
-    
+
     // Format phone to always start with 57
     let formattedPhone = customer.phone ? customer.phone.replace(/\D/g, '') : '';
     if (formattedPhone.length === 10) {
@@ -385,13 +393,13 @@ app.post('/api/pedidos/checkout', async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12, NOW())) 
        RETURNING id`,
       [
-        customer.name, 
-        formattedPhone, 
-        customer.address || '', 
-        customer.barrio || '', 
-        customer.deliveryType, 
-        customer.paymentMethod, 
-        total, 
+        customer.name,
+        formattedPhone,
+        customer.address || '',
+        customer.barrio || '',
+        customer.deliveryType,
+        customer.paymentMethod,
+        total,
         JSON.stringify(cart),
         req.body.source || customer.source || 'Web',
         customer.notes || '',
@@ -411,7 +419,7 @@ app.post('/api/pedidos/checkout', async (req, res) => {
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
-  
+
   if (!token) return res.status(401).json({ error: 'Acceso denegado' });
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
@@ -424,7 +432,7 @@ const authenticateToken = (req, res, next) => {
 app.post('/api/pedidos/admin/login', async (req, res) => {
   try {
     const { username, password } = req.body;
-    
+
     // Si no hay DB, mockear login para desarrollo local si la DB no está conectada
     if (!process.env.DATABASE_URL) {
       if (username === 'admin' && password === 'Distrito2026*') {
@@ -435,14 +443,14 @@ app.post('/api/pedidos/admin/login', async (req, res) => {
     }
 
     const { rows } = await pool.query('SELECT * FROM pedidos_app_users WHERE username = $1', [username]);
-    
+
     if (rows.length === 0) {
       return res.status(401).json({ error: 'Usuario no encontrado' });
     }
 
     const user = rows[0];
     const validPassword = await bcrypt.compare(password, user.password_hash);
-    
+
     if (!validPassword) {
       return res.status(401).json({ error: 'Contraseña incorrecta' });
     }
@@ -466,7 +474,7 @@ app.get('/api/pedidos/admin/categories', authenticateToken, async (req, res) => 
     if (!process.env.DATABASE_URL) {
       return res.json({ status: 'ok', categories: [] });
     }
-    
+
     // Obtener categorías y contar productos relacionados
     const { rows } = await pool.query(`
       SELECT c.id, c.name, c.description, c.image, c.status, COUNT(p.id) as products
@@ -475,7 +483,7 @@ app.get('/api/pedidos/admin/categories', authenticateToken, async (req, res) => 
       GROUP BY c.id
       ORDER BY c.id ASC
     `);
-    
+
     res.json({ status: 'ok', categories: rows });
   } catch (error) {
     console.error('Error fetching categories:', error);
@@ -544,12 +552,12 @@ app.put('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => 
     const { id } = req.params;
     const { status } = req.body;
     if (!status) return res.status(400).json({ status: 'error', error: 'El estado es requerido' });
-    
+
     const { rows } = await pool.query(
       'UPDATE pedidos_app_orders SET status = $1 WHERE id = $2 RETURNING *',
       [status, id]
     );
-    
+
     res.json({ status: 'ok', order: rows[0] });
   } catch (error) {
     console.error('Error updating order:', error);
@@ -562,7 +570,7 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
   try {
     const { id } = req.params;
     const { cart, total, customer } = req.body;
-    
+
     const cartStr = JSON.stringify(cart);
     let customDateStr = customer && customer.created_at;
     let customDate = null;
@@ -570,7 +578,7 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
       if (customDateStr.length === 10) customDateStr += 'T12:00:00-05:00';
       customDate = new Date(customDateStr).toISOString();
     }
-      
+
     if (customDate && await isDateClosed(customDate)) {
       return res.status(403).json({ error: 'El período contable para esta fecha ya está cerrado.' });
     }
@@ -686,15 +694,15 @@ app.put('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
     // Build dynamic UPDATE query
     const keys = Object.keys(data).filter(k => k !== 'id' && k !== 'updated_at');
     if (keys.length === 0) return res.json({ status: 'ok', message: 'No fields to update' });
-    
+
     const setString = keys.map((k, i) => `${k} = $${i + 1}`).join(', ');
     const values = keys.map(k => data[k]);
-    
+
     // Add updated_at manually if needed, or rely on schema default
-    
+
     const query = `UPDATE pedidos_app_settings SET ${setString} WHERE id = 1 RETURNING *`;
     const { rows } = await pool.query(query, values);
-    
+
     res.json({ status: 'ok', settings: rows[0] });
   } catch (error) {
     console.error('Error updating settings:', error);
@@ -704,7 +712,7 @@ app.put('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
 
 
 async function ensureRealInventorySchema(client) {
-    await client.query(`
+  await client.query(`
       CREATE TABLE IF NOT EXISTS pedidos_app_purchases (
         id SERIAL PRIMARY KEY,
         invoice_number VARCHAR(100),
@@ -1017,8 +1025,8 @@ app.post('/api/pedidos/admin/inventory', authenticateToken, async (req, res) => 
        (image, name, type, category, unit, min_stock, sku, purchase_unit, consumption_unit, conversion_factor, max_stock, status, observations)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
       [image || null, name.trim(), type || 'Ingrediente', category || 'General', consumption_unit || unit || 'Unidad',
-        Number(min_stock) || 0, automaticSku, purchase_unit || unit || 'Unidad', consumption_unit || unit || 'Unidad',
-        Number(conversion_factor) || 1, max_stock || null, status || 'Activo', observations || null]
+      Number(min_stock) || 0, automaticSku, purchase_unit || unit || 'Unidad', consumption_unit || unit || 'Unidad',
+      Number(conversion_factor) || 1, max_stock || null, status || 'Activo', observations || null]
     );
     await client.query('COMMIT');
     res.json({ status: 'ok', item: rows[0] });
@@ -1040,9 +1048,9 @@ app.put('/api/pedidos/admin/inventory/:id', authenticateToken, async (req, res) 
        SET image=$1, name=$2, type=$3, category=$4, unit=$5, min_stock=$6, sku=COALESCE(sku, $7), purchase_unit=$8,
            consumption_unit=$9, conversion_factor=$10, max_stock=$11, status=$12, observations=$13, updated_at=NOW()
        WHERE id=$14 RETURNING *`,
-       [image || null, name, type || 'Ingrediente', category || 'General', consumption_unit || unit || 'Unidad', Number(min_stock) || 0,
-        sku || null, purchase_unit || unit || 'Unidad', consumption_unit || unit || 'Unidad', Number(conversion_factor) || 1,
-        max_stock || null, status || 'Activo', observations || null, id]
+      [image || null, name, type || 'Ingrediente', category || 'General', consumption_unit || unit || 'Unidad', Number(min_stock) || 0,
+      sku || null, purchase_unit || unit || 'Unidad', consumption_unit || unit || 'Unidad', Number(conversion_factor) || 1,
+      max_stock || null, status || 'Activo', observations || null, id]
     );
     res.json({ status: 'ok', item: rows[0] });
   } catch (error) {
@@ -1068,7 +1076,7 @@ app.post('/api/pedidos/admin/inventory/:id/movement', authenticateToken, async (
     if (!['IN', 'OUT'].includes(movement_type) || !Number.isFinite(numericQuantity) || numericQuantity <= 0) {
       return res.status(400).json({ status: 'error', error: 'Solo se permiten ajustes positivos o negativos con una cantidad mayor a cero.' });
     }
-    
+
     // Iniciar transacción
     const client = await pool.connect();
     try {
@@ -1085,8 +1093,10 @@ app.post('/api/pedidos/admin/inventory/:id/movement', authenticateToken, async (
            VALUES ($1,$2,$3,$4,$3,$3,$5) RETURNING *`,
           [id, lotCode, numericQuantity, ingredients[0].consumption_unit || ingredients[0].unit, cost]
         );
-        await createInventoryMovement(client, { inventoryId: id, lotId: lots[0].id, type: 'Ajuste positivo', quantity: numericQuantity,
-          unitCost: cost, balanceAfter: numericQuantity, referenceType: 'Ajuste', notes, createdBy: req.user?.username });
+        await createInventoryMovement(client, {
+          inventoryId: id, lotId: lots[0].id, type: 'Ajuste positivo', quantity: numericQuantity,
+          unitCost: cost, balanceAfter: numericQuantity, referenceType: 'Ajuste', notes, createdBy: req.user?.username
+        });
       } else {
         let pending = numericQuantity;
         const { rows: lots } = await client.query(`
@@ -1097,8 +1107,10 @@ app.post('/api/pedidos/admin/inventory/:id/movement', authenticateToken, async (
           const used = Math.min(pending, Number(lot.available_quantity));
           const balance = Number(lot.available_quantity) - used;
           await client.query('UPDATE pedidos_app_inventory_lots SET available_quantity = $1, status = CASE WHEN $1 = 0 THEN \'Agotado\' ELSE \'Disponible\' END WHERE id = $2', [balance, lot.id]);
-          await createInventoryMovement(client, { inventoryId: id, lotId: lot.id, type: 'Ajuste negativo', quantity: -used,
-            unitCost: lot.unit_cost, balanceAfter: balance, referenceType: 'Ajuste', notes, createdBy: req.user?.username });
+          await createInventoryMovement(client, {
+            inventoryId: id, lotId: lot.id, type: 'Ajuste negativo', quantity: -used,
+            unitCost: lot.unit_cost, balanceAfter: balance, referenceType: 'Ajuste', notes, createdBy: req.user?.username
+          });
           pending -= used;
         }
         if (pending > 0) { const error = new Error('No hay existencia suficiente para el ajuste.'); error.statusCode = 409; throw error; }
@@ -1139,11 +1151,11 @@ app.get('/api/pedidos/admin/purchases', authenticateToken, async (req, res) => {
 app.post('/api/pedidos/admin/purchases', authenticateToken, async (req, res) => {
   const { invoice_number, supplier, purchase_date, total_amount, iva_amount, notes, items } = req.body;
   const client = await pool.connect();
-  
+
   try {
     await client.query('BEGIN');
     await ensureRealInventorySchema(client);
-    
+
     // 1. Crear compra
     const { rows: purchaseRows } = await client.query(
       `INSERT INTO pedidos_app_purchases (invoice_number, supplier, purchase_date, total_amount, iva_amount, notes) 
@@ -1153,45 +1165,45 @@ app.post('/api/pedidos/admin/purchases', authenticateToken, async (req, res) => 
     const purchase = purchaseRows[0];
 
     // 2. Procesar ítems
-      for (let index = 0; index < items.length; index++) {
-        const item = items[index];
-        if (!item.inventory_id || Number(item.quantity) <= 0 || Number(item.total_cost) < 0) {
-          const error = new Error('Cada compra debe tener ingrediente, cantidad y costo válidos.');
-          error.statusCode = 400;
-          throw error;
-        }
-        const { rows: ingredients } = await client.query(
-          'SELECT id, purchase_unit, consumption_unit, conversion_factor FROM pedidos_app_inventory WHERE id = $1 FOR UPDATE',
-          [item.inventory_id]
-        );
-        if (!ingredients.length) throw new Error(`Ingrediente #${item.inventory_id} no encontrado.`);
-        const ingredient = ingredients[0];
-        const factor = Number(item.conversion_factor || ingredient.conversion_factor || 1);
-        const usableQuantity = Number(item.usable_quantity || (Number(item.quantity) * factor));
-        if (!Number.isFinite(usableQuantity) || usableQuantity <= 0) throw new Error('El rendimiento útil debe ser mayor a cero.');
-        const totalWithTax = Number(item.total_cost) * (1 + Number(item.iva_amount || 0) / 100);
-        const unitCost = totalWithTax / usableQuantity;
-        const lotCode = item.lot_code || `${String(ingredient.sku || 'LOT').replace(/\s+/g, '-').toUpperCase()}-${String(purchase.purchase_date).replace(/-/g, '')}-${String(index + 1).padStart(3, '0')}`;
-        // Registrar detalle de compra
-        const { rows: purchaseItemRows } = await client.query(
-          `INSERT INTO pedidos_app_purchase_items (purchase_id, inventory_id, quantity, unit_cost, total_cost, iva_amount, lot_code, expiration_date)
+    for (let index = 0; index < items.length; index++) {
+      const item = items[index];
+      if (!item.inventory_id || Number(item.quantity) <= 0 || Number(item.total_cost) < 0) {
+        const error = new Error('Cada compra debe tener ingrediente, cantidad y costo válidos.');
+        error.statusCode = 400;
+        throw error;
+      }
+      const { rows: ingredients } = await client.query(
+        'SELECT id, purchase_unit, consumption_unit, conversion_factor FROM pedidos_app_inventory WHERE id = $1 FOR UPDATE',
+        [item.inventory_id]
+      );
+      if (!ingredients.length) throw new Error(`Ingrediente #${item.inventory_id} no encontrado.`);
+      const ingredient = ingredients[0];
+      const factor = Number(item.conversion_factor || ingredient.conversion_factor || 1);
+      const usableQuantity = Number(item.usable_quantity || (Number(item.quantity) * factor));
+      if (!Number.isFinite(usableQuantity) || usableQuantity <= 0) throw new Error('El rendimiento útil debe ser mayor a cero.');
+      const totalWithTax = Number(item.total_cost) * (1 + Number(item.iva_amount || 0) / 100);
+      const unitCost = totalWithTax / usableQuantity;
+      const lotCode = item.lot_code || `${String(ingredient.sku || 'LOT').replace(/\s+/g, '-').toUpperCase()}-${String(purchase.purchase_date).replace(/-/g, '')}-${String(index + 1).padStart(3, '0')}`;
+      // Registrar detalle de compra
+      const { rows: purchaseItemRows } = await client.query(
+        `INSERT INTO pedidos_app_purchase_items (purchase_id, inventory_id, quantity, unit_cost, total_cost, iva_amount, lot_code, expiration_date)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-          [purchase.id, item.inventory_id, item.quantity, item.unit_cost, item.total_cost, item.iva_amount || 0, lotCode, item.expiration_date || null]
-        );
-        const purchaseItemId = purchaseItemRows[0]?.id;
-        const { rows: lotRows } = await client.query(
-          `INSERT INTO pedidos_app_inventory_lots
+        [purchase.id, item.inventory_id, item.quantity, item.unit_cost, item.total_cost, item.iva_amount || 0, lotCode, item.expiration_date || null]
+      );
+      const purchaseItemId = purchaseItemRows[0]?.id;
+      const { rows: lotRows } = await client.query(
+        `INSERT INTO pedidos_app_inventory_lots
            (inventory_id, purchase_item_id, lot_code, source_quantity, source_unit, initial_quantity, available_quantity, unit_cost, expiration_date)
            VALUES ($1,$2,$3,$4,$5,$6,$6,$7,$8) RETURNING *`,
-          [item.inventory_id, purchaseItemId || null, lotCode, item.quantity, ingredient.purchase_unit || item.unit,
-            usableQuantity, unitCost, item.expiration_date || null]
-        );
-        await createInventoryMovement(client, {
-          inventoryId: item.inventory_id, lotId: lotRows[0].id, type: 'Compra', quantity: usableQuantity,
-          unitCost, balanceAfter: usableQuantity, referenceType: 'Compra', referenceId: purchase.id,
-          notes: `Compra: ${invoice_number || 'S/N'} · Lote ${lotCode}`, createdBy: req.user?.username
-        });
-      }
+        [item.inventory_id, purchaseItemId || null, lotCode, item.quantity, ingredient.purchase_unit || item.unit,
+          usableQuantity, unitCost, item.expiration_date || null]
+      );
+      await createInventoryMovement(client, {
+        inventoryId: item.inventory_id, lotId: lotRows[0].id, type: 'Compra', quantity: usableQuantity,
+        unitCost, balanceAfter: usableQuantity, referenceType: 'Compra', referenceId: purchase.id,
+        notes: `Compra: ${invoice_number || 'S/N'} · Lote ${lotCode}`, createdBy: req.user?.username
+      });
+    }
 
     await client.query('COMMIT');
     res.json({ status: 'ok', purchase });
@@ -1291,7 +1303,7 @@ app.post('/api/pedidos/rate', async (req, res) => {
   if (!product_id || !rating || rating < 1 || rating > 5) {
     return res.status(400).json({ status: 'error', error: 'Calificación inválida' });
   }
-  
+
   try {
     const result = await pool.query(
       `UPDATE pedidos_app_products 
@@ -1299,11 +1311,11 @@ app.post('/api/pedidos/rate', async (req, res) => {
        WHERE id = $2 RETURNING *`,
       [rating, product_id]
     );
-    
+
     if (result.rows.length === 0) {
       return res.status(404).json({ status: 'error', error: 'Producto no encontrado' });
     }
-    
+
     res.json({ status: 'ok', product: result.rows[0] });
   } catch (error) {
     res.status(500).json({ status: 'error', error: error.message });
@@ -1334,9 +1346,9 @@ app.post('/api/pedidos/admin/push/send', authenticateToken, async (req, res) => 
   try {
     const { title, message, url } = req.body;
     const { rows } = await pool.query('SELECT subscription_json FROM pedidos_app_push_subscriptions');
-    
+
     const payload = JSON.stringify({ title, body: message, url: url || '/' });
-    
+
     const promises = rows.map(async (row) => {
       const sub = typeof row.subscription_json === 'string' ? JSON.parse(row.subscription_json) : row.subscription_json;
       try {
@@ -1347,7 +1359,7 @@ app.post('/api/pedidos/admin/push/send', authenticateToken, async (req, res) => 
         }
       }
     });
-    
+
     await Promise.all(promises);
     res.json({ status: 'ok', sent: rows.length });
   } catch (err) {
@@ -1449,11 +1461,11 @@ app.get('/api/pedidos/admin/recipes/:productId', authenticateToken, async (req, 
 app.post('/api/pedidos/admin/recipes', authenticateToken, async (req, res) => {
   try {
     const { product_id, rendimiento_id, cantidad_usada } = req.body;
-    
+
     // Obtener costo por unidad del rendimiento
     const renRes = await pool.query('SELECT costo_por_unidad FROM pedidos_app_rendimientos WHERE id = $1', [rendimiento_id]);
     if (renRes.rowCount === 0) return res.status(404).json({ error: 'Rendimiento no encontrado' });
-    
+
     const costo_por_unidad = Number(renRes.rows[0].costo_por_unidad);
     const costo_calculado = costo_por_unidad * Number(cantidad_usada);
 
@@ -1490,12 +1502,12 @@ app.get('/api/pedidos/admin/rendimientos', authenticateToken, async (req, res) =
 app.post('/api/pedidos/admin/rendimientos', authenticateToken, async (req, res) => {
   try {
     const { ingrediente_id, ingrediente_name, unidad_compra, cantidad_comprada, costo_compra, unidad_consumo, conversion_definida } = req.body;
-    
+
     // Automatic yield calculation based on conversion rule
     const rendimiento_obtenido = Number(cantidad_comprada) * Number(conversion_definida);
     const costo_por_unidad = Number(costo_compra) / rendimiento_obtenido;
     const created_by = 'Administrador'; // Default since user auth roles aren't strictly complex yet
-    
+
     const { rows } = await pool.query(
       `INSERT INTO pedidos_app_rendimientos 
       (ingrediente_id, ingrediente_name, unidad_compra, cantidad_comprada, costo_compra, unidad_consumo, conversion_definida, rendimiento_obtenido, costo_por_unidad, created_by) 
@@ -1532,7 +1544,7 @@ app.get('/api/pedidos/admin/reports', authenticateToken, async (req, res) => {
     }
 
     const { rows: orders } = await pool.query(ordersQuery, params);
-    
+
     // Purchases also filtered
     let purchasesQuery = "SELECT total_amount FROM pedidos_app_purchases";
     let pParams = [];
@@ -1553,23 +1565,23 @@ app.get('/api/pedidos/admin/reports', authenticateToken, async (req, res) => {
 
     orders.forEach(order => {
       totalVentas += order.total || 0;
-        const name = (order.customer_name || 'Cliente sin nombre').trim();
-        const phone = (order.customer_phone || '').trim();
-        const clientKey = `${name.toLowerCase()}-${phone}`;
-        
-        clientesUnicos.add(clientKey);
+      const name = (order.customer_name || 'Cliente sin nombre').trim();
+      const phone = (order.customer_phone || '').trim();
+      const clientKey = `${name.toLowerCase()}-${phone}`;
 
-        if (!topClientes[clientKey]) {
-          topClientes[clientKey] = { name: name, phone: phone, total: 0, count: 0, products: {}, orderHistory: [] };
-        }
-        topClientes[clientKey].total += order.total || 0;
-        topClientes[clientKey].count += 1;
-        topClientes[clientKey].orderHistory.push({
-          date: order.created_at,
-          total: order.total || 0,
-          cart: order.cart_json || []
-        });
-      
+      clientesUnicos.add(clientKey);
+
+      if (!topClientes[clientKey]) {
+        topClientes[clientKey] = { name: name, phone: phone, total: 0, count: 0, products: {}, orderHistory: [] };
+      }
+      topClientes[clientKey].total += order.total || 0;
+      topClientes[clientKey].count += 1;
+      topClientes[clientKey].orderHistory.push({
+        date: order.created_at,
+        total: order.total || 0,
+        cart: order.cart_json || []
+      });
+
       const dateStr = new Date(order.created_at).toLocaleDateString();
       ventasPorFecha[dateStr] = (ventasPorFecha[dateStr] || 0) + (order.total || 0);
 
@@ -1699,7 +1711,7 @@ app.get('/api/pedidos/admin/closures/preview', authenticateToken, async (req, re
 
     orders.forEach(o => {
       totalVentas += Number(o.total || 0);
-      
+
       const pm = o.payment_method || 'efectivo';
       metodosPago[pm] = (metodosPago[pm] || 0) + Number(o.total || 0);
 
@@ -1714,14 +1726,14 @@ app.get('/api/pedidos/admin/closures/preview', authenticateToken, async (req, re
     // 2. Costos de Producción (Basado en recetas de productos vendidos)
     let totalCostoProduccion = 0;
     let desgloseCostos = {}; // Ingrediente -> Costo
-    
+
     // Traer todas las recetas
     const recipesRes = await pool.query(`
       SELECT r.product_id, r.cantidad_usada, r.costo_calculado, ren.ingrediente_name 
       FROM pedidos_app_recipes r
       JOIN pedidos_app_rendimientos ren ON r.rendimiento_id = ren.id
     `);
-    
+
     recipesRes.rows.forEach(recipe => {
       const qSold = productosVendidos[recipe.product_id] || 0;
       if (qSold > 0) {
