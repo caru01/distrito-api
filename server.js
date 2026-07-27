@@ -8,14 +8,38 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const webpush = require('web-push');
 
-const publicVapidKey = 'BBCJtzBn22IJcujyWlCCwtSAyWLfsiELTqWAjQcEiOuPX0yiad9P5LIpMJv5T8VwkHJU0vxLHTqFYImzLYWBQyU';
-const privateVapidKey = 'Sn-oYBv_LJxdaKVe3S7GEdlKGuT9n50SifBdNpDPpxs';
-webpush.setVapidDetails('mailto:soporte@distrito.com', publicVapidKey, privateVapidKey);
+const publicVapidKey = process.env.VAPID_PUBLIC_KEY || 'BBCJtzBn22IJcujyWlCCwtSAyWLfsiELTqWAjQcEiOuPX0yiad9P5LIpMJv5T8VwkHJU0vxLHTqFYImzLYWBQyU';
+const privateVapidKey = process.env.VAPID_PRIVATE_KEY || 'Sn-oYBv_LJxdaKVe3S7GEdlKGuT9n50SifBdNpDPpxs';
+const vapidEmail = process.env.VAPID_EMAIL || 'mailto:soporte@distrito.com';
+webpush.setVapidDetails(vapidEmail, publicVapidKey, privateVapidKey);
 
-const JWT_SECRET = process.env.JWT_SECRET || 'distrito_super_secret_2026';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('❌ FATAL: JWT_SECRET no está definida en las variables de entorno. El servidor no puede iniciar de forma segura.');
+  process.exit(1);
+}
 
 const app = express();
-app.use(cors());
+
+// Restringir CORS a dominios conocidos
+const allowedOrigins = [
+  'https://distrito-web.vercel.app',
+  'https://distrito-admin.vercel.app',
+  /\.vercel\.app$/,          // Cualquier preview de Vercel
+  /^http:\/\/localhost/,      // Desarrollo local
+];
+app.use(cors({
+  origin: (origin, callback) => {
+    // Permitir peticiones sin origin (Postman, Render health checks)
+    if (!origin) return callback(null, true);
+    const allowed = allowedOrigins.some(o =>
+      typeof o === 'string' ? o === origin : o.test(origin)
+    );
+    if (allowed) return callback(null, true);
+    return callback(new Error(`CORS: Origen no permitido: ${origin}`));
+  },
+  credentials: true,
+}));
 app.use(express.json({ limit: '50mb' }));
 
 let getHorariosStatus = async () => ({ isOpen: true }); // Fallback before initialized
