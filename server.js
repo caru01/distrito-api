@@ -23,10 +23,13 @@ const app = express();
 
 // Restringir CORS a dominios conocidos
 const allowedOrigins = [
-  'https://distrito-web.vercel.app',
+  'https://distritobg.app',          // Web principal
+  'https://admin.distritobg.app',    // Panel admin
+  'https://www.distritobg.app',      // Por si usan www
+  'https://distrito-web.vercel.app', // Vercel (fallback)
   'https://distrito-admin.vercel.app',
-  /\.vercel\.app$/,          // Cualquier preview de Vercel
-  /^http:\/\/localhost/,      // Desarrollo local
+  /\.vercel\.app$/,                  // Previews de Vercel
+  /^http:\/\/localhost/,             // Desarrollo local
 ];
 app.use(cors({
   origin: (origin, callback) => {
