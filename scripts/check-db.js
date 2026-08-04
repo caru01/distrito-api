@@ -1,5 +1,5 @@
-const { Pool } = require('pg');
-const pool = new Pool({ connectionString: 'postgres://neondb_owner:n8WqR9DkLIGv@ep-rapid-math-a54lssn6.us-east-2.aws.neon.tech/neondb?sslmode=require' });
+const { createPool } = require('../src/db');
+const pool = createPool({ max: 1 });
 async function check() {
   const { rows } = await pool.query(`SELECT data_type FROM information_schema.columns WHERE table_name = 'pedidos_app_inventory' AND column_name = 'id'`);
   console.log(rows);

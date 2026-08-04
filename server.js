@@ -2,15 +2,29 @@ console.log('🚀 Starting backend server...');
 
 const express = require('express');
 const cors = require('cors');
-require('dotenv').config();
-const { Pool } = require('pg');
+const compression = require('compression');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const webpush = require('web-push');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const { createPool, getDatabaseUrl } = require('./src/db');
+const { getDashboardSnapshot } = require('./src/dashboard');
+const { authorizeTrackingAccess, issueTrackingToken, isFinalOrder } = require('./src/tracking');
+const {
+  CARRYING_DELIVERY_STATUSES,
+  DEFAULT_MAX_ACTIVE_ORDERS,
+  DELIVERY_ROLES,
+  normalizeMaxActiveOrders,
+} = require('./src/delivery-rules');
 
-const publicVapidKey = process.env.VAPID_PUBLIC_KEY || 'BBCJtzBn22IJcujyWlCCwtSAyWLfsiELTqWAjQcEiOuPX0yiad9P5LIpMJv5T8VwkHJU0vxLHTqFYImzLYWBQyU';
-const privateVapidKey = process.env.VAPID_PRIVATE_KEY || 'Sn-oYBv_LJxdaKVe3S7GEdlKGuT9n50SifBdNpDPpxs';
+const publicVapidKey = process.env.VAPID_PUBLIC_KEY;
+const privateVapidKey = process.env.VAPID_PRIVATE_KEY;
 const vapidEmail = process.env.VAPID_EMAIL || 'mailto:soporte@distrito.com';
+if (!publicVapidKey || !privateVapidKey) {
+  console.error('❌ FATAL: las claves VAPID no están configuradas.');
+  process.exit(1);
+}
 webpush.setVapidDetails(vapidEmail, publicVapidKey, privateVapidKey);
 
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -20,11 +34,18 @@ if (!JWT_SECRET) {
 }
 
 const app = express();
+app.set('trust proxy', 1);
 
 // Restringir CORS a dominios conocidos
+const configuredOrigins = (process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
 const allowedOrigins = [
+  ...configuredOrigins,
   'https://distritobg.app',          // Web principal
   'https://admin.distritobg.app',    // Panel admin
+  'https://delivery.distritobg.app', // PWA domiciliarios
   'https://www.distritobg.app',      // Por si usan www
   'https://distrito-web.vercel.app', // Vercel (fallback)
   'https://distrito-admin.vercel.app',
@@ -43,19 +64,45 @@ app.use(cors({
   },
   credentials: true,
 }));
-app.use(express.json({ limit: '50mb' }));
+app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(compression());
+app.use(express.json({ limit: '25mb' }));
 
-let getHorariosStatus = async () => ({ isOpen: true }); // Fallback before initialized
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
-
-const dbUrl = process.env.DATABASE_URL || process.env.VITE_NEON_URL;
-
-const pool = new Pool({
-  connectionString: dbUrl,
-  ssl: {
-    rejectUnauthorized: false
-  }
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 15,
+  message: { error: 'Demasiadas solicitudes, intente de nuevo en 15 minutos.' }
 });
+
+const checkoutLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  message: { error: 'Demasiados intentos de pedido. Intente nuevamente en un minuto.' }
+});
+
+const inventoryLookupLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  message: { error: 'Límite de consultas de código de barras alcanzado. Intente en un minuto.' }
+});
+
+const trackingLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  message: { error: 'Demasiadas consultas de seguimiento. Intente nuevamente en un minuto.' }
+});
+
+const ACCESS_TOKEN_TTL = '15m';
+const REFRESH_TOKEN_TTL = '7d';
+const MAX_DEVICE_SESSIONS = 3;
+const DEFAULT_IDLE_MINUTES = 60;
+const MIN_PASSWORD_LENGTH = 10;
+
+let getHorariosStatus = async () => ({ isOpen: false, statusText: 'No disponible' });
+app.use(express.urlencoded({ limit: '25mb', extended: true }));
+
+const dbUrl = getDatabaseUrl();
+const pool = createPool();
 pool.connect()
   .then(client => {
     console.log('✅ Conectado a Neon correctamente');
@@ -65,110 +112,53 @@ pool.connect()
     console.error('❌ Error conectando a Neon:', err);
   });
 
+app.get('/api/pedidos/health', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT current_database() AS database,
+             (SELECT COUNT(*)::int FROM pedidos_app_schema_migrations) AS migrations
+    `);
+    res.json({ status: 'ok', database: rows[0].database, migrations: rows[0].migrations });
+  } catch (error) {
+    res.status(503).json({ status: 'error', error: 'Base de datos no disponible' });
+  }
+});
+
 const FINAL_ORDER_STATUSES = new Set(['Entregado', 'Completado']);
+const ORDER_STATUSES = new Set([
+  'Nuevo',
+  'En preparación',
+  'Listo',
+  'En camino',
+  'Entregado',
+  'Pendiente Pago',
+  'Cancelado',
+  'Completado',
+]);
+let deliveryRealtime = { publish: () => {}, sendPush: async () => {} };
 
-// El inventario se controla por movimientos y lotes. `stock` se conserva solo
-// por compatibilidad con pantallas antiguas; nunca es la fuente de verdad.
-async function ensureRealInventorySchema(client) {
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS pedidos_app_purchases (
-      id SERIAL PRIMARY KEY,
-      invoice_number VARCHAR(100),
-      supplier VARCHAR(255),
-      purchase_date DATE NOT NULL DEFAULT CURRENT_DATE,
-      total_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
-      iva_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
-      notes TEXT,
-      created_at TIMESTAMP NOT NULL DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS pedidos_app_purchase_items (
-      id SERIAL PRIMARY KEY,
-      purchase_id INTEGER NOT NULL REFERENCES pedidos_app_purchases(id) ON DELETE RESTRICT,
-      inventory_id INTEGER NOT NULL REFERENCES pedidos_app_inventory(id) ON DELETE RESTRICT,
-      quantity NUMERIC(14,4) NOT NULL,
-      unit_cost NUMERIC(14,4) NOT NULL,
-      total_cost NUMERIC(14,2) NOT NULL,
-      iva_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
-      lot_code VARCHAR(100),
-      expiration_date DATE
-    );
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS sku VARCHAR(100);
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS purchase_unit VARCHAR(50);
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS consumption_unit VARCHAR(50);
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS conversion_factor NUMERIC(14,4) DEFAULT 1;
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS max_stock NUMERIC(14,4);
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'Activo';
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS observations TEXT;
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS branch_id INTEGER DEFAULT 1;
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS unit VARCHAR(50);
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS image TEXT;
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS type VARCHAR(50) DEFAULT 'Ingrediente';
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS expiry_date DATE;
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS supplier VARCHAR(255);
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS min_stock NUMERIC(14,4) DEFAULT 0;
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS stock NUMERIC(14,4) DEFAULT 0;
-    ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS unit_cost NUMERIC(14,4) DEFAULT 0;
-    ALTER TABLE pedidos_app_purchase_items ADD COLUMN IF NOT EXISTS lot_code VARCHAR(100);
-    ALTER TABLE pedidos_app_purchase_items ADD COLUMN IF NOT EXISTS expiration_date DATE;
+function normalizeDeliveryLocation(customer = {}) {
+  const rawLatitude = customer.latitude ?? customer.deliveryLatitude;
+  const rawLongitude = customer.longitude ?? customer.deliveryLongitude;
+  const hasLatitude = rawLatitude !== '' && rawLatitude !== null && rawLatitude !== undefined;
+  const hasLongitude = rawLongitude !== '' && rawLongitude !== null && rawLongitude !== undefined;
 
-    CREATE TABLE IF NOT EXISTS pedidos_app_inventory_lots (
-      id BIGSERIAL PRIMARY KEY,
-      inventory_id INTEGER NOT NULL REFERENCES pedidos_app_inventory(id) ON DELETE RESTRICT,
-      purchase_item_id INTEGER,
-      branch_id INTEGER NOT NULL DEFAULT 1,
-      lot_code VARCHAR(100) NOT NULL,
-      source_quantity NUMERIC(14,4) NOT NULL,
-      source_unit VARCHAR(50),
-      initial_quantity NUMERIC(14,4) NOT NULL CHECK (initial_quantity > 0),
-      available_quantity NUMERIC(14,4) NOT NULL CHECK (available_quantity >= 0),
-      unit_cost NUMERIC(14,4) NOT NULL CHECK (unit_cost >= 0),
-      expiration_date DATE,
-      status VARCHAR(20) NOT NULL DEFAULT 'Disponible',
-      created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-      UNIQUE (branch_id, lot_code)
-    );
+  if (hasLatitude !== hasLongitude) {
+    const error = new Error('La latitud y longitud de entrega deben enviarse juntas.');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!hasLatitude) return { latitude: null, longitude: null };
 
-    CREATE TABLE IF NOT EXISTS pedidos_app_inventory_movements (
-      id BIGSERIAL PRIMARY KEY,
-      inventory_id INTEGER NOT NULL REFERENCES pedidos_app_inventory(id) ON DELETE RESTRICT,
-      lot_id BIGINT REFERENCES pedidos_app_inventory_lots(id) ON DELETE RESTRICT,
-      branch_id INTEGER NOT NULL DEFAULT 1,
-      movement_type VARCHAR(30) NOT NULL,
-      quantity NUMERIC(14,4) NOT NULL,
-      unit_cost NUMERIC(14,4) NOT NULL DEFAULT 0,
-      balance_after NUMERIC(14,4),
-      reference_type VARCHAR(30),
-      reference_id VARCHAR(100),
-      notes TEXT,
-      created_by VARCHAR(100) DEFAULT 'Administrador',
-      created_at TIMESTAMP NOT NULL DEFAULT NOW()
-    );
-    ALTER TABLE pedidos_app_inventory_movements ADD COLUMN IF NOT EXISTS lot_id BIGINT;
-    ALTER TABLE pedidos_app_inventory_movements ADD COLUMN IF NOT EXISTS branch_id INTEGER DEFAULT 1;
-    ALTER TABLE pedidos_app_inventory_movements ADD COLUMN IF NOT EXISTS unit_cost NUMERIC(14,4) DEFAULT 0;
-    ALTER TABLE pedidos_app_inventory_movements ADD COLUMN IF NOT EXISTS balance_after NUMERIC(14,4);
-    ALTER TABLE pedidos_app_inventory_movements ADD COLUMN IF NOT EXISTS reference_type VARCHAR(30);
-    ALTER TABLE pedidos_app_inventory_movements ADD COLUMN IF NOT EXISTS reference_id VARCHAR(100);
-    ALTER TABLE pedidos_app_inventory_movements ADD COLUMN IF NOT EXISTS created_by VARCHAR(100) DEFAULT 'Administrador';
-
-    CREATE TABLE IF NOT EXISTS pedidos_app_order_inventory_consumptions (
-      id BIGSERIAL PRIMARY KEY,
-      order_id INTEGER NOT NULL REFERENCES pedidos_app_orders(id) ON DELETE RESTRICT,
-      recipe_id INTEGER,
-      inventory_id INTEGER NOT NULL REFERENCES pedidos_app_inventory(id) ON DELETE RESTRICT,
-      lot_id BIGINT NOT NULL REFERENCES pedidos_app_inventory_lots(id) ON DELETE RESTRICT,
-      movement_id BIGINT REFERENCES pedidos_app_inventory_movements(id) ON DELETE RESTRICT,
-      quantity NUMERIC(14,4) NOT NULL CHECK (quantity > 0),
-      unit_cost NUMERIC(14,4) NOT NULL,
-      reversed_at TIMESTAMP,
-      created_at TIMESTAMP NOT NULL DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_inventory_lots_fifo ON pedidos_app_inventory_lots (inventory_id, branch_id, created_at, id) WHERE available_quantity > 0;
-    CREATE INDEX IF NOT EXISTS idx_inventory_movements_item ON pedidos_app_inventory_movements (inventory_id, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_order_consumptions_order ON pedidos_app_order_inventory_consumptions (order_id);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_inventory_sku_unique ON pedidos_app_inventory (sku) WHERE sku IS NOT NULL;
-  `);
+  const latitude = Number(rawLatitude);
+  const longitude = Number(rawLongitude);
+  if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90
+      || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+    const error = new Error('Las coordenadas de entrega no son válidas.');
+    error.statusCode = 400;
+    throw error;
+  }
+  return { latitude, longitude };
 }
 
 async function getInventoryAvailability(client, inventoryId, branchId = 1) {
@@ -207,83 +197,6 @@ async function createInventoryMovement(client, data) {
   return rows[0];
 }
 
-async function consumeOrderInventoryFIFO(client, order, createdBy = 'Administrador') {
-  const cart = Array.isArray(order.cart_json) ? order.cart_json : JSON.parse(order.cart_json || '[]');
-  for (const cartItem of cart) {
-    const productId = cartItem.id || cartItem.product_id;
-    const productQuantity = Number(cartItem.quantity || cartItem.qty || 1);
-    if (!productId || productQuantity <= 0) continue;
-
-    const { rows: recipeItems } = await client.query(`
-      SELECT r.id AS recipe_id, r.cantidad_usada, ren.ingrediente_id
-      FROM pedidos_app_recipes r
-      JOIN pedidos_app_rendimientos ren ON ren.id = r.rendimiento_id
-      WHERE r.product_id::text = $1 AND ren.ingrediente_id IS NOT NULL
-    `, [String(productId)]);
-
-    for (const recipeItem of recipeItems) {
-      let pending = Number(recipeItem.cantidad_usada) * productQuantity;
-      const { rows: lots } = await client.query(`
-        SELECT * FROM pedidos_app_inventory_lots
-        WHERE inventory_id = $1 AND branch_id = 1 AND status = 'Disponible' AND available_quantity > 0
-        ORDER BY created_at ASC, id ASC FOR UPDATE
-      `, [recipeItem.ingrediente_id]);
-
-      for (const lot of lots) {
-        if (pending <= 0) break;
-        const consumed = Math.min(pending, Number(lot.available_quantity));
-        const balance = Number(lot.available_quantity) - consumed;
-        await client.query(
-          `UPDATE pedidos_app_inventory_lots
-           SET available_quantity = $1, status = CASE WHEN $1 = 0 THEN 'Agotado' ELSE 'Disponible' END
-           WHERE id = $2`,
-          [balance, lot.id]
-        );
-        const movement = await createInventoryMovement(client, {
-          inventoryId: recipeItem.ingrediente_id, lotId: lot.id, type: 'Venta', quantity: -consumed,
-          unitCost: lot.unit_cost, balanceAfter: balance, referenceType: 'Pedido', referenceId: order.id,
-          notes: `Consumo FIFO del pedido #${order.id}`, createdBy
-        });
-        await client.query(
-          `INSERT INTO pedidos_app_order_inventory_consumptions
-           (order_id, recipe_id, inventory_id, lot_id, movement_id, quantity, unit_cost)
-           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-          [order.id, recipeItem.recipe_id, recipeItem.ingrediente_id, lot.id, movement.id, consumed, lot.unit_cost]
-        );
-        pending -= consumed;
-      }
-      if (pending > 0) {
-        const error = new Error(`Inventario insuficiente para el ingrediente #${recipeItem.ingrediente_id}. Faltan ${pending} unidades.`);
-        error.statusCode = 409;
-        throw error;
-      }
-    }
-  }
-}
-
-async function reverseOrderInventory(client, orderId, createdBy = 'Administrador') {
-  const { rows: consumptions } = await client.query(`
-    SELECT c.*, l.available_quantity
-    FROM pedidos_app_order_inventory_consumptions c
-    JOIN pedidos_app_inventory_lots l ON l.id = c.lot_id
-    WHERE c.order_id = $1 AND c.reversed_at IS NULL
-    ORDER BY c.id ASC FOR UPDATE OF l, c
-  `, [orderId]);
-  for (const consumption of consumptions) {
-    const balance = Number(consumption.available_quantity) + Number(consumption.quantity);
-    await client.query(
-      `UPDATE pedidos_app_inventory_lots SET available_quantity = $1, status = 'Disponible' WHERE id = $2`,
-      [balance, consumption.lot_id]
-    );
-    await createInventoryMovement(client, {
-      inventoryId: consumption.inventory_id, lotId: consumption.lot_id, type: 'Devolución', quantity: consumption.quantity,
-      unitCost: consumption.unit_cost, balanceAfter: balance, referenceType: 'Pedido', referenceId: orderId,
-      notes: `Reverso del pedido #${orderId}`, createdBy
-    });
-    await client.query('UPDATE pedidos_app_order_inventory_consumptions SET reversed_at = NOW() WHERE id = $1', [consumption.id]);
-  }
-}
-
 // Wrapper de reconexión automática para manejar el "Cold Start" de Neon
 const originalQuery = pool.query.bind(pool);
 pool.query = async function (text, params) {
@@ -316,6 +229,183 @@ const seedProducts = [
   { title: 'Cheesecake de Frutos Rojos', description: 'Suave tarta de queso con base de galleta y coulis de frutos rojos.', price: 12000, category: 'postres', image: 'https://images.unsplash.com/photo-1533134242443-d4fd215305ad?auto=format&fit=crop&q=80&w=500' }
 ];
 
+function absoluteApiUrl(req, path) {
+  return `${req.protocol}://${req.get('host')}/api/pedidos${path}`;
+}
+
+function productForResponse(req, product) {
+  if (!product) return product;
+  const { has_image: hasImage, ...data } = product;
+  if (hasImage || data.image) {
+    const version = data.updated_at ? new Date(data.updated_at).getTime() : '';
+    data.image = `${absoluteApiUrl(req, `/media/products/${data.id}`)}${version ? `?v=${version}` : ''}`;
+  }
+  return data;
+}
+
+function announcementForResponse(req, announcement) {
+  if (!announcement) return announcement;
+  const { has_image: hasImage, ...data } = announcement;
+  const now = Date.now();
+  const startsAt = data.starts_at ? new Date(data.starts_at).getTime() : null;
+  const endsAt = data.ends_at ? new Date(data.ends_at).getTime() : null;
+  data.is_visible = Boolean(data.is_active)
+    && (!startsAt || startsAt <= now)
+    && (!endsAt || endsAt >= now);
+  if (hasImage || data.image_url) {
+    const version = data.updated_at ? new Date(data.updated_at).getTime() : '';
+    data.image_url = `${absoluteApiUrl(req, `/media/announcements/${data.id}`)}${version ? `?v=${version}` : ''}`;
+  }
+  return data;
+}
+
+function settingsForResponse(req, settings) {
+  if (!settings) return settings;
+  const data = { ...settings };
+  if (data.logo) {
+    const version = data.updated_at ? new Date(data.updated_at).getTime() : '';
+    data.logo = `${absoluteApiUrl(req, '/media/settings-logo')}${version ? `?v=${version}` : ''}`;
+  }
+  return data;
+}
+
+function isManagedMediaUrl(value, resource, id) {
+  return typeof value === 'string' && value.includes(`/api/pedidos/media/${resource}/${id}`);
+}
+
+function sendStoredMedia(res, value) {
+  if (!value) return res.status(404).end();
+  res.set('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
+  if (/^https?:\/\//i.test(value)) return res.redirect(302, value);
+
+  const match = /^data:([^;,]+);base64,(.+)$/s.exec(value);
+  if (!match) return res.status(415).json({ error: 'Formato de imagen no compatible' });
+
+  const buffer = Buffer.from(match[2], 'base64');
+  res.set('Content-Type', match[1]);
+  return res.send(buffer);
+}
+
+async function normalizeOrderCart(client, rawCart, { activeOnly = true } = {}) {
+  if (!Array.isArray(rawCart) || rawCart.length === 0 || rawCart.length > 100) {
+    const error = new Error('El pedido debe contener entre 1 y 100 productos.');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const ids = [...new Set(rawCart.map((item) => String(item.id || item.product_id || '')).filter(Boolean))];
+  const { rows } = await client.query(
+    `SELECT id, title, price, category, stock, track_stock
+     FROM pedidos_app_products
+     WHERE id::text = ANY($1::text[]) AND ($2::boolean = FALSE OR status = 'Activo')`,
+    [ids, activeOnly]
+  );
+  const products = new Map(rows.map((product) => [String(product.id), product]));
+
+  const cart = rawCart.map((item) => {
+    const id = String(item.id || item.product_id || '');
+    const product = products.get(id);
+    const quantity = Number(item.quantity || item.qty || 1);
+    if (!product || !Number.isInteger(quantity) || quantity < 1 || quantity > 50) {
+      const error = new Error('El carrito contiene un producto o cantidad inválida.');
+      error.statusCode = 400;
+      throw error;
+    }
+    return {
+      id: product.id,
+      title: product.title,
+      price: Number(product.price),
+      category: product.category || 'General',
+      quantity,
+      notes: String(item.notes || item.observations || item.observaciones || '').trim().slice(0, 500),
+    };
+  });
+
+  return {
+    cart,
+    inventory: rows
+      .filter((product) => product.track_stock)
+      .map((product) => ({
+        id: product.id,
+        title: product.title,
+        stock: Number(product.stock) || 0,
+        quantity: cart.find((item) => String(item.id) === String(product.id))?.quantity || 0,
+      })),
+    total: cart.reduce((sum, item) => sum + item.price * item.quantity, 0),
+  };
+}
+
+async function reserveProductStock(client, normalized, orderId, createdBy = 'Sistema') {
+  for (const item of normalized.inventory || []) {
+    const { rows } = await client.query(`
+      UPDATE pedidos_app_products
+      SET stock = COALESCE(stock, 0) - $1, updated_at = NOW()
+      WHERE id = $2 AND track_stock = TRUE AND COALESCE(stock, 0) >= $1
+      RETURNING stock
+    `, [item.quantity, item.id]);
+    if (!rows.length) {
+      const error = new Error(`No hay existencias suficientes de ${item.title}.`);
+      error.statusCode = 409;
+      error.code = 'INSUFFICIENT_STOCK';
+      throw error;
+    }
+    await client.query(`
+      INSERT INTO pedidos_app_product_stock_movements
+        (product_id, order_id, movement_type, quantity, balance_after, reason, created_by)
+      VALUES ($1,$2,'Pedido',-$3,$4,$5,$6)
+    `, [item.id, orderId, item.quantity, rows[0].stock, `Reserva del pedido #${orderId}`, createdBy]);
+  }
+}
+
+async function releaseProductStock(client, order, createdBy = 'Sistema') {
+  const { rows: movements } = await client.query(`
+    SELECT product_id, -SUM(quantity)::int AS quantity
+    FROM pedidos_app_product_stock_movements
+    WHERE order_id = $1
+    GROUP BY product_id
+    HAVING SUM(quantity) < 0
+  `, [order.id]);
+  for (const movement of movements) {
+    const { rows } = await client.query(`
+      UPDATE pedidos_app_products SET stock = COALESCE(stock, 0) + $1, updated_at = NOW()
+      WHERE id = $2 RETURNING stock
+    `, [movement.quantity, movement.product_id]);
+    if (!rows.length) continue;
+    await client.query(`
+      INSERT INTO pedidos_app_product_stock_movements
+        (product_id, order_id, movement_type, quantity, balance_after, reason, created_by)
+      VALUES ($1,$2,'Cancelación',$3,$4,$5,$6)
+    `, [movement.product_id, order.id, movement.quantity, rows[0].stock, `Devolución del pedido #${order.id}`, createdBy]);
+  }
+}
+
+app.get('/api/pedidos/media/products/:id', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT image FROM pedidos_app_products WHERE id::text = $1', [req.params.id]);
+    return sendStoredMedia(res, rows[0]?.image);
+  } catch (error) {
+    return res.status(500).json({ error: 'No fue posible cargar la imagen' });
+  }
+});
+
+app.get('/api/pedidos/media/announcements/:id', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT image_url FROM pedidos_app_announcements WHERE id = $1', [req.params.id]);
+    return sendStoredMedia(res, rows[0]?.image_url);
+  } catch (error) {
+    return res.status(500).json({ error: 'No fue posible cargar la imagen' });
+  }
+});
+
+app.get('/api/pedidos/media/settings-logo', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT logo FROM pedidos_app_settings WHERE id = 1');
+    return sendStoredMedia(res, rows[0]?.logo);
+  } catch (error) {
+    return res.status(500).json({ error: 'No fue posible cargar el logo' });
+  }
+});
+
 app.get('/api/pedidos/init', async (req, res) => {
   try {
     // Si no hay dbUrl configurada, devolver datos de prueba
@@ -328,7 +418,14 @@ app.get('/api/pedidos/init', async (req, res) => {
       });
     }
 
-    const { rows: products } = await pool.query("SELECT * FROM pedidos_app_products WHERE status = 'Activo' ORDER BY id DESC");
+    const { rows: products } = await pool.query(`
+      SELECT id, title, description, price, category, status, is_active, is_featured,
+             stock, track_stock, low_stock_threshold, inventory_unit, barcode,
+             rating_sum, rating_count, created_at, updated_at, image IS NOT NULL AS has_image
+      FROM pedidos_app_products
+      WHERE status = 'Activo'
+      ORDER BY id DESC
+    `);
     const { rows: categories } = await pool.query("SELECT * FROM pedidos_app_categories WHERE status = 'Activa' ORDER BY id ASC");
 
     // Asumimos que settings es solo una fila
@@ -343,7 +440,15 @@ app.get('/api/pedidos/init', async (req, res) => {
     // Anuncio
     let announcementRow = null;
     try {
-      const { rows: announcements } = await pool.query('SELECT * FROM pedidos_app_announcements ORDER BY id DESC LIMIT 1');
+      const { rows: announcements } = await pool.query(`
+        SELECT id, title, body, cta_label, cta_url, starts_at, ends_at,
+               display_frequency, is_active, updated_at, image_url IS NOT NULL AS has_image
+        FROM pedidos_app_announcements
+        WHERE is_active = TRUE
+          AND (starts_at IS NULL OR starts_at <= NOW())
+          AND (ends_at IS NULL OR ends_at >= NOW())
+        ORDER BY updated_at DESC, id DESC LIMIT 1
+      `);
       if (announcements.length > 0) announcementRow = announcements[0];
     } catch (err) {
       console.log('Announcement table might not exist yet.');
@@ -351,10 +456,10 @@ app.get('/api/pedidos/init', async (req, res) => {
 
     res.json({
       status: 'ok',
-      products,
+      products: products.map((product) => productForResponse(req, product)),
       categories,
-      settings: settingsRow,
-      announcement: announcementRow
+      settings: settingsForResponse(req, settingsRow),
+      announcement: announcementForResponse(req, announcementRow)
     });
   } catch (error) {
     console.error('Error fetching init data:', error);
@@ -364,14 +469,18 @@ app.get('/api/pedidos/init', async (req, res) => {
         status: 'ok',
         products: seedProducts.map((p, i) => ({ id: i + 1, ...p })),
         settings: { whatsapp_number: '', nequi_number: '', bancolombia_number: '' },
-        message: 'Devolviendo datos locales. Por favor ejecuta el POST a /api/pedidos/setup para crear las tablas en Neon.'
+        message: 'Devolviendo datos locales. Ejecuta npm run migrate en distrito-api para preparar PostgreSQL.'
       });
     }
     res.status(500).json({ status: 'error', message: 'Fallo al conectar con la base de datos', details: error.message });
   }
 });
 
-// Middleware / Helper
+
+
+
+
+// Helper for checking if accounting date is closed
 const isDateClosed = async (isoDate) => {
   if (!isoDate) return false;
   try {
@@ -381,19 +490,25 @@ const isDateClosed = async (isoDate) => {
   } catch (e) { return false; }
 };
 
-app.post('/api/pedidos/checkout', async (req, res) => {
+app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
+  let client;
   try {
     const status = await getHorariosStatus();
-    if (!status.isOpen && req.body.source !== 'Presencial' && req.body.source !== 'WhatsApp' && req.body.source !== 'Teléfono') {
-      return res.status(403).json({ error: 'El restaurante se encuentra cerrado en este momento. ' + status.statusText });
+    if (!status.isOpen) {
+      return res.status(423).json({
+        status: 'error', code: 'STORE_CLOSED',
+        error: `El restaurante no recibe pedidos en este momento. ${status.statusText}`,
+        schedule: status,
+      });
     }
 
-    const { customer, cart, total } = req.body;
-
-    // Si no hay DB, retornar un ID falso para que el frontend siga
-    if (!process.env.DATABASE_URL) {
-      return res.json({ status: 'ok', order_id: Math.floor(Math.random() * 1000) });
+    const { customer, cart } = req.body;
+    if (!customer || typeof customer !== 'object' || !customer.name || !customer.phone) {
+      return res.status(400).json({ error: 'Nombre y teléfono del cliente son obligatorios.' });
     }
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const normalized = await normalizeOrderCart(client, cart);
 
     let customDateStr = req.body.created_at || (customer && customer.created_at);
     let customDate = null;
@@ -403,6 +518,7 @@ app.post('/api/pedidos/checkout', async (req, res) => {
     }
 
     if (customDate && await isDateClosed(customDate)) {
+      await client.query('ROLLBACK');
       return res.status(403).json({ error: 'El período contable para esta fecha ya está cerrado.' });
     }
 
@@ -414,10 +530,18 @@ app.post('/api/pedidos/checkout', async (req, res) => {
       formattedPhone = '57' + formattedPhone;
     }
 
-    const { rows } = await pool.query(
+    const deliveryLocation = normalizeDeliveryLocation(customer);
+    const isDelivery = String(customer.deliveryType || '').toLowerCase() === 'domicilio';
+    const { rows } = await client.query(
       `INSERT INTO pedidos_app_orders 
-       (customer_name, customer_phone, address, barrio, delivery_type, payment_method, total, cart_json, source, notes, voucher_reference, created_at) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12, NOW())) 
+       (customer_name, customer_phone, address, barrio, delivery_type, payment_method, total, cart_json, source, notes, voucher_reference, created_at,
+        delivery_fee, delivery_reference, change_required, delivery_latitude, delivery_longitude,
+        delivery_place_id, delivery_location_adjusted, delivery_apartment, delivery_tower, delivery_floor)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12, NOW()),
+         CASE WHEN $15::boolean
+           THEN COALESCE((SELECT delivery_cost FROM pedidos_app_settings WHERE id = 1), 0)
+           ELSE 0
+         END, $13, $14, $16, $17, $18, $19, $20, $21, $22)
        RETURNING id`,
       [
         customer.name,
@@ -426,64 +550,459 @@ app.post('/api/pedidos/checkout', async (req, res) => {
         customer.barrio || '',
         customer.deliveryType,
         customer.paymentMethod,
-        total,
-        JSON.stringify(cart),
+        normalized.total,
+        JSON.stringify(normalized.cart),
         req.body.source || customer.source || 'Web',
-        customer.notes || '',
+        customer.notes || customer.comment || '',
         customer.voucher_reference || '',
-        customDate
+        customDate,
+        customer.reference || customer.deliveryReference || '',
+        customer.paymentMethod === 'efectivo' && Number(customer.cashAmount) > normalized.total
+          ? Math.round(Number(customer.cashAmount) - normalized.total)
+          : null,
+        isDelivery,
+        isDelivery ? deliveryLocation.latitude : null,
+        isDelivery ? deliveryLocation.longitude : null,
+        isDelivery ? String(customer.placeId || customer.googlePlaceId || '').trim().slice(0, 255) || null : null,
+        isDelivery && customer.locationAdjusted === true,
+        isDelivery ? String(customer.apartment || '').trim().slice(0, 50) || null : null,
+        isDelivery ? String(customer.tower || '').trim().slice(0, 50) || null : null,
+        isDelivery ? String(customer.floor || '').trim().slice(0, 30) || null : null
       ]
     );
 
-    res.json({ status: 'ok', order_id: rows[0].id });
+    await reserveProductStock(client, normalized, rows[0].id, req.body.source || 'Web');
+    await client.query('COMMIT');
+
+    res.status(201).json({
+      status: 'ok',
+      order_id: rows[0].id,
+      total: normalized.total,
+      tracking_token: issueTrackingToken(rows[0].id, JWT_SECRET),
+    });
   } catch (error) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
     console.error('Error guardando orden:', error);
-    res.status(500).json({ status: 'error', message: error.message });
+    res.status(error.statusCode || 500).json({ status: 'error', code: error.code, error: error.message, message: error.message });
+  } finally {
+    if (client) client.release();
   }
 });
 
+app.get('/api/pedidos/track/:id', trackingLimiter, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    await authorizeTrackingAccess(pool, {
+      orderId: id,
+      phone: req.query.phone,
+      token: req.query.token,
+      secret: JWT_SECRET,
+    });
+    const { rows } = await pool.query(`
+      SELECT order_data.id, order_data.customer_name, order_data.customer_phone,
+             order_data.delivery_type, order_data.total, order_data.status, order_data.delivery_status,
+             order_data.address, order_data.barrio,
+             order_data.delivery_latitude, order_data.delivery_longitude,
+             order_data.cart_json, order_data.created_at, order_data.updated_at,
+             order_data.completed_at, order_data.delivered_at, order_data.delivery_completed_at,
+             order_data.delivery_duration_seconds, order_data.delivery_user_id,
+             CASE WHEN order_data.delivery_status = 'En camino'
+                       AND profile.last_location_at >= order_data.delivery_accepted_at
+                  THEN profile.current_latitude ELSE NULL END AS driver_latitude,
+             CASE WHEN order_data.delivery_status = 'En camino'
+                       AND profile.last_location_at >= order_data.delivery_accepted_at
+                  THEN profile.current_longitude ELSE NULL END AS driver_longitude,
+             CASE WHEN order_data.delivery_status = 'En camino'
+                       AND profile.last_location_at >= order_data.delivery_accepted_at
+                  THEN profile.last_location_at ELSE NULL END AS driver_location_at,
+             CASE WHEN order_data.delivery_status = 'En camino' THEN TRIM(CONCAT(driver.name, ' ', driver.last_name)) ELSE NULL END AS driver_name,
+             CASE WHEN order_data.delivery_status = 'En camino' THEN profile.vehicle_type ELSE NULL END AS vehicle_type,
+             CASE WHEN order_data.delivery_status = 'En camino' THEN profile.plate ELSE NULL END AS plate,
+             settings.restaurant_name, COALESCE(settings.kitchen_address, settings.address) AS store_address,
+             settings.store_latitude, settings.store_longitude
+      FROM pedidos_app_orders order_data
+      LEFT JOIN pedidos_app_users driver ON driver.id = order_data.delivery_user_id
+      LEFT JOIN pedidos_app_delivery_profiles profile ON profile.user_id = order_data.delivery_user_id
+      LEFT JOIN pedidos_app_settings settings ON settings.id = 1
+      WHERE order_data.id = $1
+    `, [id]);
+    if (!rows.length) return res.status(404).json({ error: 'No encontramos el pedido' });
+    const order = rows[0];
+    let driverTrail = [];
+    if (order.delivery_status === 'En camino' && order.delivery_user_id != null) {
+      const trailResult = await pool.query(`
+        SELECT latitude, longitude, recorded_at
+        FROM pedidos_app_delivery_locations
+        WHERE order_id = $1 AND user_id = $2
+        ORDER BY recorded_at DESC
+        LIMIT 120
+      `, [id, order.delivery_user_id]);
+      driverTrail = trailResult.rows.reverse().map((point) => ({
+        latitude: Number(point.latitude),
+        longitude: Number(point.longitude),
+        recorded_at: point.recorded_at,
+      }));
+    }
+    res.json({
+      status: 'ok',
+      order: {
+        id: order.id,
+        customer_name: order.customer_name,
+        delivery_type: order.delivery_type,
+        total: Number(order.total),
+        order_status: order.status,
+        delivery_status: order.delivery_status,
+        items: (order.cart_json || []).map((item) => ({ title: item.title, quantity: item.quantity || item.qty || 1 })),
+        created_at: order.created_at,
+        updated_at: order.updated_at,
+        completed_at: order.completed_at,
+        delivered_at: order.delivered_at,
+        delivery_completed_at: order.delivery_completed_at,
+        delivery_duration_seconds: order.delivery_duration_seconds == null ? null : Number(order.delivery_duration_seconds),
+        store: {
+          name: order.restaurant_name || 'Distrito BG',
+          address: order.store_address || 'Valledupar, Colombia',
+          latitude: Number(order.store_latitude ?? 10.4631),
+          longitude: Number(order.store_longitude ?? -73.2532),
+        },
+        destination: order.delivery_latitude == null || order.delivery_longitude == null ? null : {
+          address: [order.address, order.barrio].filter(Boolean).join(', '),
+          latitude: Number(order.delivery_latitude),
+          longitude: Number(order.delivery_longitude),
+        },
+        driver: order.delivery_user_id == null ? null : {
+          id: Number(order.delivery_user_id),
+          name: order.driver_name,
+          vehicle_type: order.vehicle_type,
+          plate: order.plate,
+          latitude: order.driver_latitude == null ? null : Number(order.driver_latitude),
+          longitude: order.driver_longitude == null ? null : Number(order.driver_longitude),
+          updated_at: order.driver_location_at,
+          trail: driverTrail,
+        },
+      },
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({
+      code: error.code,
+      error: error.statusCode ? error.message : 'No fue posible consultar el pedido',
+    });
+  }
+});
+
+// Funciones Globales y Middleware
+const logActivity = async (userId, module, action, details, ip, os, browser, requestData) => {
+  if (!dbUrl) return;
+  try {
+    await pool.query(
+      `INSERT INTO pedidos_app_audit_logs (user_id, module, action, details, ip, os, browser, request_data) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [userId, module, action, details, ip, os, browser, JSON.stringify(requestData)]
+    );
+  } catch (e) {
+    console.error('Error logging activity:', e);
+  }
+};
+
+const requirePermission = (moduleName, actionName) => async (req, res, next) => {
+  if (!req.user) return res.status(401).json({ error: 'Acceso denegado' });
+  if (req.user.role === 'Super Administrador') return next();
+
+  try {
+    const { rows } = await pool.query(`
+      SELECT rp.* FROM pedidos_app_role_permissions rp
+      JOIN pedidos_app_permissions p ON rp.permission_id = p.id
+      WHERE rp.role_id = $1 AND p.module = $2 AND p.action = $3
+    `, [req.user.role_id, moduleName, actionName]);
+
+    if (rows.length === 0) {
+      return res.status(403).json({ error: 'No tienes permiso para realizar esta acción' });
+    }
+    next();
+  } catch (error) {
+    console.error('Error verificando permisos:', error);
+    res.status(500).json({ error: 'Error interno verificando permisos' });
+  }
+};
+
 // AUTH MIDDLEWARE
+const expireInactiveSessions = async (client, userId = null) => {
+  const params = userId ? [userId] : [];
+  const userFilter = userId ? 'AND s.user_id = $1' : '';
+  await client.query(`
+    UPDATE pedidos_app_sessions s
+    SET status = CASE WHEN s.expires_at <= NOW() THEN 'Expirada' ELSE 'Expirada por inactividad' END,
+        revoked_at = NOW()
+    FROM pedidos_app_users u
+    LEFT JOIN pedidos_app_roles r ON r.id = u.role_id
+    WHERE s.user_id = u.id
+      AND s.status = 'Activa'
+      AND (s.expires_at <= NOW()
+        OR (
+          COALESCE(r.name, u.role, '') NOT IN ('Domiciliario', 'Repartidor')
+          AND s.last_active < NOW() - make_interval(mins => COALESCE(u.session_idle_minutes, $${userId ? 2 : 1}))
+        ))
+      ${userFilter}
+  `, userId ? [userId, DEFAULT_IDLE_MINUTES] : [DEFAULT_IDLE_MINUTES]);
+};
+
+const getAuthUser = async (client, userId) => {
+  const { rows } = await client.query(`
+    SELECT u.id, u.username, u.name, u.last_name, u.email, u.phone, u.photo_url,
+           u.role_id, u.role, u.must_change_password, u.max_active_sessions,
+           u.session_idle_minutes, r.name AS role_name
+    FROM pedidos_app_users u
+    LEFT JOIN pedidos_app_roles r ON r.id = u.role_id
+    WHERE u.id = $1 AND u.status = 'Activo'
+  `, [userId]);
+  if (!rows.length) return null;
+  const user = rows[0];
+  const { rows: permissionRows } = user.role_id ? await client.query(`
+    SELECT p.module, p.action
+    FROM pedidos_app_role_permissions rp
+    JOIN pedidos_app_permissions p ON p.id = rp.permission_id
+    WHERE rp.role_id = $1
+    ORDER BY p.module, p.action
+  `, [user.role_id]) : { rows: [] };
+  return {
+    user: {
+      id: user.id, username: user.username, name: user.name, last_name: user.last_name,
+      email: user.email, phone: user.phone, photo_url: user.photo_url,
+      role: user.role_name || user.role, role_id: user.role_id,
+      max_active_sessions: Math.min(Number(user.max_active_sessions) || MAX_DEVICE_SESSIONS, MAX_DEVICE_SESSIONS),
+      session_idle_minutes: Number(user.session_idle_minutes) || DEFAULT_IDLE_MINUTES,
+    },
+    permissions: permissionRows.map((permission) => `${permission.module}:${permission.action}`),
+    must_change_password: Boolean(user.must_change_password),
+  };
+};
+
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
   if (!token) return res.status(401).json({ error: 'Acceso denegado' });
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
+  jwt.verify(token, JWT_SECRET, async (err, user) => {
     if (err) return res.status(403).json({ error: 'Token inválido o expirado' });
+
+    // Validar en DB si la sesión está activa y actualizar último acceso
+    if (user.jti && dbUrl) {
+      try {
+        await expireInactiveSessions(pool, user.id);
+        const { rows } = await pool.query(
+          "SELECT id, status, last_active, expires_at FROM pedidos_app_sessions WHERE token_jti = $1 AND user_id = $2",
+          [user.jti, user.id]
+        );
+        if (rows.length === 0 || rows[0].status !== 'Activa') {
+          return res.status(401).json({ code: 'SESSION_EXPIRED', error: 'La sesión finalizó o caducó por inactividad' });
+        }
+        await pool.query(
+          "UPDATE pedidos_app_sessions SET last_active = NOW() WHERE token_jti = $1 AND last_active < NOW() - INTERVAL '60 seconds'",
+          [user.jti]
+        );
+        if (user.id) {
+          await pool.query("UPDATE pedidos_app_users SET last_access = NOW() WHERE id = $1", [user.id]);
+        }
+      } catch (e) {
+        console.error("Error validando sesión:", e);
+        return res.status(503).json({ error: 'No fue posible validar la sesión' });
+      }
+    }
+
     req.user = user;
     next();
   });
 };
 
-app.post('/api/pedidos/admin/login', async (req, res) => {
+const crypto = require('crypto');
+const nodemailer = require('nodemailer');
+
+const transporter = nodemailer.createTransport({
+  host: 'smtp.hostinger.com',
+  port: 465,
+  secure: true,
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
+  }
+});
+
+app.post('/api/pedidos/admin/forgot-password', authLimiter, async (req, res) => {
+  const { email, app: requestedApp } = req.body;
+  if (!email) return res.status(400).json({ error: 'El correo es obligatorio' });
+
   try {
-    const { username, password } = req.body;
-
-    // Si no hay DB, mockear login para desarrollo local si la DB no está conectada
-    if (!process.env.DATABASE_URL) {
-      if (username === 'admin' && password === 'Distrito2026*') {
-        const token = jwt.sign({ username, role: 'admin' }, JWT_SECRET, { expiresIn: '24h' });
-        return res.json({ status: 'ok', token });
-      }
-      return res.status(401).json({ error: 'Credenciales inválidas' });
-    }
-
-    const { rows } = await pool.query('SELECT * FROM pedidos_app_users WHERE username = $1', [username]);
-
+    const { rows } = await pool.query('SELECT id, username FROM pedidos_app_users WHERE email = $1 AND status = $2', [email, 'Activo']);
     if (rows.length === 0) {
-      return res.status(401).json({ error: 'Usuario no encontrado' });
+      // Para evitar enumeración de correos, devolvemos OK aunque no exista
+      return res.json({ status: 'ok', message: 'Si el correo existe, recibirás un enlace de recuperación.' });
     }
 
     const user = rows[0];
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const expiry = new Date(Date.now() + 3600000); // 1 hora
+
+    await pool.query('UPDATE pedidos_app_users SET reset_token = $1, reset_token_expiry = $2 WHERE id = $3', [resetToken, expiry, user.id]);
+
+    const resetLink = requestedApp === 'delivery'
+      ? `https://delivery.distritobg.app/reset-password?token=${resetToken}`
+      : `https://admin.distritobg.app/admin/reset-password?token=${resetToken}`;
+
+    const mailOptions = {
+      from: '"Soporte Distrito BG" <' + (process.env.EMAIL_USER || 'soporte@distritobg.com') + '>',
+      to: email,
+      subject: 'Recuperación de Contraseña - Distrito BG',
+      html: `
+        <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
+          <h2 style="color: #D4A017;">Distrito BG</h2>
+          <p>Hola <b>${user.username}</b>,</p>
+          <p>Hemos recibido una solicitud para restablecer tu contraseña. Si fuiste tú, haz clic en el siguiente enlace (válido por 1 hora):</p>
+          <a href="${resetLink}" style="display: inline-block; padding: 10px 20px; background-color: #D4A017; color: #000; text-decoration: none; border-radius: 5px; font-weight: bold;">Restablecer mi contraseña</a>
+          <br><br>
+          <p>Si el botón no funciona, copia y pega el siguiente enlace en tu navegador:</p>
+          <p><a href="${resetLink}">${resetLink}</a></p>
+          <p>Si no solicitaste este cambio, puedes ignorar este correo de forma segura.</p>
+        </div>
+      `
+    };
+
+    if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+      await transporter.sendMail(mailOptions);
+    } else {
+      console.warn("⚠️ EMAIL_USER o EMAIL_PASS no configurados en .env. El enlace generado es:", resetLink);
+    }
+
+    const ua = req.headers['user-agent'] || '-';
+    await pool.query(`INSERT INTO pedidos_app_audit_logs (action, user_id, username_attempted, ip, os, browser, details) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      ['Solicitud de Recuperación', user.id, user.username, req.ip, ua.substring(0, 50), '-', `Correo enviado a ${email}`]
+    );
+
+    res.json({ status: 'ok', message: 'Si el correo existe, recibirás un enlace de recuperación.' });
+  } catch (error) {
+    console.error('Error en forgot-password:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+
+app.post('/api/pedidos/admin/reset-password', authLimiter, async (req, res) => {
+  const { token, newPassword } = req.body;
+  if (!token || !newPassword) return res.status(400).json({ error: 'Faltan datos' });
+
+  if (newPassword.length < MIN_PASSWORD_LENGTH) {
+    return res.status(400).json({ error: `La contraseña debe tener al menos ${MIN_PASSWORD_LENGTH} caracteres` });
+  }
+
+  try {
+    const { rows } = await pool.query('SELECT id, username, reset_token_expiry FROM pedidos_app_users WHERE reset_token = $1', [token]);
+    if (rows.length === 0) {
+      return res.status(400).json({ error: 'Token inválido o expirado' });
+    }
+
+    const user = rows[0];
+    if (new Date() > new Date(user.reset_token_expiry)) {
+      return res.status(400).json({ error: 'El enlace ha expirado. Solicita uno nuevo.' });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await pool.query('UPDATE pedidos_app_users SET password_hash = $1, reset_token = NULL, reset_token_expiry = NULL WHERE id = $2', [hashedPassword, user.id]);
+
+    const ua = req.headers['user-agent'] || '-';
+    await pool.query(`INSERT INTO pedidos_app_audit_logs (action, user_id, username_attempted, ip, os, browser, details) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      ['Contraseña Restablecida', user.id, user.username, req.ip, ua.substring(0, 50), '-', `Contraseña recuperada exitosamente`]
+    );
+
+    res.json({ status: 'ok', message: 'Contraseña actualizada correctamente' });
+  } catch (error) {
+    console.error('Error en reset-password:', error);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
+});
+app.post('/api/pedidos/admin/login', authLimiter, async (req, res) => {
+  try {
+    const { username, password, deviceId, deviceName } = req.body;
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'Desconocida';
+    const userAgent = req.headers['user-agent'] || 'Desconocido';
+    const os = userAgent.includes('Windows') ? 'Windows' : userAgent.includes('Mac') ? 'Mac' : userAgent.includes('Android') ? 'Android' : userAgent.includes('iPhone') ? 'iPhone' : 'Otro';
+    const browser = userAgent.includes('Chrome') ? 'Chrome' : userAgent.includes('Firefox') ? 'Firefox' : userAgent.includes('Safari') ? 'Safari' : 'Otro';
+
+    const { rows } = await pool.query(`
+      SELECT u.*, r.name as role_name
+      FROM pedidos_app_users u
+      LEFT JOIN pedidos_app_roles r ON u.role_id = r.id
+      WHERE u.username = $1 OR u.email = $1 OR u.document = $1
+    `, [username]);
+
+    if (rows.length === 0) {
+      await pool.query("INSERT INTO pedidos_app_audit_logs (username_attempted, action, ip, browser, os) VALUES ($1, 'Intento Fallido (Usuario no existe)', $2, $3, $4)", [username, ip, browser, os]);
+      return res.status(401).json({ error: 'Usuario o contraseña incorrecta' });
+    }
+
+    const user = rows[0];
+
+    if (user.status !== 'Activo') {
+      return res.status(403).json({ error: 'La cuenta está desactivada' });
+    }
+
+    if (user.blocked_until && new Date(user.blocked_until) > new Date()) {
+      return res.status(403).json({ error: 'Cuenta bloqueada temporalmente por demasiados intentos. Intente más tarde.' });
+    }
+
     const validPassword = await bcrypt.compare(password, user.password_hash);
 
     if (!validPassword) {
-      return res.status(401).json({ error: 'Contraseña incorrecta' });
+      const newFails = (user.failed_attempts || 0) + 1;
+      let blockedUntil = null;
+      if (newFails >= 5) {
+        blockedUntil = new Date(Date.now() + 15 * 60000); // 15 mins
+      }
+      await pool.query("UPDATE pedidos_app_users SET failed_attempts = $1, blocked_until = $2 WHERE id = $3", [newFails, blockedUntil, user.id]);
+      await pool.query("INSERT INTO pedidos_app_audit_logs (user_id, username_attempted, action, ip, browser, os) VALUES ($1, $2, 'Intento Fallido (Clave incorrecta)', $3, $4, $5)", [user.id, username, ip, browser, os]);
+
+      if (newFails >= 5) {
+         return res.status(403).json({ error: 'Demasiados intentos fallidos. Cuenta bloqueada por 15 minutos.' });
+      }
+      return res.status(401).json({ error: 'Usuario o contraseña incorrecta' });
     }
 
-    const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
-    res.json({ status: 'ok', token });
+    await expireInactiveSessions(pool, user.id);
+    const safeDeviceId = String(deviceId || crypto.randomUUID()).slice(0, 100);
+    const safeDeviceName = String(deviceName || `${browser} en ${os}`).slice(0, 160);
+    await pool.query(
+      "UPDATE pedidos_app_sessions SET status = 'Reemplazada en el mismo dispositivo', revoked_at = NOW() WHERE user_id = $1 AND device_id = $2 AND status = 'Activa'",
+      [user.id, safeDeviceId]
+    );
+    const { rows: sessions } = await pool.query(`
+      SELECT id, device_name, browser, os, last_active
+      FROM pedidos_app_sessions
+      WHERE user_id = $1 AND status = 'Activa'
+      ORDER BY last_active DESC
+    `, [user.id]);
+    const sessionLimit = Math.min(Number(user.max_active_sessions) || MAX_DEVICE_SESSIONS, MAX_DEVICE_SESSIONS);
+    if (sessions.length >= sessionLimit) {
+      return res.status(409).json({
+        code: 'SESSION_LIMIT_REACHED',
+        error: `Alcanzaste el límite de ${sessionLimit} dispositivos activos. Cierra una sesión desde tu perfil.`,
+        sessions,
+      });
+    }
+
+    // Reset fails
+    await pool.query("UPDATE pedidos_app_users SET failed_attempts = 0, blocked_until = NULL, last_access = NOW() WHERE id = $1", [user.id]);
+
+    const jti = crypto.randomUUID();
+    const token = jwt.sign({ id: user.id, username: user.username, role: user.role_name || user.role, role_id: user.role_id, jti }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_TTL });
+    const refreshToken = jwt.sign({ id: user.id, jti }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_TTL });
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+    await pool.query(
+      "INSERT INTO pedidos_app_sessions (user_id, token_jti, ip, browser, os, device_id, device_name, status, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 'Activa', $8)",
+      [user.id, jti, ip, browser, os, safeDeviceId, safeDeviceName, expiresAt]
+    );
+
+    await pool.query("INSERT INTO pedidos_app_audit_logs (user_id, username_attempted, action, ip, browser, os) VALUES ($1, $2, 'Ingreso Exitoso', $3, $4, $5)", [user.id, username, ip, browser, os]);
+
+    const authData = await getAuthUser(pool, user.id);
+    res.json({ status: 'ok', token, refreshToken, ...authData });
 
   } catch (error) {
     console.error('Error en login:', error);
@@ -491,14 +1010,64 @@ app.post('/api/pedidos/admin/login', async (req, res) => {
   }
 });
 
-app.get('/api/pedidos/admin/verify', authenticateToken, (req, res) => {
-  res.json({ status: 'ok', user: req.user });
+app.post('/api/pedidos/admin/refresh-token', async (req, res) => {
+  const { refreshToken } = req.body;
+  if (!refreshToken) return res.status(401).json({ error: 'No token provided' });
+
+  jwt.verify(refreshToken, JWT_SECRET, async (err, payload) => {
+    if (err) return res.status(403).json({ error: 'Invalid refresh token' });
+
+    await expireInactiveSessions(pool, payload.id);
+    const { rows: sessions } = await pool.query(
+      "SELECT status FROM pedidos_app_sessions WHERE token_jti = $1 AND user_id = $2",
+      [payload.jti, payload.id]
+    );
+    if (!sessions.length || sessions[0].status !== 'Activa') {
+      return res.status(401).json({ code: 'SESSION_EXPIRED', error: 'La sesión finalizó o caducó por inactividad' });
+    }
+    const authData = await getAuthUser(pool, payload.id);
+    if (!authData) return res.status(401).json({ error: 'Usuario no disponible' });
+    const user = authData.user;
+    const token = jwt.sign({
+      id: user.id,
+      username: user.username,
+      role: user.role_name || user.role,
+      role_id: user.role_id,
+      jti: payload.jti
+    }, JWT_SECRET, { expiresIn: ACCESS_TOKEN_TTL });
+    await pool.query("UPDATE pedidos_app_sessions SET last_active = NOW() WHERE token_jti = $1", [payload.jti]);
+    res.json({ status: 'ok', token, ...authData });
+  });
+});
+
+app.post('/api/pedidos/admin/logout', authenticateToken, async (req, res) => {
+  if (req.user && req.user.jti && dbUrl) {
+    await pool.query("UPDATE pedidos_app_sessions SET status = 'Cerrada por usuario' WHERE token_jti = $1", [req.user.jti]);
+    await pool.query("INSERT INTO pedidos_app_audit_logs (user_id, action) VALUES ($1, 'Cierre de Sesión')", [req.user.id]);
+  }
+  res.json({ status: 'ok' });
+});
+
+app.get('/api/pedidos/admin/verify', authenticateToken, async (req, res) => {
+  const authData = await getAuthUser(pool, req.user.id);
+  if (!authData) return res.status(401).json({ error: 'Usuario no disponible' });
+  res.json({ status: 'ok', ...authData });
+});
+
+app.get('/api/pedidos/admin/dashboard', authenticateToken, async (req, res) => {
+  try {
+    const dashboard = await getDashboardSnapshot(pool, getHorariosStatus);
+    res.json({ status: 'ok', dashboard });
+  } catch (error) {
+    console.error('Error fetching dashboard:', error);
+    res.status(500).json({ status: 'error', error: 'No fue posible cargar el resumen operativo.' });
+  }
 });
 
 // Obtener todas las categorías para el panel admin
 app.get('/api/pedidos/admin/categories', authenticateToken, async (req, res) => {
   try {
-    if (!process.env.DATABASE_URL) {
+    if (!dbUrl) {
       return res.json({ status: 'ok', categories: [] });
     }
 
@@ -562,14 +1131,75 @@ app.delete('/api/pedidos/admin/categories/:id', authenticateToken, async (req, r
 });
 
 // Obtener todas las ordenes para admin
+// ── Clientes: Autocompletar por nombre o teléfono ────────────────────────────
+app.get('/api/pedidos/admin/clientes/buscar', authenticateToken, async (req, res) => {
+  try {
+    const { q } = req.query;
+    if (!q || q.length < 1) return res.json({ status: 'ok', clientes: [] });
+
+    // Buscar en el historial de pedidos
+    const { rows } = await pool.query(`
+      SELECT customer_name as name, customer_phone as phone, address, barrio, delivery_type, payment_method, source, notes
+      FROM pedidos_app_orders
+      WHERE customer_name ILIKE $1 OR customer_phone LIKE $2
+      ORDER BY created_at DESC
+    `, [`${q}%`, `${q.replace(/\D/g, '')}%`]);
+
+    // Deduplicar
+    const unique = [];
+    const seen = new Set();
+    for (const r of rows) {
+      const key = (r.phone || r.name).toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        unique.push(r);
+      }
+    }
+    res.json({ status: 'ok', clientes: unique.slice(0, 10) });
+  } catch (error) {
+    res.status(500).json({ status: 'error', error: error.message });
+  }
+});
+
 app.get('/api/pedidos/admin/orders', authenticateToken, async (req, res) => {
   try {
-    if (!process.env.DATABASE_URL) return res.json({ status: 'ok', orders: [] });
-    const { rows } = await pool.query('SELECT * FROM pedidos_app_orders ORDER BY created_at DESC');
+    if (!dbUrl) return res.json({ status: 'ok', orders: [] });
+    const requestedLimit = Number.parseInt(req.query.limit, 10) || 300;
+    const limit = Math.min(Math.max(requestedLimit, 1), 500);
+    const { rows } = await pool.query(`
+      SELECT id, customer_name, customer_phone, address, barrio, delivery_type,
+             payment_method, total, status, source, notes, cart_json,
+             voucher_reference, created_at, updated_at, delivered_at,
+             delivery_user_id, delivery_status, delivery_fee, delivery_reference,
+             delivery_latitude, delivery_longitude, delivery_place_id,
+             delivery_location_adjusted, delivery_apartment, delivery_tower, delivery_floor,
+             change_required, delivery_accepted_at, picked_up_at, on_the_way_at,
+             delivery_completed_at, delivery_distance_km, delivery_duration_seconds
+      FROM pedidos_app_orders
+      ORDER BY created_at DESC
+      LIMIT $1
+    `, [limit]);
     res.json({ status: 'ok', orders: rows });
   } catch (error) {
     console.error('Error fetching orders:', error);
     res.status(500).json({ status: 'error', error: error.message });
+  }
+});
+
+app.post('/api/pedidos/admin/orders/:id/tracking-token', authenticateToken, async (req, res) => {
+  try {
+    const orderId = Number(req.params.id);
+    if (!Number.isInteger(orderId) || orderId < 1) return res.status(400).json({ error: 'Pedido inválido' });
+    const { rows } = await pool.query(`
+      SELECT id, status, delivery_status
+      FROM pedidos_app_orders
+      WHERE id = $1
+    `, [orderId]);
+    if (!rows.length) return res.status(404).json({ error: 'Pedido no encontrado' });
+    if (isFinalOrder(rows[0])) return res.status(409).json({ error: 'El seguimiento de este pedido ya finalizó' });
+    res.json({ status: 'ok', tracking_token: issueTrackingToken(orderId, JWT_SECRET) });
+  } catch (error) {
+    res.status(500).json({ error: 'No fue posible generar el enlace de seguimiento' });
   }
 });
 
@@ -578,35 +1208,129 @@ app.put('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => 
   try {
     const { id } = req.params;
     const { status } = req.body;
-    if (!status) return res.status(400).json({ status: 'error', error: 'El estado es requerido' });
 
-    const { rows } = await pool.query(
-      'UPDATE pedidos_app_orders SET status = $1 WHERE id = $2 RETURNING *',
-      [status, id]
-    );
+    if (status) {
+      if (!ORDER_STATUSES.has(status)) {
+        return res.status(400).json({ status: 'error', error: 'Estado de pedido inválido' });
+      }
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const { rows: currentRows } = await client.query(
+          'SELECT * FROM pedidos_app_orders WHERE id = $1 FOR UPDATE',
+          [id]
+        );
+        if (!currentRows.length) {
+          await client.query('ROLLBACK');
+          return res.status(404).json({ status: 'error', error: 'Pedido no encontrado' });
+        }
 
-    res.json({ status: 'ok', order: rows[0] });
+        const currentOrder = currentRows[0];
+        const willBeFinal = FINAL_ORDER_STATUSES.has(status);
+        if (currentOrder.status !== 'Cancelado' && status === 'Cancelado') {
+          await releaseProductStock(client, currentOrder, req.user?.username);
+        } else if (currentOrder.status === 'Cancelado' && status !== 'Cancelado') {
+          const normalized = await normalizeOrderCart(client, currentOrder.cart_json, { activeOnly: false });
+          await reserveProductStock(client, normalized, currentOrder.id, req.user?.username);
+        }
+
+        const deliveryStatus = status === 'Cancelado'
+          ? 'Cancelado'
+          : willBeFinal
+            ? 'Entregado'
+            : ['Cancelado', 'Entregado'].includes(currentOrder.delivery_status) ? 'Pendiente' : null;
+        const { rows } = await client.query(
+          `UPDATE pedidos_app_orders
+           SET status = $1,
+               updated_at = NOW(),
+               completed_at = CASE WHEN $2 THEN COALESCE(completed_at, NOW()) ELSE completed_at END,
+               delivered_at = CASE WHEN $2 THEN COALESCE(delivered_at, NOW()) ELSE NULL END,
+               delivery_status = COALESCE($4, delivery_status),
+               delivery_completed_at = CASE WHEN $4 = 'Entregado' THEN COALESCE(delivery_completed_at, NOW()) ELSE delivery_completed_at END
+           WHERE id = $3 RETURNING *`,
+          [status, willBeFinal, id, deliveryStatus]
+        );
+        if (rows[0].delivery_user_id && ['Cancelado', 'Entregado'].includes(rows[0].delivery_status)) {
+          await client.query(`
+            UPDATE pedidos_app_delivery_profiles
+            SET availability_status = 'Libre', updated_at = NOW()
+            WHERE user_id = $1
+          `, [rows[0].delivery_user_id]);
+        }
+        await client.query('COMMIT');
+        deliveryRealtime.publish('order_updated', {
+          orderId: Number(id),
+          orderStatus: status,
+          deliveryStatus: rows[0].delivery_status,
+        });
+        if (status === 'Cancelado' && rows[0].delivery_user_id) {
+          deliveryRealtime.sendPush({
+            userId: rows[0].delivery_user_id,
+            title: 'Pedido cancelado',
+            body: `El pedido #${id} fue cancelado`,
+            url: '/',
+          }).catch((pushError) => console.error('Error enviando push de cancelación:', pushError));
+        } else if (rows[0].delivery_user_id) {
+          deliveryRealtime.sendPush({
+            userId: rows[0].delivery_user_id,
+            title: `Pedido #${id} actualizado`,
+            body: `El estado del pedido cambió a ${status}`,
+            url: `/pedidos/${id}`,
+          }).catch((pushError) => console.error('Error enviando push de estado:', pushError));
+        } else if (status === 'Listo' && String(rows[0].delivery_type || '').toLowerCase() === 'domicilio') {
+          deliveryRealtime.sendPush({
+            title: 'Nuevo pedido disponible',
+            body: `El pedido #${id} está listo para entregar`,
+            url: '/',
+          }).catch((pushError) => console.error('Error enviando push de pedido disponible:', pushError));
+        }
+        res.json({ status: 'ok', order: rows[0] });
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+    } else {
+      res.status(400).json({ status: 'error', error: 'No se enviaron datos para actualizar' });
+    }
   } catch (error) {
     console.error('Error updating order:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    res.status(error.statusCode || 500).json({ status: 'error', error: error.message });
   }
 });
 
 // Editar pedido completo (carrito, total, cliente)
 app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res) => {
+  const client = await pool.connect();
   try {
     const { id } = req.params;
-    const { cart, total, customer } = req.body;
-
-    const cartStr = JSON.stringify(cart);
-    let customDateStr = customer && customer.created_at;
+    const { cart, customer } = req.body;
+    if (!customer || typeof customer !== 'object') {
+      return res.status(400).json({ status: 'error', error: 'Los datos del cliente son obligatorios' });
+    }
+    await client.query('BEGIN');
+    const { rows: currentRows } = await client.query('SELECT * FROM pedidos_app_orders WHERE id=$1 FOR UPDATE', [id]);
+    if (!currentRows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Pedido no encontrado' });
+    }
+    const currentOrder = currentRows[0];
+    if (currentOrder.status !== 'Cancelado') await releaseProductStock(client, currentOrder, req.user?.username);
+    const normalized = await normalizeOrderCart(client, cart, { activeOnly: false });
+    const cartStr = JSON.stringify(normalized.cart);
+    let customDateStr = (customer && customer.created_at) || req.body.created_at;
     let customDate = null;
     if (customDateStr) {
       if (customDateStr.length === 10) customDateStr += 'T12:00:00-05:00';
-      customDate = new Date(customDateStr).toISOString();
+      const parsedDate = new Date(customDateStr);
+      if (!isNaN(parsedDate.getTime())) {
+        customDate = parsedDate.toISOString();
+      }
     }
 
     if (customDate && await isDateClosed(customDate)) {
+      await client.query('ROLLBACK');
       return res.status(403).json({ error: 'El período contable para esta fecha ya está cerrado.' });
     }
 
@@ -618,38 +1342,82 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
       formattedPhone = '57' + formattedPhone;
     }
 
-    const { rows } = await pool.query(
+    const deliveryLocation = normalizeDeliveryLocation(customer);
+    const isDelivery = String(customer.deliveryType || '').toLowerCase() === 'domicilio';
+    const { rows } = await client.query(
       `UPDATE pedidos_app_orders 
-       SET cart_json = $1, total = $2, customer_name = $3, customer_phone = $4, address = $5, delivery_type = $6, payment_method = $7, barrio = $8, source = $9, created_at = COALESCE($10, created_at), notes = COALESCE($12, notes), voucher_reference = $13
+       SET cart_json = $1, total = $2, customer_name = $3, customer_phone = $4, address = $5,
+           delivery_type = $6, payment_method = $7, barrio = $8, source = $9,
+           created_at = COALESCE($10, created_at), notes = COALESCE($12, notes),
+           voucher_reference = $13,
+           delivery_reference = $14, delivery_latitude = $15, delivery_longitude = $16,
+           delivery_place_id = $17, delivery_location_adjusted = $18,
+           delivery_apartment = $19, delivery_tower = $20, delivery_floor = $21,
+           delivery_fee = CASE WHEN $22::boolean
+             THEN COALESCE(NULLIF(delivery_fee, 0), (SELECT delivery_cost FROM pedidos_app_settings WHERE id = 1), 0)
+             ELSE 0
+           END
        WHERE id = $11 RETURNING *`,
-      [cartStr, total, customer.name, formattedPhone, customer.address, customer.deliveryType, customer.paymentMethod, customer.barrio || '', req.body.source || customer.source || 'Web', customDate, id, customer.notes || '', customer.voucher_reference || '']
+      [
+        cartStr, normalized.total, customer.name, formattedPhone, customer.address,
+        customer.deliveryType, customer.paymentMethod, customer.barrio || '',
+        req.body.source || customer.source || 'Web', customDate, id, customer.notes || '',
+        customer.voucher_reference || '',
+        isDelivery ? String(customer.reference || customer.deliveryReference || '').trim().slice(0, 500) || null : null,
+        isDelivery ? deliveryLocation.latitude : null,
+        isDelivery ? deliveryLocation.longitude : null,
+        isDelivery ? String(customer.placeId || customer.googlePlaceId || '').trim().slice(0, 255) || null : null,
+        isDelivery && customer.locationAdjusted === true,
+        isDelivery ? String(customer.apartment || '').trim().slice(0, 50) || null : null,
+        isDelivery ? String(customer.tower || '').trim().slice(0, 50) || null : null,
+        isDelivery ? String(customer.floor || '').trim().slice(0, 30) || null : null,
+        isDelivery,
+      ]
     );
+    if (currentOrder.status !== 'Cancelado') await reserveProductStock(client, normalized, id, req.user?.username);
+    await client.query('COMMIT');
     res.json({ status: 'ok', order: rows[0] });
   } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('Error editing order:', error);
-    res.status(500).json({ status: 'error', error: error.message });
-  }
+    res.status(error.statusCode || 500).json({ status: 'error', error: error.message });
+  } finally { client.release(); }
 });
 
 // Eliminar orden
 app.delete('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => {
+  const client = await pool.connect();
   try {
     const { id } = req.params;
-    await pool.query('DELETE FROM pedidos_app_orders WHERE id = $1', [id]);
+    await client.query('BEGIN');
+    const { rows } = await client.query('SELECT * FROM pedidos_app_orders WHERE id=$1 FOR UPDATE', [id]);
+    if (!rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Pedido no encontrado' });
+    }
+    if (rows[0].status !== 'Cancelado') await releaseProductStock(client, rows[0], req.user?.username);
+    await client.query('DELETE FROM pedidos_app_orders WHERE id = $1', [id]);
+    await client.query('COMMIT');
     res.json({ status: 'ok' });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Error deleting order:', error);
     res.status(500).json({ status: 'error', error: error.message });
-  }
+  } finally { client.release(); }
 });
 
 // ================= PRODUCTOS =================
 // Obtener todos los productos admin
 app.get('/api/pedidos/admin/products', authenticateToken, async (req, res) => {
   try {
-    if (!process.env.DATABASE_URL) return res.json({ status: 'ok', products: [] });
-    const { rows } = await pool.query('SELECT * FROM pedidos_app_products ORDER BY id DESC');
-    res.json({ status: 'ok', products: rows });
+    if (!dbUrl) return res.json({ status: 'ok', products: [] });
+    const { rows } = await pool.query(`
+      SELECT id, title, description, price, category, status, is_active, is_featured,
+             stock, barcode, track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost,
+             rating_sum, rating_count, created_at, updated_at, image IS NOT NULL AS has_image
+      FROM pedidos_app_products ORDER BY id DESC
+    `);
+    res.json({ status: 'ok', products: rows.map((product) => productForResponse(req, product)) });
   } catch (error) {
     console.error('Error fetching products:', error);
     res.status(500).json({ status: 'error', error: error.message });
@@ -659,15 +1427,24 @@ app.get('/api/pedidos/admin/products', authenticateToken, async (req, res) => {
 // Crear producto
 app.post('/api/pedidos/admin/products', authenticateToken, async (req, res) => {
   try {
-    const { title, description, price, category, image, status, is_featured, stock } = req.body;
+    const { title, description, price, category, image, status, is_featured, stock,
+      barcode, track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost } = req.body;
+    if (!title?.trim() || !Number.isFinite(Number(price)) || Number(price) < 0) {
+      return res.status(400).json({ error: 'Nombre y precio válido son obligatorios' });
+    }
     const { rows } = await pool.query(
-      'INSERT INTO pedidos_app_products (title, description, price, category, image, status, is_featured, stock) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-      [title, description, price, category, image, status || 'Activo', is_featured || false, stock || null]
+      `INSERT INTO pedidos_app_products
+       (title, description, price, category, image, status, is_featured, stock, barcode,
+        track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+      [title.trim(), description, Number(price), category, image, status || 'Activo', Boolean(is_featured),
+        Number(stock) || 0, barcode?.trim() || null, Boolean(track_stock), Number(low_stock_threshold) || 5,
+        inventory_unit || 'unidad', Number(inventory_unit_cost) || 0]
     );
-    res.json({ status: 'ok', product: rows[0] });
+    res.status(201).json({ status: 'ok', product: productForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image) }) });
   } catch (error) {
     console.error('Error creating product:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    res.status(error.code === '23505' ? 409 : 500).json({ status: 'error', error: error.code === '23505' ? 'El código de barras ya está asignado' : error.message });
   }
 });
 
@@ -675,15 +1452,35 @@ app.post('/api/pedidos/admin/products', authenticateToken, async (req, res) => {
 app.put('/api/pedidos/admin/products/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    const { title, description, price, category, image, status, is_featured, stock } = req.body;
-    const { rows } = await pool.query(
-      'UPDATE pedidos_app_products SET title = $1, description = $2, price = $3, category = $4, image = $5, status = $6, is_featured = $7, stock = $8 WHERE id = $9 RETURNING *',
-      [title, description, price, category, image, status, is_featured, stock, id]
-    );
-    res.json({ status: 'ok', product: rows[0] });
+    const { title, description, price, category, image, status, is_featured, stock,
+      barcode, track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost } = req.body;
+    const keepStoredImage = isManagedMediaUrl(image, 'products', id);
+    const { rows } = keepStoredImage
+      ? await pool.query(
+        `UPDATE pedidos_app_products
+         SET title=$1, description=$2, price=$3, category=$4, status=$5,
+             is_featured=$6, stock=$7, barcode=$8, track_stock=$9,
+             low_stock_threshold=$10, inventory_unit=$11, inventory_unit_cost=$12, updated_at=NOW()
+         WHERE id::text=$13 RETURNING *`,
+        [title, description, price, category, status, is_featured, Number(stock) || 0,
+          barcode?.trim() || null, Boolean(track_stock), Number(low_stock_threshold) || 5,
+          inventory_unit || 'unidad', Number(inventory_unit_cost) || 0, id]
+      )
+      : await pool.query(
+        `UPDATE pedidos_app_products
+         SET title=$1, description=$2, price=$3, category=$4, image=$5, status=$6,
+             is_featured=$7, stock=$8, barcode=$9, track_stock=$10,
+             low_stock_threshold=$11, inventory_unit=$12, inventory_unit_cost=$13, updated_at=NOW()
+         WHERE id::text=$14 RETURNING *`,
+        [title, description, price, category, image, status, is_featured, Number(stock) || 0,
+          barcode?.trim() || null, Boolean(track_stock), Number(low_stock_threshold) || 5,
+          inventory_unit || 'unidad', Number(inventory_unit_cost) || 0, id]
+      );
+    if (!rows.length) return res.status(404).json({ status: 'error', error: 'Producto no encontrado' });
+    res.json({ status: 'ok', product: productForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image) }) });
   } catch (error) {
     console.error('Error updating product:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    res.status(error.code === '23505' ? 409 : 500).json({ status: 'error', error: error.code === '23505' ? 'El código de barras ya está asignado' : error.message });
   }
 });
 
@@ -691,7 +1488,7 @@ app.put('/api/pedidos/admin/products/:id', authenticateToken, async (req, res) =
 app.delete('/api/pedidos/admin/products/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    await pool.query('DELETE FROM pedidos_app_products WHERE id = $1', [id]);
+    await pool.query('DELETE FROM pedidos_app_products WHERE id::text = $1', [id]);
     res.json({ status: 'ok' });
   } catch (error) {
     console.error('Error deleting product:', error);
@@ -699,16 +1496,132 @@ app.delete('/api/pedidos/admin/products/:id', authenticateToken, async (req, res
   }
 });
 
+const barcodeLookupCache = new Map();
+app.get('/api/pedidos/admin/products/lookup-barcode/:code', authenticateToken, inventoryLookupLimiter, async (req, res) => {
+  const code = String(req.params.code || '').replace(/\D/g, '');
+  if (!/^\d{8,14}$/.test(code)) return res.status(400).json({ error: 'El código debe contener entre 8 y 14 dígitos' });
+  const cached = barcodeLookupCache.get(code);
+  if (cached && cached.expiresAt > Date.now()) return res.json({ status: 'ok', source: 'cache', product: cached.product });
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 6000);
+    const response = await fetch(`https://world.openfoodfacts.org/api/v3/product/${code}?fields=code,product_name,brands,quantity,image_front_url,categories`, {
+      headers: { 'User-Agent': process.env.OPEN_FOOD_FACTS_USER_AGENT || 'DistritoBG/1.0 (inventario; contacto@distritobg.app)' },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!response.ok) return res.status(response.status === 404 ? 404 : 502).json({ error: 'Producto no encontrado en Open Food Facts' });
+    const data = await response.json();
+    const source = data.product || data;
+    const product = {
+      barcode: code,
+      title: source.product_name || '',
+      brand: source.brands || '',
+      quantity: source.quantity || '',
+      image: source.image_front_url || '',
+      category: String(source.categories || '').split(',')[0].trim(),
+    };
+    barcodeLookupCache.set(code, { product, expiresAt: Date.now() + 24 * 60 * 60 * 1000 });
+    res.json({ status: 'ok', source: 'open-food-facts', product, advisory: true });
+  } catch (error) {
+    res.status(502).json({ error: error.name === 'AbortError' ? 'La consulta externa tardó demasiado' : 'No fue posible consultar el código de barras' });
+  }
+});
+
+app.get('/api/pedidos/admin/product-stock', authenticateToken, requirePermission('Inventario', 'ver'), async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, title, category, status, stock, barcode, track_stock, low_stock_threshold,
+             inventory_unit, inventory_unit_cost, updated_at
+      FROM pedidos_app_products
+      ORDER BY (track_stock AND COALESCE(stock, 0) <= low_stock_threshold) DESC, title
+    `);
+    res.json({ status: 'ok', data: rows });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.post('/api/pedidos/admin/product-stock/:id/movements', authenticateToken, requirePermission('Inventario', 'editar'), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const movementType = String(req.body.movement_type || '').toUpperCase();
+    const quantity = Number(req.body.quantity);
+    if (!['ENTRADA', 'SALIDA', 'AJUSTE'].includes(movementType) || !Number.isInteger(quantity) || quantity < 0) {
+      return res.status(400).json({ error: 'Movimiento o cantidad inválida' });
+    }
+    await client.query('BEGIN');
+    const { rows } = await client.query('SELECT id, stock FROM pedidos_app_products WHERE id::text=$1 FOR UPDATE', [req.params.id]);
+    if (!rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Producto no encontrado' });
+    }
+    const current = Number(rows[0].stock) || 0;
+    const next = movementType === 'AJUSTE' ? quantity : movementType === 'ENTRADA' ? current + quantity : current - quantity;
+    if (next < 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'La salida supera las existencias disponibles' });
+    }
+    await client.query(`
+      UPDATE pedidos_app_products SET stock=$1, track_stock=TRUE, updated_at=NOW() WHERE id=$2
+    `, [next, rows[0].id]);
+    await client.query(`
+      INSERT INTO pedidos_app_product_stock_movements
+        (product_id, movement_type, quantity, balance_after, reason, created_by)
+      VALUES ($1,$2,$3,$4,$5,$6)
+    `, [rows[0].id, movementType, next - current, next, String(req.body.reason || '').slice(0, 500), req.user.username]);
+    await client.query('COMMIT');
+    res.json({ status: 'ok', stock: next });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally { client.release(); }
+});
+
+app.patch('/api/pedidos/admin/product-stock/:id', authenticateToken, requirePermission('Inventario', 'editar'), async (req, res) => {
+  try {
+    const { barcode, track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost } = req.body;
+    const threshold = Number(low_stock_threshold);
+    const unitCost = Number(inventory_unit_cost);
+    if (!Number.isInteger(threshold) || threshold < 0 || !Number.isFinite(unitCost) || unitCost < 0) {
+      return res.status(400).json({ error: 'Umbral o costo inválido' });
+    }
+    const { rows } = await pool.query(`
+      UPDATE pedidos_app_products
+      SET barcode=$1, track_stock=$2, low_stock_threshold=$3,
+          inventory_unit=$4, inventory_unit_cost=$5, updated_at=NOW()
+      WHERE id::text=$6 RETURNING id, stock
+    `, [String(barcode || '').trim() || null, Boolean(track_stock), threshold, String(inventory_unit || 'unidad').slice(0, 30), Math.round(unitCost), req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Producto no encontrado' });
+    res.json({ status: 'ok', data: rows[0] });
+  } catch (error) {
+    res.status(error.code === '23505' ? 409 : 500).json({ error: error.code === '23505' ? 'El código de barras ya está asignado a otro producto' : error.message });
+  }
+});
+
 // ================= CONFIGURACION =================
+const SETTINGS_FIELDS = new Set([
+  'whatsapp_number', 'nequi_number', 'bancolombia_number', 'restaurant_name',
+  'description', 'phone', 'email', 'address', 'schedule', 'logo', 'prep_time',
+  'min_order', 'delivery_cost', 'max_distance', 'delivery_schedule',
+  'default_order_type', 'payment_efectivo', 'payment_nequi', 'payment_daviplata',
+  'payment_tarjeta', 'payment_transferencia', 'payment_pse', 'instagram',
+  'facebook', 'tiktok', 'welcome_message', 'currency', 'timezone', 'language',
+  'date_format', 'time_format', 'web_primary_color', 'web_background_color',
+  'web_surface_color', 'web_text_color', 'admin_primary_color', 'admin_background_color',
+  'admin_surface_color', 'admin_text_color', 'store_latitude', 'store_longitude',
+  'kitchen_address', 'kitchen_place_id', 'delivery_completion_radius_meters'
+]);
+
+const COLOR_SETTING_FIELDS = new Set([...SETTINGS_FIELDS].filter((key) => key.endsWith('_color')));
+
 app.get('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM pedidos_app_settings WHERE id = 1');
     if (rows.length === 0) {
       await pool.query('INSERT INTO pedidos_app_settings (id) VALUES (1)');
       const { rows: newRows } = await pool.query('SELECT * FROM pedidos_app_settings WHERE id = 1');
-      return res.json({ status: 'ok', settings: newRows[0] });
+      return res.json({ status: 'ok', settings: settingsForResponse(req, newRows[0]) });
     }
-    res.json({ status: 'ok', settings: rows[0] });
+    res.json({ status: 'ok', settings: settingsForResponse(req, rows[0]) });
   } catch (error) {
     console.error('Error fetching settings:', error);
     res.status(500).json({ status: 'error', error: error.message });
@@ -717,20 +1630,45 @@ app.get('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
 
 app.put('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
   try {
-    const data = req.body;
-    // Build dynamic UPDATE query
-    const keys = Object.keys(data).filter(k => k !== 'id' && k !== 'updated_at');
+    const data = { ...req.body };
+    if (typeof data.logo === 'string' && data.logo.includes('/api/pedidos/media/settings-logo')) delete data.logo;
+    const requestedKeys = Object.keys(data).filter(k => k !== 'id' && k !== 'updated_at');
+    const invalidKeys = requestedKeys.filter(k => !SETTINGS_FIELDS.has(k));
+    if (invalidKeys.length) {
+      return res.status(400).json({ status: 'error', error: 'La configuración contiene campos no permitidos.' });
+    }
+    const invalidColors = requestedKeys.filter((key) => COLOR_SETTING_FIELDS.has(key) && !/^#[0-9A-Fa-f]{6}$/.test(String(data[key] || '')));
+    if (invalidColors.length) return res.status(400).json({ status: 'error', error: 'Los colores deben usar formato hexadecimal #RRGGBB.' });
+    if (requestedKeys.includes('kitchen_address') && String(data.kitchen_address || '').length > 500) {
+      return res.status(400).json({ status: 'error', error: 'La dirección de la cocina es demasiado larga.' });
+    }
+    if (requestedKeys.includes('kitchen_place_id') && String(data.kitchen_place_id || '').length > 255) {
+      return res.status(400).json({ status: 'error', error: 'El identificador de Google Maps no es válido.' });
+    }
+    if (requestedKeys.includes('delivery_completion_radius_meters')) {
+      const completionRadius = Number(data.delivery_completion_radius_meters);
+      if (!Number.isInteger(completionRadius) || completionRadius < 50 || completionRadius > 500) {
+        return res.status(400).json({ status: 'error', error: 'El radio para finalizar debe estar entre 50 y 500 metros.' });
+      }
+    }
+    const latitude = Number(data.store_latitude);
+    const longitude = Number(data.store_longitude);
+    const hasLatitude = data.store_latitude !== null && data.store_latitude !== undefined && data.store_latitude !== '';
+    const hasLongitude = data.store_longitude !== null && data.store_longitude !== undefined && data.store_longitude !== '';
+    if ((requestedKeys.includes('store_latitude') && (!hasLatitude || !Number.isFinite(latitude) || latitude < -90 || latitude > 90))
+        || (requestedKeys.includes('store_longitude') && (!hasLongitude || !Number.isFinite(longitude) || longitude < -180 || longitude > 180))) {
+      return res.status(400).json({ status: 'error', error: 'Las coordenadas de la cocina no son válidas.' });
+    }
+    const keys = requestedKeys;
     if (keys.length === 0) return res.json({ status: 'ok', message: 'No fields to update' });
 
-    const setString = keys.map((k, i) => `${k} = $${i + 1}`).join(', ');
+    const setString = keys.map((k, i) => `"${k}" = $${i + 1}`).join(', ');
     const values = keys.map(k => data[k]);
 
-    // Add updated_at manually if needed, or rely on schema default
-
-    const query = `UPDATE pedidos_app_settings SET ${setString} WHERE id = 1 RETURNING *`;
+    const query = `UPDATE pedidos_app_settings SET ${setString}, updated_at = NOW() WHERE id = 1 RETURNING *`;
     const { rows } = await pool.query(query, values);
 
-    res.json({ status: 'ok', settings: rows[0] });
+    res.json({ status: 'ok', settings: settingsForResponse(req, rows[0]) });
   } catch (error) {
     console.error('Error updating settings:', error);
     res.status(500).json({ status: 'error', error: error.message });
@@ -738,287 +1676,6 @@ app.put('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
 });
 
 
-async function ensureRealInventorySchema(client) {
-  await client.query(`
-      CREATE TABLE IF NOT EXISTS pedidos_app_purchases (
-        id SERIAL PRIMARY KEY,
-        invoice_number VARCHAR(100),
-        supplier VARCHAR(255),
-        purchase_date DATE NOT NULL DEFAULT CURRENT_DATE,
-        total_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
-        iva_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
-        notes TEXT,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS pedidos_app_purchase_items (
-        id SERIAL PRIMARY KEY,
-        purchase_id INTEGER NOT NULL REFERENCES pedidos_app_purchases(id) ON DELETE RESTRICT,
-        inventory_id UUID NOT NULL REFERENCES pedidos_app_inventory(id) ON DELETE RESTRICT,
-        quantity NUMERIC(14,4) NOT NULL,
-        unit_cost NUMERIC(14,4) NOT NULL,
-        total_cost NUMERIC(14,2) NOT NULL,
-        iva_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
-        lot_code VARCHAR(100),
-        expiration_date DATE
-      );
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS sku VARCHAR(100);
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS purchase_unit VARCHAR(50);
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS consumption_unit VARCHAR(50);
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS conversion_factor NUMERIC(14,4) DEFAULT 1;
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS max_stock NUMERIC(14,4);
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'Activo';
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS observations TEXT;
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS branch_id INTEGER DEFAULT 1;
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW();
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS unit VARCHAR(50);
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS image TEXT;
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS type VARCHAR(50) DEFAULT 'Ingrediente';
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS expiry_date DATE;
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS supplier VARCHAR(255);
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS min_stock NUMERIC(14,4) DEFAULT 0;
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS stock NUMERIC(14,4) DEFAULT 0;
-      ALTER TABLE pedidos_app_inventory ADD COLUMN IF NOT EXISTS unit_cost NUMERIC(14,4) DEFAULT 0;
-      ALTER TABLE pedidos_app_purchase_items ADD COLUMN IF NOT EXISTS lot_code VARCHAR(100);
-      ALTER TABLE pedidos_app_purchase_items ADD COLUMN IF NOT EXISTS expiration_date DATE;
-  
-      CREATE TABLE IF NOT EXISTS pedidos_app_inventory_lots (
-        id BIGSERIAL PRIMARY KEY,
-        inventory_id UUID NOT NULL REFERENCES pedidos_app_inventory(id) ON DELETE RESTRICT,
-        purchase_item_id INTEGER,
-        branch_id INTEGER NOT NULL DEFAULT 1,
-        lot_code VARCHAR(100) NOT NULL,
-        source_quantity NUMERIC(14,4) NOT NULL,
-        source_unit VARCHAR(50),
-        initial_quantity NUMERIC(14,4) NOT NULL CHECK (initial_quantity > 0),
-        available_quantity NUMERIC(14,4) NOT NULL CHECK (available_quantity >= 0),
-        unit_cost NUMERIC(14,4) NOT NULL CHECK (unit_cost >= 0),
-        expiration_date DATE,
-        status VARCHAR(20) NOT NULL DEFAULT 'Disponible',
-        created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-        UNIQUE (branch_id, lot_code)
-      );
-  
-      CREATE TABLE IF NOT EXISTS pedidos_app_inventory_movements (
-        id BIGSERIAL PRIMARY KEY,
-        inventory_id UUID NOT NULL REFERENCES pedidos_app_inventory(id) ON DELETE RESTRICT,
-        lot_id BIGINT REFERENCES pedidos_app_inventory_lots(id) ON DELETE RESTRICT,
-        branch_id INTEGER NOT NULL DEFAULT 1,
-        movement_type VARCHAR(30) NOT NULL,
-        quantity NUMERIC(14,4) NOT NULL,
-        unit_cost NUMERIC(14,4) NOT NULL DEFAULT 0,
-        balance_after NUMERIC(14,4),
-        reference_type VARCHAR(30),
-        reference_id VARCHAR(100),
-        notes TEXT,
-        created_by VARCHAR(100) DEFAULT 'Administrador',
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
-      );CREATE TABLE IF NOT EXISTS settings (
-        id SERIAL PRIMARY KEY,
-        whatsapp_number VARCHAR(50),
-        nequi_number VARCHAR(50),
-        bancolombia_number VARCHAR(50)
-      );
-    `);
-}
-
-app.post('/api/pedidos/setup', async (req, res) => {
-  try {
-    if (!process.env.DATABASE_URL) return res.status(400).json({ error: 'No hay DATABASE_URL en el archivo .env' });
-
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS pedidos_app_products (
-        id SERIAL PRIMARY KEY,
-        title VARCHAR(255) NOT NULL,
-        description TEXT,
-        price INTEGER NOT NULL,
-        category VARCHAR(100),
-        image TEXT
-      );
-      
-      ALTER TABLE pedidos_app_products ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'Activo';
-      ALTER TABLE pedidos_app_products ADD COLUMN IF NOT EXISTS is_featured BOOLEAN DEFAULT false;
-      ALTER TABLE pedidos_app_products ADD COLUMN IF NOT EXISTS stock INTEGER DEFAULT NULL;
-      CREATE TABLE IF NOT EXISTS settings (
-        id SERIAL PRIMARY KEY,
-        whatsapp_number VARCHAR(50),
-        nequi_number VARCHAR(50),
-        bancolombia_number VARCHAR(50)
-      );
-      CREATE TABLE IF NOT EXISTS pedidos_app_orders (
-        id SERIAL PRIMARY KEY,
-        customer_name VARCHAR(255),
-        customer_phone VARCHAR(50),
-        address TEXT,
-        barrio VARCHAR(255),
-        delivery_type VARCHAR(50),
-        payment_method VARCHAR(50),
-        total INTEGER,
-        cart_json JSONB,
-        status VARCHAR(50) DEFAULT 'Nuevo',
-        source VARCHAR(50) DEFAULT 'Web',
-        notes TEXT,
-        created_at TIMESTAMP DEFAULT NOW(),
-        completed_at TIMESTAMP
-      );
-      
-      ALTER TABLE pedidos_app_orders ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'Nuevo';
-      ALTER TABLE pedidos_app_orders ADD COLUMN IF NOT EXISTS source VARCHAR(50) DEFAULT 'Web';
-      ALTER TABLE pedidos_app_orders ADD COLUMN IF NOT EXISTS notes TEXT;
-      ALTER TABLE pedidos_app_orders ADD COLUMN IF NOT EXISTS voucher_reference VARCHAR(255);
-      ALTER TABLE pedidos_app_purchases ADD COLUMN IF NOT EXISTS iva_amount INTEGER DEFAULT 0;
-      ALTER TABLE pedidos_app_purchase_items ADD COLUMN IF NOT EXISTS iva_amount INTEGER DEFAULT 0;
-
-      CREATE TABLE IF NOT EXISTS pedidos_app_users (
-        id SERIAL PRIMARY KEY,
-        username VARCHAR(100) UNIQUE NOT NULL,
-        password_hash VARCHAR(255) NOT NULL,
-        role VARCHAR(50) DEFAULT 'admin',
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-        CREATE TABLE IF NOT EXISTS pedidos_app_categories (
-          id SERIAL PRIMARY KEY,
-          name VARCHAR(100) UNIQUE NOT NULL,
-          description TEXT,
-          image TEXT,
-          status VARCHAR(20) DEFAULT 'Activa',
-          created_at TIMESTAMP DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS pedidos_app_customers (
-          id SERIAL PRIMARY KEY,
-          name VARCHAR(255),
-          phone VARCHAR(50) UNIQUE NOT NULL,
-          avatar_url TEXT,
-          total_orders INTEGER DEFAULT 0,
-          total_spent INTEGER DEFAULT 0,
-          created_at TIMESTAMP DEFAULT NOW(),
-          updated_at TIMESTAMP DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS pedidos_app_push_subscriptions (
-          id SERIAL PRIMARY KEY,
-          endpoint TEXT UNIQUE NOT NULL,
-          subscription_json JSON NOT NULL,
-          created_at TIMESTAMP DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS pedidos_app_expenses (
-          id SERIAL PRIMARY KEY,
-          category VARCHAR(100),
-          description TEXT,
-          amount INTEGER,
-          expense_date DATE,
-          created_at TIMESTAMP DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS pedidos_app_closures (
-          id SERIAL PRIMARY KEY,
-          start_date DATE NOT NULL,
-          end_date DATE NOT NULL,
-          status VARCHAR(20) DEFAULT 'Cerrado',
-          total_sales INTEGER DEFAULT 0,
-          total_costs INTEGER DEFAULT 0,
-          total_expenses INTEGER DEFAULT 0,
-          net_profit INTEGER DEFAULT 0,
-          summary_json JSONB,
-          closed_by VARCHAR(100),
-          closed_at TIMESTAMP DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS pedidos_app_inventory (
-          id SERIAL PRIMARY KEY,
-          name VARCHAR(255) UNIQUE NOT NULL,
-          category VARCHAR(100) DEFAULT 'General',
-          created_at TIMESTAMP DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS pedidos_app_rendimientos (
-          id SERIAL PRIMARY KEY,
-          ingrediente_id INTEGER REFERENCES pedidos_app_inventory(id) ON DELETE CASCADE,
-          ingrediente_name VARCHAR(255),
-          unidad_compra VARCHAR(50),
-          cantidad_comprada NUMERIC(10, 2),
-          costo_compra INTEGER,
-          unidad_consumo VARCHAR(50),
-          conversion_definida NUMERIC(10, 2),
-          rendimiento_obtenido NUMERIC(10, 2),
-          costo_por_unidad NUMERIC(10, 2),
-          estado VARCHAR(20) DEFAULT 'Activo',
-          created_by VARCHAR(100),
-          created_at TIMESTAMP DEFAULT NOW()
-        );
-        ALTER TABLE pedidos_app_rendimientos ADD COLUMN IF NOT EXISTS conversion_definida NUMERIC(10, 2);
-        ALTER TABLE pedidos_app_rendimientos ADD COLUMN IF NOT EXISTS created_by VARCHAR(100);
-        CREATE TABLE IF NOT EXISTS pedidos_app_recipes (
-          id SERIAL PRIMARY KEY,
-          product_id INTEGER REFERENCES pedidos_app_products(id) ON DELETE CASCADE,
-          rendimiento_id INTEGER REFERENCES pedidos_app_rendimientos(id) ON DELETE CASCADE,
-          cantidad_usada NUMERIC(10, 2),
-          costo_calculado NUMERIC(10, 2),
-          created_at TIMESTAMP DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS pedidos_app_horarios (
-          id SERIAL PRIMARY KEY,
-          day_of_week VARCHAR(20) UNIQUE NOT NULL,
-          is_active BOOLEAN DEFAULT true,
-          open_time VARCHAR(10) DEFAULT '18:00',
-          close_time VARCHAR(10) DEFAULT '22:00'
-        );
-        CREATE TABLE IF NOT EXISTS pedidos_app_horarios_config (
-          id SERIAL PRIMARY KEY,
-          pre_open_minutes INTEGER DEFAULT 30,
-          auto_close_minutes INTEGER DEFAULT 15,
-          prep_time_minutes INTEGER DEFAULT 30,
-          timezone VARCHAR(50) DEFAULT 'America/Bogota'
-        );
-        CREATE TABLE IF NOT EXISTS pedidos_app_horarios_exceptions (
-          id SERIAL PRIMARY KEY,
-          exception_date DATE UNIQUE NOT NULL,
-          description VARCHAR(255),
-          is_closed BOOLEAN DEFAULT true,
-          open_time VARCHAR(10),
-          close_time VARCHAR(10),
-          created_at TIMESTAMP DEFAULT NOW()
-        );
-    `);
-
-    await ensureRealInventorySchema(pool);
-
-    // Seed Horarios if empty
-    const { rows: horariosCount } = await pool.query('SELECT COUNT(*) FROM pedidos_app_horarios');
-    if (parseInt(horariosCount[0].count) === 0) {
-      const days = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'];
-      for (const day of days) {
-        await pool.query('INSERT INTO pedidos_app_horarios (day_of_week) VALUES ($1)', [day]);
-      }
-    }
-
-    // Seed Horarios Config if empty
-    const { rows: configCount } = await pool.query('SELECT COUNT(*) FROM pedidos_app_horarios_config');
-    if (parseInt(configCount[0].count) === 0) {
-      await pool.query('INSERT INTO pedidos_app_horarios_config DEFAULT VALUES');
-    }
-
-    // Insertar usuario por defecto si no hay
-    const { rows: userCount } = await pool.query('SELECT COUNT(*) FROM pedidos_app_users');
-    if (parseInt(userCount[0].count) === 0) {
-      const salt = await bcrypt.genSalt(10);
-      const hashedPassword = await bcrypt.hash('Distrito2026*', salt);
-      await pool.query('INSERT INTO pedidos_app_users (username, password_hash, role) VALUES ($1, $2, $3)', ['admin', hashedPassword, 'admin']);
-      console.log('Usuario admin creado por defecto.');
-    }
-
-    // Solo insertar si esta vacía
-    const { rows: count } = await pool.query('SELECT COUNT(*) FROM pedidos_app_products');
-    if (parseInt(count[0].count) === 0) {
-      for (const p of seedProducts) {
-        await pool.query(
-          'INSERT INTO pedidos_app_products (title, description, price, category, image) VALUES ($1, $2, $3, $4, $5)',
-          [p.title, p.description, p.price, p.category, p.image]
-        );
-      }
-    }
-
-    res.json({ status: 'ok', message: 'Tablas creadas e inicializadas exitosamente en Neon!' });
-  } catch (error) {
-    console.error('Error de setup:', error);
-    res.status(500).json({ status: 'error', error: error.message });
-  }
-});
 // ================= INVENTARIO =================
 
 app.get('/api/pedidos/admin/inventory', authenticateToken, async (req, res) => {
@@ -1045,7 +1702,6 @@ app.post('/api/pedidos/admin/inventory', authenticateToken, async (req, res) => 
       conversion_factor, max_stock, status, observations } = req.body;
     if (!name?.trim()) return res.status(400).json({ status: 'error', error: 'El nombre es requerido' });
     await client.query('BEGIN');
-    await ensureRealInventorySchema(client);
     const automaticSku = await generateIngredientSku(client, category);
     const { rows } = await client.query(
       `INSERT INTO pedidos_app_inventory
@@ -1108,7 +1764,6 @@ app.post('/api/pedidos/admin/inventory/:id/movement', authenticateToken, async (
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await ensureRealInventorySchema(client);
       const { rows: ingredients } = await client.query('SELECT * FROM pedidos_app_inventory WHERE id = $1 FOR UPDATE', [id]);
       if (!ingredients.length) throw new Error('Ingrediente no encontrado.');
       if (movement_type === 'IN') {
@@ -1181,7 +1836,6 @@ app.post('/api/pedidos/admin/purchases', authenticateToken, async (req, res) => 
 
   try {
     await client.query('BEGIN');
-    await ensureRealInventorySchema(client);
 
     // 1. Crear compra
     const { rows: purchaseRows } = await client.query(
@@ -1357,9 +2011,9 @@ app.post('/api/pedidos/push/subscribe', async (req, res) => {
       return res.status(400).json({ error: 'Suscripción inválida' });
     }
     await pool.query(
-      `INSERT INTO pedidos_app_push_subscriptions (endpoint, subscription_json)
-       VALUES ($1, $2)
-       ON CONFLICT (endpoint) DO UPDATE SET subscription_json = $2`,
+      `INSERT INTO pedidos_app_push_subscriptions (endpoint, subscription_json, audience, updated_at)
+       VALUES ($1, $2, 'customer', NOW())
+       ON CONFLICT (endpoint) DO UPDATE SET subscription_json = $2, audience = 'customer', user_id = NULL, updated_at = NOW()`,
       [subscription.endpoint, JSON.stringify(subscription)]
     );
     res.status(201).json({ status: 'ok' });
@@ -1397,9 +2051,17 @@ app.post('/api/pedidos/admin/push/send', authenticateToken, async (req, res) => 
 
 app.get('/api/pedidos/announcement', async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT * FROM pedidos_app_announcements ORDER BY id DESC LIMIT 1');
+    const { rows } = await pool.query(`
+      SELECT id, title, body, cta_label, cta_url, starts_at, ends_at,
+             display_frequency, is_active, updated_at, image_url IS NOT NULL AS has_image
+      FROM pedidos_app_announcements
+      WHERE is_active = TRUE
+        AND (starts_at IS NULL OR starts_at <= NOW())
+        AND (ends_at IS NULL OR ends_at >= NOW())
+      ORDER BY updated_at DESC, id DESC LIMIT 1
+    `);
     if (rows.length > 0) {
-      res.json({ status: 'ok', announcement: rows[0] });
+      res.json({ status: 'ok', announcement: announcementForResponse(req, rows[0]) });
     } else {
       res.json({ status: 'ok', announcement: null });
     }
@@ -1408,275 +2070,226 @@ app.get('/api/pedidos/announcement', async (req, res) => {
   }
 });
 
+app.get('/api/pedidos/admin/announcement', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, title, body, cta_label, cta_url, starts_at, ends_at,
+             display_frequency, is_active, updated_at, image_url IS NOT NULL AS has_image
+      FROM pedidos_app_announcements ORDER BY updated_at DESC, id DESC LIMIT 1
+    `);
+    res.json({ status: 'ok', announcement: rows.length ? announcementForResponse(req, rows[0]) : null });
+  } catch (error) {
+    res.status(500).json({ status: 'error', error: error.message });
+  }
+});
+
 app.put('/api/pedidos/admin/announcement', authenticateToken, async (req, res) => {
-  const { title, image_url, is_active } = req.body;
+  const title = String(req.body.title || '').trim();
+  const imageUrl = String(req.body.image_url || '');
+  const body = String(req.body.body || '').trim();
+  const ctaLabel = String(req.body.cta_label || 'Continuar').trim();
+  const ctaUrl = String(req.body.cta_url || '').trim();
+  const startsAt = req.body.starts_at || null;
+  const endsAt = req.body.ends_at || null;
+  const displayFrequency = ['always', 'session', 'daily'].includes(req.body.display_frequency)
+    ? req.body.display_frequency
+    : 'session';
+
+  if (!title || title.length > 255) return res.status(400).json({ error: 'El título es obligatorio y admite hasta 255 caracteres' });
+  if (body.length > 1000) return res.status(400).json({ error: 'El mensaje admite hasta 1000 caracteres' });
+  if (!ctaLabel || ctaLabel.length > 80) return res.status(400).json({ error: 'El texto del botón admite hasta 80 caracteres' });
+  if (ctaUrl && !ctaUrl.startsWith('/') && !/^https:\/\//i.test(ctaUrl)) {
+    return res.status(400).json({ error: 'El enlace debe iniciar con / o usar HTTPS' });
+  }
+  if (startsAt && !Number.isFinite(new Date(startsAt).getTime())) return res.status(400).json({ error: 'La fecha de inicio no es válida' });
+  if (endsAt && !Number.isFinite(new Date(endsAt).getTime())) return res.status(400).json({ error: 'La fecha de cierre no es válida' });
+  if (startsAt && endsAt && new Date(endsAt) <= new Date(startsAt)) {
+    return res.status(400).json({ error: 'La fecha de cierre debe ser posterior al inicio' });
+  }
   try {
     const { rows } = await pool.query('SELECT id FROM pedidos_app_announcements LIMIT 1');
     if (rows.length > 0) {
       const id = rows[0].id;
-      const updated = await pool.query(
-        'UPDATE pedidos_app_announcements SET title = $1, image_url = $2, is_active = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4 RETURNING *',
-        [title, image_url, is_active, id]
-      );
-      res.json({ status: 'ok', announcement: updated.rows[0] });
+      const keepStoredImage = isManagedMediaUrl(imageUrl, 'announcements', id);
+      const updated = keepStoredImage
+        ? await pool.query(
+          `UPDATE pedidos_app_announcements
+           SET title=$1, body=$2, cta_label=$3, cta_url=$4, starts_at=$5, ends_at=$6,
+               display_frequency=$7, is_active=$8, updated_at=CURRENT_TIMESTAMP
+           WHERE id=$9 RETURNING *`,
+          [title, body, ctaLabel, ctaUrl, startsAt, endsAt, displayFrequency, Boolean(req.body.is_active), id]
+        )
+        : await pool.query(
+          `UPDATE pedidos_app_announcements
+           SET title=$1, image_url=$2, body=$3, cta_label=$4, cta_url=$5, starts_at=$6,
+               ends_at=$7, display_frequency=$8, is_active=$9, updated_at=CURRENT_TIMESTAMP
+           WHERE id=$10 RETURNING *`,
+          [title, imageUrl, body, ctaLabel, ctaUrl, startsAt, endsAt, displayFrequency, Boolean(req.body.is_active), id]
+        );
+      res.json({ status: 'ok', announcement: announcementForResponse(req, { ...updated.rows[0], has_image: Boolean(updated.rows[0].image_url) }) });
     } else {
       const inserted = await pool.query(
-        'INSERT INTO pedidos_app_announcements (title, image_url, is_active) VALUES ($1, $2, $3) RETURNING *',
-        [title, image_url, is_active]
+        `INSERT INTO pedidos_app_announcements
+         (title, image_url, body, cta_label, cta_url, starts_at, ends_at, display_frequency, is_active)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        [title, imageUrl, body, ctaLabel, ctaUrl, startsAt, endsAt, displayFrequency, Boolean(req.body.is_active)]
       );
-      res.json({ status: 'ok', announcement: inserted.rows[0] });
+      res.status(201).json({ status: 'ok', announcement: announcementForResponse(req, { ...inserted.rows[0], has_image: Boolean(inserted.rows[0].image_url) }) });
     }
   } catch (error) {
     res.status(500).json({ status: 'error', error: error.message });
   }
 });
 
-// ================= RENDIMIENTOS & INVENTARIO =================
-app.get('/api/pedidos/admin/inventory/basic', authenticateToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query('SELECT * FROM pedidos_app_inventory ORDER BY name ASC');
-    res.json({ status: 'ok', data: rows });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/pedidos/admin/inventory/basic', authenticateToken, async (req, res) => {
-  try {
-    const { name, category } = req.body;
-    const { rows } = await pool.query(
-      'INSERT INTO pedidos_app_inventory (name, category) VALUES ($1, $2) RETURNING *',
-      [name, category || 'General']
-    );
-    res.json({ status: 'ok', data: rows[0] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ================= RECETAS =================
-app.get('/api/pedidos/admin/recipes', authenticateToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT r.product_id, SUM(r.costo_calculado) as total_cost
-      FROM pedidos_app_recipes r
-      GROUP BY r.product_id
-    `);
-    res.json({ status: 'ok', data: rows });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/pedidos/admin/recipes/:productId', authenticateToken, async (req, res) => {
-  try {
-    const { productId } = req.params;
-    const { rows } = await pool.query(`
-      SELECT r.id, r.product_id, r.cantidad_usada, r.costo_calculado, 
-             ren.ingrediente_name, ren.unidad_consumo, ren.costo_por_unidad 
-      FROM pedidos_app_recipes r
-      JOIN pedidos_app_rendimientos ren ON r.rendimiento_id = ren.id
-      WHERE r.product_id = $1
-      ORDER BY r.id ASC
-    `, [productId]);
-    res.json({ status: 'ok', data: rows });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/pedidos/admin/recipes', authenticateToken, async (req, res) => {
-  try {
-    const { product_id, rendimiento_id, cantidad_usada } = req.body;
-
-    // Obtener costo por unidad del rendimiento
-    const renRes = await pool.query('SELECT costo_por_unidad FROM pedidos_app_rendimientos WHERE id = $1', [rendimiento_id]);
-    if (renRes.rowCount === 0) return res.status(404).json({ error: 'Rendimiento no encontrado' });
-
-    const costo_por_unidad = Number(renRes.rows[0].costo_por_unidad);
-    const costo_calculado = costo_por_unidad * Number(cantidad_usada);
-
-    const { rows } = await pool.query(
-      `INSERT INTO pedidos_app_recipes (product_id, rendimiento_id, cantidad_usada, costo_calculado) 
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [product_id, rendimiento_id, cantidad_usada, costo_calculado]
-    );
-    res.json({ status: 'ok', data: rows[0] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete('/api/pedidos/admin/recipes/:id', authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    await pool.query('DELETE FROM pedidos_app_recipes WHERE id = $1', [id]);
-    res.json({ status: 'ok' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/api/pedidos/admin/rendimientos', authenticateToken, async (req, res) => {
-  try {
-    const { rows } = await pool.query('SELECT * FROM pedidos_app_rendimientos ORDER BY id DESC');
-    res.json({ status: 'ok', data: rows });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/pedidos/admin/rendimientos', authenticateToken, async (req, res) => {
-  try {
-    const { ingrediente_id, ingrediente_name, unidad_compra, cantidad_comprada, costo_compra, unidad_consumo, conversion_definida } = req.body;
-
-    // Automatic yield calculation based on conversion rule
-    const rendimiento_obtenido = Number(cantidad_comprada) * Number(conversion_definida);
-    const costo_por_unidad = Number(costo_compra) / rendimiento_obtenido;
-    const created_by = 'Administrador'; // Default since user auth roles aren't strictly complex yet
-
-    const { rows } = await pool.query(
-      `INSERT INTO pedidos_app_rendimientos 
-      (ingrediente_id, ingrediente_name, unidad_compra, cantidad_comprada, costo_compra, unidad_consumo, conversion_definida, rendimiento_obtenido, costo_por_unidad, created_by) 
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-      [ingrediente_id, ingrediente_name, unidad_compra, cantidad_comprada, costo_compra, unidad_consumo, conversion_definida, rendimiento_obtenido, costo_por_unidad, created_by]
-    );
-    res.json({ status: 'ok', data: rows[0] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.delete('/api/pedidos/admin/rendimientos/:id', authenticateToken, async (req, res) => {
-  try {
-    await pool.query('DELETE FROM pedidos_app_rendimientos WHERE id = $1', [req.params.id]);
-    res.json({ status: 'ok' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // ================= REPORTES =================
+function validIsoDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) return false;
+  const parsed = new Date(`${value}T12:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+function shiftIsoDate(value, days) {
+  const parsed = new Date(`${value}T12:00:00.000Z`);
+  parsed.setUTCDate(parsed.getUTCDate() + days);
+  return parsed.toISOString().slice(0, 10);
+}
+
+function reportPercentageChange(current, previous) {
+  const currentValue = Number(current || 0);
+  const previousValue = Number(previous || 0);
+  if (!previousValue) return currentValue ? 100 : 0;
+  return Math.round(((currentValue - previousValue) / Math.abs(previousValue)) * 1000) / 10;
+}
+
+function buildReportData(orderRows, purchaseRows) {
+  const completedStatuses = new Set(['Completado', 'Entregado']);
+  const completedOrders = orderRows.filter((order) => completedStatuses.has(order.status));
+  const customers = new Set();
+  const salesByDate = {};
+  const salesByCategory = {};
+  const salesByPayment = {};
+  const ordersByStatus = {};
+  const salesByProduct = {};
+  const topCustomers = {};
+
+  for (const order of orderRows) {
+    const status = order.status || 'Sin estado';
+    ordersByStatus[status] = (ordersByStatus[status] || 0) + 1;
+  }
+
+  for (const order of completedOrders) {
+    const total = Number(order.total || 0);
+    const name = String(order.customer_name || 'Cliente sin nombre').trim();
+    const phone = String(order.customer_phone || '').trim();
+    const clientKey = `${name.toLowerCase()}-${phone}`;
+    const reportDate = order.report_date;
+    customers.add(clientKey);
+    salesByDate[reportDate] = (salesByDate[reportDate] || 0) + total;
+    salesByPayment[order.payment_method || 'Otro'] = (salesByPayment[order.payment_method || 'Otro'] || 0) + total;
+
+    if (!topCustomers[clientKey]) {
+      topCustomers[clientKey] = { name, phone, total: 0, count: 0, products: {}, orderHistory: [] };
+    }
+    const customer = topCustomers[clientKey];
+    customer.total += total;
+    customer.count += 1;
+    customer.orderHistory.push({ date: order.created_at, total, cart: Array.isArray(order.cart_json) ? order.cart_json : [] });
+
+    const cart = Array.isArray(order.cart_json) ? order.cart_json : [];
+    for (const item of cart) {
+      const productName = String(item.title || 'Producto');
+      const category = String(item.category || 'Otros');
+      const quantity = Math.max(0, Number(item.qty || item.quantity || 1));
+      const itemTotal = Math.max(0, Number(item.price || 0) * quantity);
+      salesByCategory[category] = (salesByCategory[category] || 0) + itemTotal;
+      if (!salesByProduct[productName]) salesByProduct[productName] = { name: productName, category, quantity: 0, total: 0 };
+      salesByProduct[productName].quantity += quantity;
+      salesByProduct[productName].total += itemTotal;
+      customer.products[productName] = (customer.products[productName] || 0) + quantity;
+    }
+  }
+
+  const totalSales = completedOrders.reduce((sum, order) => sum + Number(order.total || 0), 0);
+  const totalPurchases = purchaseRows.reduce((sum, purchase) => sum + Number(purchase.total_amount || 0), 0);
+  const grossProfit = totalSales - totalPurchases;
+  const cancelled = orderRows.filter((order) => order.status === 'Cancelado').length;
+  const topProducts = Object.values(salesByProduct).sort((a, b) => b.total - a.total).slice(0, 10);
+  const clientList = Object.values(topCustomers).map((customer) => {
+    const favoriteProduct = Object.entries(customer.products).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Ninguno';
+    return { ...customer, favoriteProduct };
+  }).sort((a, b) => b.total - a.total).slice(0, 10);
+
+  return {
+    kpis: {
+      totalVentas: Math.round(totalSales),
+      pedidosRealizados: orderRows.length,
+      pedidosCompletados: completedOrders.length,
+      pedidosCancelados: cancelled,
+      clientesAtendidos: customers.size,
+      ticketPromedio: completedOrders.length ? Math.round(totalSales / completedOrders.length) : 0,
+      utilidadBruta: Math.round(grossProfit),
+      totalCompras: Math.round(totalPurchases),
+      margenUtilidad: totalSales ? Math.round((grossProfit / totalSales) * 1000) / 10 : 0,
+      tasaFinalizacion: orderRows.length ? Math.round((completedOrders.length / orderRows.length) * 1000) / 10 : 0,
+    },
+    charts: {
+      ventas: Object.entries(salesByDate).sort(([a], [b]) => a.localeCompare(b)).map(([date, ventas]) => ({ date, ventas: Math.round(ventas) })),
+      categorias: Object.entries(salesByCategory).sort((a, b) => b[1] - a[1]).map(([name, value]) => ({ name, value: Math.round(value) })),
+      pagos: Object.entries(salesByPayment).sort((a, b) => b[1] - a[1]).map(([name, value]) => ({ name, value: Math.round(value) })),
+      estados: Object.entries(ordersByStatus).sort((a, b) => b[1] - a[1]).map(([name, value]) => ({ name, value })),
+    },
+    lists: { productos: topProducts, clientes: clientList },
+  };
+}
+
 app.get('/api/pedidos/admin/reports', authenticateToken, async (req, res) => {
   try {
-    // Buscar el último cierre contable
-    const closureRes = await pool.query("SELECT MAX(end_date) as last_closure FROM pedidos_app_closures WHERE status = 'Cerrado'");
-    const lastClosure = closureRes.rows[0]?.last_closure;
-
-    let ordersQuery = "SELECT * FROM pedidos_app_orders WHERE (status = 'Completado' OR status = 'Entregado')";
-    let params = [];
-    if (lastClosure) {
-      ordersQuery += " AND DATE(created_at) > $1";
-      params.push(lastClosure);
+    const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Bogota' }).format(new Date());
+    const from = String(req.query.from || shiftIsoDate(today, -29));
+    const to = String(req.query.to || today);
+    if (!validIsoDate(from) || !validIsoDate(to) || from > to) {
+      return res.status(400).json({ status: 'error', error: 'El rango de fechas no es válido' });
     }
+    const days = Math.round((new Date(`${to}T12:00:00Z`) - new Date(`${from}T12:00:00Z`)) / 86400000) + 1;
+    if (days > 366) return res.status(400).json({ status: 'error', error: 'El reporte admite un máximo de 366 días' });
+    const previousTo = shiftIsoDate(from, -1);
+    const previousFrom = shiftIsoDate(previousTo, -(days - 1));
+    const orderSql = `
+      SELECT id, customer_name, customer_phone, payment_method, total, cart_json, status,
+             created_at, TO_CHAR(created_at, 'YYYY-MM-DD') AS report_date
+      FROM pedidos_app_orders
+      WHERE created_at >= $1::date AND created_at < ($2::date + INTERVAL '1 day')
+      ORDER BY created_at ASC`;
+    const purchaseSql = `
+      SELECT total_amount FROM pedidos_app_purchases
+      WHERE purchase_date BETWEEN $1::date AND $2::date`;
 
-    const { rows: orders } = await pool.query(ordersQuery, params);
+    const [ordersResult, purchasesResult, previousOrdersResult, previousPurchasesResult, inventoryResult] = await Promise.all([
+      pool.query(orderSql, [from, to]),
+      pool.query(purchaseSql, [from, to]),
+      pool.query(orderSql, [previousFrom, previousTo]),
+      pool.query(purchaseSql, [previousFrom, previousTo]),
+      pool.query(`
+        SELECT
+          COUNT(*) FILTER (WHERE track_stock = TRUE AND COALESCE(stock, 0) <= 0)::int AS out_of_stock,
+          COUNT(*) FILTER (WHERE track_stock = TRUE AND COALESCE(stock, 0) > 0 AND stock <= COALESCE(low_stock_threshold, 5))::int AS low_stock
+        FROM pedidos_app_products WHERE status = 'Activo'`),
+    ]);
 
-    // Purchases also filtered
-    let purchasesQuery = "SELECT total_amount FROM pedidos_app_purchases";
-    let pParams = [];
-    if (lastClosure) {
-      purchasesQuery += " WHERE DATE(purchase_date) > $1";
-      pParams.push(lastClosure);
-    }
-    const { rows: purchases } = await pool.query(purchasesQuery, pParams);
-
-    let totalVentas = 0;
-    let pedidosCount = orders.length;
-    let clientesUnicos = new Set();
-    let ventasPorFecha = {};
-    let ventasPorCategoria = {};
-    let ventasPorMetodo = {};
-    let ventasPorProducto = {};
-    let topClientes = {};
-
-    orders.forEach(order => {
-      totalVentas += order.total || 0;
-      const name = (order.customer_name || 'Cliente sin nombre').trim();
-      const phone = (order.customer_phone || '').trim();
-      const clientKey = `${name.toLowerCase()}-${phone}`;
-
-      clientesUnicos.add(clientKey);
-
-      if (!topClientes[clientKey]) {
-        topClientes[clientKey] = { name: name, phone: phone, total: 0, count: 0, products: {}, orderHistory: [] };
-      }
-      topClientes[clientKey].total += order.total || 0;
-      topClientes[clientKey].count += 1;
-      topClientes[clientKey].orderHistory.push({
-        date: order.created_at,
-        total: order.total || 0,
-        cart: order.cart_json || []
-      });
-
-      const dateStr = new Date(order.created_at).toLocaleDateString();
-      ventasPorFecha[dateStr] = (ventasPorFecha[dateStr] || 0) + (order.total || 0);
-
-      const method = order.payment_method || 'Otro';
-      ventasPorMetodo[method] = (ventasPorMetodo[method] || 0) + (order.total || 0);
-
-      if (order.cart_json) {
-        order.cart_json.forEach(item => {
-          const cat = item.category || 'Otros';
-          const qty = item.qty || item.quantity || 1;
-          const itemTotal = item.price * qty;
-          ventasPorCategoria[cat] = (ventasPorCategoria[cat] || 0) + itemTotal;
-
-          if (!ventasPorProducto[item.title]) ventasPorProducto[item.title] = { name: item.title, category: cat, quantity: 0, total: 0 };
-          ventasPorProducto[item.title].quantity += qty;
-          ventasPorProducto[item.title].total += itemTotal;
-
-          // Track for customer favorite
-          if (!topClientes[clientKey].products[item.title]) {
-            topClientes[clientKey].products[item.title] = 0;
-          }
-          topClientes[clientKey].products[item.title] += qty;
-        });
-      }
-    });
-
-    const totalCompras = purchases.reduce((sum, p) => sum + (p.total_amount || 0), 0);
-    const utilidadBruta = totalVentas - totalCompras;
-    const ticketPromedio = pedidosCount > 0 ? totalVentas / pedidosCount : 0;
-
-    const chartVentas = Object.keys(ventasPorFecha).map(date => ({ date, ventas: ventasPorFecha[date] }));
-    const chartCategorias = Object.keys(ventasPorCategoria).map(name => ({ name, value: ventasPorCategoria[name] }));
-    const chartPagos = Object.keys(ventasPorMetodo).map(name => ({ name, value: ventasPorMetodo[name] }));
-    const listProductos = Object.values(ventasPorProducto).sort((a, b) => b.total - a.total).slice(0, 5);
-    const listClientes = Object.values(topClientes).map(client => {
-      let favorite = "Ninguno";
-      let maxQty = 0;
-      for (const [prodName, qty] of Object.entries(client.products)) {
-        if (qty > maxQty) {
-          maxQty = qty;
-          favorite = prodName;
-        }
-      }
-      client.favoriteProduct = favorite;
-      return client;
-    }).sort((a, b) => b.total - a.total).slice(0, 5);
+    const current = buildReportData(ordersResult.rows, purchasesResult.rows);
+    const previous = buildReportData(previousOrdersResult.rows, previousPurchasesResult.rows);
+    const trendKeys = ['totalVentas', 'pedidosRealizados', 'clientesAtendidos', 'ticketPromedio', 'utilidadBruta'];
+    const trends = Object.fromEntries(trendKeys.map((key) => [key, reportPercentageChange(current.kpis[key], previous.kpis[key])]));
 
     res.json({
       status: 'ok',
-      kpis: {
-        totalVentas,
-        pedidosRealizados: pedidosCount,
-        clientesAtendidos: clientesUnicos.size,
-        ticketPromedio: Math.round(ticketPromedio),
-        utilidadBruta,
-        totalCompras
-      },
-      charts: {
-        ventas: chartVentas,
-        categorias: chartCategorias,
-        pagos: chartPagos
-      },
-      lists: {
-        productos: listProductos,
-        clientes: listClientes
-      }
+      ...current,
+      trends,
+      alerts: inventoryResult.rows[0] || { out_of_stock: 0, low_stock: 0 },
+      meta: { from, to, previousFrom, previousTo, days, timezone: 'America/Bogota' },
     });
   } catch (error) {
+    console.error('Error generating reports:', error);
     res.status(500).json({ status: 'error', error: error.message });
   }
 });
@@ -1750,23 +2363,19 @@ app.get('/api/pedidos/admin/closures/preview', authenticateToken, async (req, re
       });
     });
 
-    // 2. Costos de Producción (Basado en recetas de productos vendidos)
+    // 2. Costos directos configurados en cada producto vendible
     let totalCostoProduccion = 0;
-    let desgloseCostos = {}; // Ingrediente -> Costo
-
-    // Traer todas las recetas
-    const recipesRes = await pool.query(`
-      SELECT r.product_id, r.cantidad_usada, r.costo_calculado, ren.ingrediente_name 
-      FROM pedidos_app_recipes r
-      JOIN pedidos_app_rendimientos ren ON r.rendimiento_id = ren.id
-    `);
-
-    recipesRes.rows.forEach(recipe => {
-      const qSold = productosVendidos[recipe.product_id] || 0;
+    let desgloseCostos = {};
+    const productCosts = await pool.query(`
+      SELECT id, title, inventory_unit_cost FROM pedidos_app_products
+      WHERE id::text = ANY($1::text[])
+    `, [Object.keys(productosVendidos)]);
+    productCosts.rows.forEach(product => {
+      const qSold = productosVendidos[product.id] || 0;
       if (qSold > 0) {
-        const costForThisIngredient = Number(recipe.costo_calculado) * qSold;
-        totalCostoProduccion += costForThisIngredient;
-        desgloseCostos[recipe.ingrediente_name] = (desgloseCostos[recipe.ingrediente_name] || 0) + costForThisIngredient;
+        const productCost = Number(product.inventory_unit_cost || 0) * qSold;
+        totalCostoProduccion += productCost;
+        desgloseCostos[product.title] = productCost;
       }
     });
 
@@ -1784,18 +2393,16 @@ app.get('/api/pedidos/admin/closures/preview', authenticateToken, async (req, re
     });
 
     const invRes = await pool.query(`
-      SELECT i.name AS ingrediente_name, i.unit AS unidad_consumo,
-        COALESCE(SUM(l.available_quantity), 0) AS cantidad,
-        COALESCE(SUM(l.available_quantity * l.unit_cost), 0) AS valor
-      FROM pedidos_app_inventory i
-      LEFT JOIN pedidos_app_inventory_lots l ON l.inventory_id = i.id AND l.branch_id = 1 AND l.status = 'Disponible'
-      GROUP BY i.id, i.name, i.unit
+      SELECT title AS product_name, inventory_unit AS unit,
+             COALESCE(stock, 0) AS quantity,
+             COALESCE(stock, 0) * inventory_unit_cost AS value
+      FROM pedidos_app_products WHERE track_stock = TRUE ORDER BY title
     `);
     const inventarioSnapshot = invRes.rows.map(r => ({
-      name: r.ingrediente_name,
-      unit: r.unidad_consumo,
-      quantity: Number(r.cantidad),
-      value: Number(r.valor)
+      name: r.product_name,
+      unit: r.unit,
+      quantity: Number(r.quantity),
+      value: Number(r.value)
     }));
 
     const utilidadNeta = totalVentas - totalCostoProduccion - totalGastos;
@@ -1855,9 +2462,405 @@ app.put('/api/pedidos/admin/closures/:id/reopen', authenticateToken, async (req,
   }
 });
 
+// ================= PERFIL =================
+app.get('/api/pedidos/admin/profile', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT u.id, u.username, u.email, u.phone, u.photo_url, u.branch, u.created_at, u.last_access, r.name as role_name
+      FROM pedidos_app_users u
+      LEFT JOIN pedidos_app_roles r ON u.role_id = r.id
+      WHERE u.id = $1
+    `, [req.user.id]);
+    res.json({ status: 'ok', data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/pedidos/admin/profile/password', authenticateToken, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!newPassword || newPassword.length < MIN_PASSWORD_LENGTH) return res.status(400).json({ error: `La nueva contraseña debe tener mínimo ${MIN_PASSWORD_LENGTH} caracteres` });
+    const { rows } = await pool.query("SELECT password_hash FROM pedidos_app_users WHERE id = $1", [req.user.id]);
+    const valid = await bcrypt.compare(currentPassword, rows[0].password_hash);
+    if (!valid) return res.status(401).json({ error: 'La contraseña actual es incorrecta' });
+
+    const newHash = await bcrypt.hash(newPassword, 10);
+    await pool.query("UPDATE pedidos_app_users SET password_hash = $1, must_change_password = FALSE WHERE id = $2", [newHash, req.user.id]);
+    await pool.query("INSERT INTO pedidos_app_audit_logs (user_id, action) VALUES ($1, 'Cambio de Contraseña')", [req.user.id]);
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================= AUDITORÍA Y SESIONES =================
+app.get('/api/pedidos/admin/audit', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT a.*, u.username
+      FROM pedidos_app_audit_logs a
+      LEFT JOIN pedidos_app_users u ON a.user_id = u.id
+      ORDER BY a.created_at DESC LIMIT 200
+    `);
+    res.json({ status: 'ok', data: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/pedidos/admin/sessions', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT s.*, u.username
+      FROM pedidos_app_sessions s
+      LEFT JOIN pedidos_app_users u ON s.user_id = u.id
+      ORDER BY s.created_at DESC LIMIT 100
+    `);
+    res.json({ status: 'ok', data: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/pedidos/admin/profile/sessions', authenticateToken, async (req, res) => {
+  try {
+    await expireInactiveSessions(pool, req.user.id);
+    const { rows } = await pool.query(`
+      SELECT id, device_name, browser, os, ip, location, status, created_at, last_active,
+             expires_at, token_jti = $2 AS is_current
+      FROM pedidos_app_sessions
+      WHERE user_id = $1
+      ORDER BY (status = 'Activa') DESC, last_active DESC
+      LIMIT 20
+    `, [req.user.id, req.user.jti]);
+    res.json({ status: 'ok', data: rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/pedidos/admin/profile/sessions/:id', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      UPDATE pedidos_app_sessions
+      SET status = 'Cerrada desde perfil', revoked_at = NOW()
+      WHERE id = $1 AND user_id = $2 AND status = 'Activa'
+      RETURNING token_jti = $3 AS was_current
+    `, [req.params.id, req.user.id, req.user.jti]);
+    if (!rows.length) return res.status(404).json({ error: 'Sesión activa no encontrada' });
+    await logActivity(req.user.id, 'Perfil', 'Cerrar sesión', `Sesión ID: ${req.params.id}`, req.ip, '', '', {});
+    res.json({ status: 'ok', was_current: rows[0].was_current });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/pedidos/admin/sessions/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query("UPDATE pedidos_app_sessions SET status = 'Cerrada por administrador' WHERE id = $1", [id]);
+    await pool.query("INSERT INTO pedidos_app_audit_logs (user_id, action, details) VALUES ($1, 'Forzar Cierre de Sesión', $2)", [req.user.id, `Sesión ID: ${id}`]);
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/pedidos/admin/profile/info', authenticateToken, async (req, res) => {
+  try {
+    const { email, phone, photo_url } = req.body;
+    await pool.query(
+      "UPDATE pedidos_app_users SET email = $1, phone = $2, photo_url = $3 WHERE id = $4",
+      [email, phone, photo_url, req.user.id]
+    );
+    res.json({ status: 'ok', message: 'Perfil actualizado' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ================= SEGURIDAD Y USUARIOS =================
+async function syncDeliveryCapacity(client, userId, roleId, requestedCapacity) {
+  const { rows } = await client.query('SELECT name FROM pedidos_app_roles WHERE id = $1', [roleId]);
+  if (!rows.length) {
+    const error = new Error('El rol seleccionado no existe');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!DELIVERY_ROLES.has(rows[0].name)) return null;
+  if (requestedCapacity !== undefined && requestedCapacity !== null && requestedCapacity !== '') {
+    const parsed = Number(requestedCapacity);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 5) {
+      const error = new Error('La capacidad del domiciliario debe estar entre 1 y 5 pedidos');
+      error.statusCode = 400;
+      throw error;
+    }
+  }
+  const capacity = normalizeMaxActiveOrders(requestedCapacity, DEFAULT_MAX_ACTIVE_ORDERS);
+  await client.query(`
+    INSERT INTO pedidos_app_delivery_profiles (user_id, max_active_orders)
+    VALUES ($1, $2)
+    ON CONFLICT (user_id) DO UPDATE
+    SET max_active_orders = EXCLUDED.max_active_orders, updated_at = NOW()
+  `, [userId, capacity]);
+  return capacity;
+}
+
+app.get('/api/pedidos/admin/users', authenticateToken, requirePermission('Usuarios', 'ver'), async (req, res) => {
+  try {
+    await expireInactiveSessions(pool);
+    const { rows } = await pool.query(`
+      SELECT u.id, u.username, u.name, u.last_name, u.document, u.email, u.phone,
+             u.status, u.role, u.role_id, u.must_change_password, u.last_access,
+             u.max_active_sessions, u.session_idle_minutes, r.name AS role_name,
+             COALESCE(profile.max_active_orders, $1)::int AS max_active_orders,
+             (SELECT COUNT(*)::int FROM pedidos_app_orders active_order
+              WHERE active_order.delivery_user_id = u.id
+                AND active_order.delivery_status = ANY($2::text[])) AS active_delivery_orders,
+             COUNT(s.id) FILTER (WHERE s.status = 'Activa')::int AS active_sessions
+      FROM pedidos_app_users u
+      LEFT JOIN pedidos_app_roles r ON u.role_id = r.id
+      LEFT JOIN pedidos_app_delivery_profiles profile ON profile.user_id = u.id
+      LEFT JOIN pedidos_app_sessions s ON s.user_id = u.id
+      GROUP BY u.id, r.name, profile.max_active_orders
+      ORDER BY COALESCE(u.name, u.username), u.username
+    `, [DEFAULT_MAX_ACTIVE_ORDERS, CARRYING_DELIVERY_STATUSES]);
+    res.json({ status: 'ok', data: rows });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.post('/api/pedidos/admin/users', authenticateToken, requirePermission('Usuarios', 'crear'), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { username, password, email, phone, role_id, name, last_name, document, status, max_active_orders } = req.body;
+    if (!username?.trim() || !password || !role_id) return res.status(400).json({ error: 'Usuario, contraseña y rol son obligatorios' });
+    if (password.length < MIN_PASSWORD_LENGTH) return res.status(400).json({ error: `La contraseña temporal debe tener mínimo ${MIN_PASSWORD_LENGTH} caracteres` });
+    const hash = await bcrypt.hash(password, 10);
+    await client.query('BEGIN');
+    const { rows } = await client.query(`
+      INSERT INTO pedidos_app_users
+        (username, password_hash, email, phone, role_id, name, last_name, document, status, must_change_password)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,true)
+      RETURNING id, username
+    `, [username.trim(), hash, email || null, phone || null, role_id, name || null, last_name || null, document || null, status || 'Activo']);
+    const deliveryCapacity = await syncDeliveryCapacity(client, rows[0].id, role_id, max_active_orders);
+    await client.query('COMMIT');
+    const { password: _password, ...auditData } = req.body;
+    await logActivity(req.user.id, 'Usuarios', 'Crear', `Usuario creado: ${username}`, req.ip, '', '', auditData);
+    res.json({ status: 'ok', data: { ...rows[0], max_active_orders: deliveryCapacity } });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (error.code === '23505') return res.status(409).json({ error: 'El usuario, correo o documento ya está registrado' });
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally { client.release(); }
+});
+
+app.put('/api/pedidos/admin/users/:id', authenticateToken, requirePermission('Usuarios', 'editar'), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const { username, email, phone, role_id, name, last_name, document, status, password, must_change_password, max_active_orders } = req.body;
+    if (!username?.trim() || !role_id) return res.status(400).json({ error: 'Usuario y rol son obligatorios' });
+    if (password && password.length < MIN_PASSWORD_LENGTH) return res.status(400).json({ error: `La contraseña debe tener mínimo ${MIN_PASSWORD_LENGTH} caracteres` });
+    const passwordHash = password ? await bcrypt.hash(password, 10) : null;
+    await client.query('BEGIN');
+    const updated = await client.query(`
+      UPDATE pedidos_app_users
+      SET username=$1, email=$2, phone=$3, role_id=$4, name=$5, last_name=$6,
+          document=$7, status=$8,
+          password_hash=COALESCE($9, password_hash),
+          must_change_password=CASE WHEN $9 IS NOT NULL THEN TRUE ELSE COALESCE($10, must_change_password) END
+      WHERE id=$11
+      RETURNING id
+    `, [username.trim(), email || null, phone || null, role_id, name || null, last_name || null,
+      document || null, status || 'Activo', passwordHash, must_change_password, id]);
+    if (!updated.rowCount) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+    const deliveryCapacity = await syncDeliveryCapacity(client, id, role_id, max_active_orders);
+    if (status && status !== 'Activo') {
+      await client.query("UPDATE pedidos_app_sessions SET status='Cerrada por desactivación', revoked_at=NOW() WHERE user_id=$1 AND status='Activa'", [id]);
+    }
+    await client.query('COMMIT');
+    const { password: _password, ...auditData } = req.body;
+    await logActivity(req.user.id, 'Usuarios', 'Editar', `Usuario editado ID: ${id}`, req.ip, '', '', auditData);
+    if (deliveryCapacity !== null) {
+      deliveryRealtime.publish('driver_capacity_updated', { userId: Number(id), capacity: deliveryCapacity });
+    }
+    res.json({ status: 'ok', max_active_orders: deliveryCapacity });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (error.code === '23505') return res.status(409).json({ error: 'El usuario, correo o documento ya está registrado' });
+    res.status(error.statusCode || 500).json({ error: error.message });
+  } finally { client.release(); }
+});
+
+app.delete('/api/pedidos/admin/users/:id', authenticateToken, requirePermission('Usuarios', 'eliminar'), async (req, res) => {
+  try {
+    if (Number(req.params.id) === Number(req.user.id)) return res.status(400).json({ error: 'No puedes desactivar tu propio usuario' });
+    const { rows } = await pool.query(`
+      UPDATE pedidos_app_users SET status='Inactivo' WHERE id=$1 RETURNING id
+    `, [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Usuario no encontrado' });
+    await pool.query("UPDATE pedidos_app_sessions SET status='Cerrada por desactivación', revoked_at=NOW() WHERE user_id=$1 AND status='Activa'", [req.params.id]);
+    await logActivity(req.user.id, 'Usuarios', 'Desactivar', `Usuario ID: ${req.params.id}`, req.ip, '', '', {});
+    res.json({ status: 'ok' });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.get('/api/pedidos/admin/roles', authenticateToken, requirePermission('Roles', 'ver'), async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT r.*, COUNT(u.id)::int AS users_count
+      FROM pedidos_app_roles r
+      LEFT JOIN pedidos_app_users u ON u.role_id = r.id AND u.status = 'Activo'
+      GROUP BY r.id ORDER BY r.is_system_role DESC, r.name
+    `);
+    res.json({ status: 'ok', data: rows });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.get('/api/pedidos/admin/roles-meta', authenticateToken, requirePermission('Roles', 'ver'), async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, module, action, description
+      FROM pedidos_app_permissions
+      WHERE module NOT IN ('Recetas', 'Rendimientos')
+      ORDER BY module, action
+    `);
+    res.json({ status: 'ok', data: rows });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.post('/api/pedidos/admin/roles', authenticateToken, requirePermission('Roles', 'crear'), async (req, res) => {
+  try {
+    const { name, description } = req.body;
+    if (!name?.trim()) return res.status(400).json({ error: 'El nombre del rol es obligatorio' });
+    const { rows } = await pool.query('INSERT INTO pedidos_app_roles (name, description) VALUES ($1, $2) RETURNING *', [name, description]);
+    await logActivity(req.user.id, 'Roles', 'Crear', `Rol creado: ${name}`, req.ip, '', '', req.body);
+    res.json({ status: 'ok', data: rows[0] });
+  } catch (error) { res.status(error.code === '23505' ? 409 : 500).json({ error: error.code === '23505' ? 'Ya existe un rol con ese nombre' : error.message }); }
+});
+
+app.put('/api/pedidos/admin/roles/:id', authenticateToken, requirePermission('Roles', 'editar'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, description } = req.body;
+    const { rows: current } = await pool.query('SELECT is_system_role, name FROM pedidos_app_roles WHERE id=$1', [id]);
+    if (!current.length) return res.status(404).json({ error: 'Rol no encontrado' });
+    const safeName = current[0].is_system_role ? current[0].name : name;
+    await pool.query('UPDATE pedidos_app_roles SET name=$1, description=$2 WHERE id=$3', [safeName, description, id]);
+    await logActivity(req.user.id, 'Roles', 'Editar', `Rol editado ID: ${id}`, req.ip, '', '', req.body);
+    res.json({ status: 'ok' });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.delete('/api/pedidos/admin/roles/:id', authenticateToken, requirePermission('Roles', 'eliminar'), async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT r.is_system_role, COUNT(u.id)::int AS users_count
+      FROM pedidos_app_roles r LEFT JOIN pedidos_app_users u ON u.role_id=r.id
+      WHERE r.id=$1 GROUP BY r.id
+    `, [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Rol no encontrado' });
+    if (rows[0].is_system_role || rows[0].users_count > 0) return res.status(409).json({ error: 'No se puede eliminar un rol del sistema o asignado a usuarios' });
+    await pool.query('DELETE FROM pedidos_app_roles WHERE id=$1', [req.params.id]);
+    res.json({ status: 'ok' });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.get('/api/pedidos/admin/roles/:id/permissions', authenticateToken, requirePermission('Roles', 'ver'), async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT p.module || ':' || p.action AS permission
+      FROM pedidos_app_role_permissions rp
+      JOIN pedidos_app_permissions p ON p.id = rp.permission_id
+      WHERE rp.role_id = $1
+      ORDER BY p.module, p.action
+    `, [req.params.id]);
+    res.json({ status: 'ok', data: rows.map(r => r.permission) });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.post('/api/pedidos/admin/roles/:id/permissions', authenticateToken, requirePermission('Roles', 'editar'), async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { permissions } = req.body;
+    if (!Array.isArray(permissions)) return res.status(400).json({ error: 'Permisos inválidos' });
+    const uniquePermissions = [...new Set(permissions.map(String))];
+    const { rows } = await client.query(`
+      SELECT id, module || ':' || action AS permission
+      FROM pedidos_app_permissions
+      WHERE module || ':' || action = ANY($1::text[])
+    `, [uniquePermissions]);
+    if (rows.length !== uniquePermissions.length) {
+      return res.status(400).json({ error: 'La selección contiene permisos desconocidos' });
+    }
+
+    await client.query('BEGIN');
+    await client.query('DELETE FROM pedidos_app_role_permissions WHERE role_id=$1', [req.params.id]);
+    for (const permission of rows) {
+      await client.query(
+        'INSERT INTO pedidos_app_role_permissions (role_id, permission_id) VALUES ($1, $2)',
+        [req.params.id, permission.id]
+      );
+    }
+    await client.query('COMMIT');
+    res.json({ status: 'ok' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/pedidos/admin/permissions', authenticateToken, requirePermission('Permisos', 'ver'), async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM pedidos_app_permissions');
+    res.json({ status: 'ok', data: rows });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.post('/api/pedidos/admin/permissions', authenticateToken, requirePermission('Permisos', 'crear'), async (req, res) => {
+  try {
+    const { module, action, description } = req.body;
+    const { rows } = await pool.query('INSERT INTO pedidos_app_permissions (module, action, description) VALUES ($1, $2, $3) RETURNING *', [module, action, description]);
+    res.json({ status: 'ok', data: rows[0] });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.put('/api/pedidos/admin/permissions/:id', authenticateToken, requirePermission('Permisos', 'editar'), async (req, res) => {
+  try {
+    const { module, action, description } = req.body;
+    await pool.query('UPDATE pedidos_app_permissions SET module=$1, action=$2, description=$3 WHERE id=$4', [module, action, description, req.params.id]);
+    res.json({ status: 'ok' });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.delete('/api/pedidos/admin/permissions/:id', authenticateToken, requirePermission('Permisos', 'eliminar'), async (req, res) => {
+  try {
+    await pool.query('DELETE FROM pedidos_app_permissions WHERE id=$1', [req.params.id]);
+    res.json({ status: 'ok' });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 const PORT = process.env.PORT || 3001;
 const horariosApi = require('./horarios_api')(app, pool, authenticateToken);
 getHorariosStatus = horariosApi.getHorariosStatus;
+deliveryRealtime = require('./delivery_api')(app, {
+  pool,
+  authenticateToken,
+  requirePermission,
+  trackingLimiter,
+  minPasswordLength: MIN_PASSWORD_LENGTH,
+  webpush,
+  publicVapidKey,
+  authorizeTrackingAccess,
+  trackingSecret: JWT_SECRET,
+});
 
 if (!process.env.VERCEL) {
   app.listen(PORT, () => {
