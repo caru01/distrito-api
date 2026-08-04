@@ -893,7 +893,21 @@ module.exports = function registerDeliveryApi(app, dependencies) {
                active_order.address AS active_address,
                active_order.delivery_latitude AS active_destination_latitude,
                active_order.delivery_longitude AS active_destination_longitude,
-               COALESCE(active_order.active_order_count, 0)::int AS active_order_count
+               COALESCE(active_order.active_order_count, 0)::int AS active_order_count,
+               (
+                 SELECT COALESCE(json_agg(
+                   json_build_object(
+                     'id', o.id,
+                     'status', o.delivery_status,
+                     'customer_name', o.customer_name,
+                     'address', o.address,
+                     'latitude', o.delivery_latitude,
+                     'longitude', o.delivery_longitude
+                   ) ORDER BY o.created_at ASC
+                 ), '[]'::json)
+                 FROM pedidos_app_orders o
+                 WHERE o.delivery_user_id = u.id AND o.delivery_status IN ('Aceptado', 'Recogido', 'En camino')
+               ) AS active_orders
         FROM pedidos_app_users u
         JOIN pedidos_app_roles role ON role.id = u.role_id AND role.name = 'Domiciliario'
         LEFT JOIN pedidos_app_delivery_profiles profile ON profile.user_id = u.id
