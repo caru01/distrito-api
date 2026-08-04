@@ -588,8 +588,118 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
     if (client) client.release();
   }
 });
+// ── Rastreo público por ID + últimos 4 dígitos del teléfono ─────────────────
+app.get('/api/pedidos/rastrear/:id', trackingLimiter, async (req, res) => {
+  try {
+    if (!process.env.DATABASE_URL) return res.status(503).json({ error: 'Base de datos no configurada' });
+    const id = parseInt(req.params.id, 10);
+    const code = (req.query.c || '').replace(/\D/g, '').slice(-4);
+    if (!id || id <= 0) return res.status(400).json({ error: 'ID de pedido inválido' });
+    if (!code || code.length < 4) return res.status(400).json({ error: 'Código de verificación requerido' });
+
+    const { rows } = await pool.query(`
+      SELECT order_data.id, order_data.customer_name, order_data.customer_phone,
+             order_data.delivery_type, order_data.total, order_data.status, order_data.delivery_status,
+             order_data.address, order_data.barrio,
+             order_data.delivery_latitude, order_data.delivery_longitude,
+             order_data.cart_json, order_data.created_at, order_data.updated_at,
+             order_data.completed_at, order_data.delivered_at, order_data.delivery_completed_at,
+             order_data.delivery_duration_seconds, order_data.delivery_user_id,
+             CASE WHEN order_data.delivery_status = 'En camino'
+                       AND profile.last_location_at >= order_data.delivery_accepted_at
+                  THEN profile.current_latitude ELSE NULL END AS driver_latitude,
+             CASE WHEN order_data.delivery_status = 'En camino'
+                       AND profile.last_location_at >= order_data.delivery_accepted_at
+                  THEN profile.current_longitude ELSE NULL END AS driver_longitude,
+             CASE WHEN order_data.delivery_status = 'En camino'
+                       AND profile.last_location_at >= order_data.delivery_accepted_at
+                  THEN profile.last_location_at ELSE NULL END AS driver_location_at,
+             CASE WHEN order_data.delivery_status = 'En camino' THEN TRIM(CONCAT(driver.name, ' ', driver.last_name)) ELSE NULL END AS driver_name,
+             CASE WHEN order_data.delivery_status = 'En camino' THEN profile.vehicle_type ELSE NULL END AS vehicle_type,
+             CASE WHEN order_data.delivery_status = 'En camino' THEN profile.plate ELSE NULL END AS plate,
+             settings.restaurant_name, COALESCE(settings.kitchen_address, settings.address) AS store_address,
+             settings.store_latitude, settings.store_longitude
+      FROM pedidos_app_orders order_data
+      LEFT JOIN pedidos_app_users driver ON driver.id = order_data.delivery_user_id
+      LEFT JOIN pedidos_app_delivery_profiles profile ON profile.user_id = order_data.delivery_user_id
+      LEFT JOIN pedidos_app_settings settings ON settings.id = 1
+      WHERE order_data.id = $1
+    `, [id]);
+
+    if (!rows.length) return res.status(404).json({ error: 'Pedido no encontrado' });
+    const order = rows[0];
+
+    // Verificar los últimos 4 dígitos del teléfono
+    const phoneDigits = (order.customer_phone || '').replace(/\D/g, '').slice(-4);
+    if (phoneDigits !== code) {
+      return res.status(403).json({ error: 'Código de verificación incorrecto' });
+    }
+
+    // Si el pedido ya finalizó, indicarlo pero no bloquear (el cliente puede ver que fue entregado)
+    const finalStatuses = new Set(['Entregado', 'Completado', 'Cancelado']);
+    const isFinal = finalStatuses.has(order.status) || finalStatuses.has(order.delivery_status);
+
+    let driverTrail = [];
+    if (!isFinal && order.delivery_status === 'En camino' && order.delivery_user_id != null) {
+      const trailResult = await pool.query(`
+        SELECT latitude, longitude, recorded_at
+        FROM pedidos_app_delivery_locations
+        WHERE order_id = $1 AND user_id = $2
+        ORDER BY recorded_at DESC LIMIT 120
+      `, [id, order.delivery_user_id]);
+      driverTrail = trailResult.rows.reverse().map((p) => ({
+        latitude: Number(p.latitude),
+        longitude: Number(p.longitude),
+        recorded_at: p.recorded_at,
+      }));
+    }
+
+    res.json({
+      status: 'ok',
+      is_final: isFinal,
+      order: {
+        id: order.id,
+        customer_name: order.customer_name,
+        delivery_type: order.delivery_type,
+        total: Number(order.total),
+        order_status: order.status,
+        delivery_status: order.delivery_status,
+        items: (order.cart_json || []).map((item) => ({ title: item.title, quantity: item.quantity || item.qty || 1 })),
+        created_at: order.created_at,
+        updated_at: order.updated_at,
+        completed_at: order.completed_at,
+        delivered_at: order.delivered_at,
+        delivery_duration_seconds: order.delivery_duration_seconds == null ? null : Number(order.delivery_duration_seconds),
+        store: {
+          name: order.restaurant_name || 'Distrito BG',
+          address: order.store_address || 'Valledupar, Colombia',
+          latitude: Number(order.store_latitude ?? 10.4631),
+          longitude: Number(order.store_longitude ?? -73.2532),
+        },
+        destination: order.delivery_latitude == null || order.delivery_longitude == null ? null : {
+          address: [order.address, order.barrio].filter(Boolean).join(', '),
+          latitude: Number(order.delivery_latitude),
+          longitude: Number(order.delivery_longitude),
+        },
+        driver: order.delivery_user_id == null ? null : {
+          name: order.driver_name,
+          vehicle_type: order.vehicle_type,
+          plate: order.plate,
+          latitude: order.driver_latitude == null ? null : Number(order.driver_latitude),
+          longitude: order.driver_longitude == null ? null : Number(order.driver_longitude),
+          updated_at: order.driver_location_at,
+        },
+        driver_trail: driverTrail,
+      },
+    });
+  } catch (error) {
+    console.error('Error en rastrear:', error);
+    res.status(500).json({ error: 'Error interno al consultar el pedido' });
+  }
+});
 
 app.get('/api/pedidos/track/:id', trackingLimiter, async (req, res) => {
+
   try {
     const id = Number(req.params.id);
     await authorizeTrackingAccess(pool, {
