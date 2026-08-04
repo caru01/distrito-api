@@ -760,7 +760,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
             delivery_completed_at = NOW(), delivered_at = COALESCE(delivered_at, NOW()),
             completed_at = COALESCE(completed_at, NOW()), delivery_notes = $1,
             delivery_rating = $2, delivery_evidence = $3,
-            delivery_duration_seconds = GREATEST(0, EXTRACT(EPOCH FROM (NOW() - COALESCE(delivery_accepted_at, created_at)))::integer),
+            delivery_duration_seconds = GREATEST(0, EXTRACT(EPOCH FROM (NOW() - created_at))::integer),
             updated_at = NOW()
         WHERE id = $4 AND delivery_user_id = $5 AND delivery_status = 'En camino'
         RETURNING *
