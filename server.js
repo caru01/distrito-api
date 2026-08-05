@@ -530,18 +530,32 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
       formattedPhone = '57' + formattedPhone;
     }
 
+    // Check for admin token to allow status override
+    let finalStatus = 'Nuevo';
+    if (req.body.status) {
+      const authHeader = req.headers['authorization'];
+      if (authHeader) {
+        try {
+          const token = authHeader.split(' ')[1];
+          const jwt = require('jsonwebtoken');
+          const user = jwt.verify(token, process.env.JWT_SECRET);
+          if (user && user.role) finalStatus = req.body.status;
+        } catch (e) {}
+      }
+    }
+
     const deliveryLocation = normalizeDeliveryLocation(customer);
     const isDelivery = String(customer.deliveryType || '').toLowerCase() === 'domicilio';
     const { rows } = await client.query(
       `INSERT INTO pedidos_app_orders 
        (customer_name, customer_phone, address, barrio, delivery_type, payment_method, total, cart_json, source, notes, voucher_reference, created_at,
         delivery_fee, delivery_reference, change_required, delivery_latitude, delivery_longitude,
-        delivery_place_id, delivery_location_adjusted, delivery_apartment, delivery_tower, delivery_floor)
+        delivery_place_id, delivery_location_adjusted, delivery_apartment, delivery_tower, delivery_floor, status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12, NOW()),
          CASE WHEN $15::boolean
            THEN COALESCE((SELECT delivery_cost FROM pedidos_app_settings WHERE id = 1), 0)
            ELSE 0
-         END, $13, $14, $16, $17, $18, $19, $20, $21, $22)
+         END, $13, $14, $16, $17, $18, $19, $20, $21, $22, $23)
        RETURNING id`,
       [
         customer.name,
@@ -567,7 +581,8 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
         isDelivery && customer.locationAdjusted === true,
         isDelivery ? String(customer.apartment || '').trim().slice(0, 50) || null : null,
         isDelivery ? String(customer.tower || '').trim().slice(0, 50) || null : null,
-        isDelivery ? String(customer.floor || '').trim().slice(0, 30) || null : null
+        isDelivery ? String(customer.floor || '').trim().slice(0, 30) || null : null,
+        finalStatus
       ]
     );
 
