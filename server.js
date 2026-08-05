@@ -1299,7 +1299,8 @@ app.get('/api/pedidos/admin/orders', authenticateToken, async (req, res) => {
              delivery_latitude, delivery_longitude, delivery_place_id,
              delivery_location_adjusted, delivery_apartment, delivery_tower, delivery_floor,
              change_required, delivery_accepted_at, picked_up_at, on_the_way_at,
-             delivery_completed_at, delivery_distance_km, delivery_duration_seconds
+             delivery_completed_at, delivery_distance_km, delivery_duration_seconds,
+             tracking_sent_at
       FROM pedidos_app_orders
       ORDER BY created_at DESC
       LIMIT $1
@@ -1325,6 +1326,17 @@ app.post('/api/pedidos/admin/orders/:id/tracking-token', authenticateToken, asyn
     res.json({ status: 'ok', tracking_token: issueTrackingToken(orderId, JWT_SECRET) });
   } catch (error) {
     res.status(500).json({ error: 'No fue posible generar el enlace de seguimiento' });
+  }
+});
+
+app.post('/api/pedidos/admin/orders/:id/tracking-sent', authenticateToken, async (req, res) => {
+  try {
+    const orderId = Number(req.params.id);
+    if (!Number.isInteger(orderId) || orderId < 1) return res.status(400).json({ error: 'Pedido inválido' });
+    await pool.query('UPDATE pedidos_app_orders SET tracking_sent_at = NOW() WHERE id = $1', [orderId]);
+    res.json({ status: 'ok' });
+  } catch (error) {
+    res.status(500).json({ error: 'Error interno' });
   }
 });
 
