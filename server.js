@@ -2160,6 +2160,21 @@ app.post('/api/pedidos/push/subscribe', async (req, res) => {
   }
 });
 
+app.get('/api/pedidos/admin/push/subscriptions/count', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE audience = 'customer')::int AS customers,
+        COUNT(*) FILTER (WHERE audience = 'delivery')::int AS drivers
+      FROM pedidos_app_push_subscriptions
+    `);
+    res.json({ status: 'ok', count: rows[0].total, customers: rows[0].customers, drivers: rows[0].drivers });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/pedidos/admin/push/send', authenticateToken, async (req, res) => {
   try {
     const { title, message, url } = req.body;
@@ -2649,10 +2664,14 @@ app.get('/api/pedidos/admin/audit', authenticateToken, async (req, res) => {
 app.get('/api/pedidos/admin/sessions', authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT s.*, u.username
+      SELECT s.*, u.username, r.name as role_name
       FROM pedidos_app_sessions s
       LEFT JOIN pedidos_app_users u ON s.user_id = u.id
-      ORDER BY s.created_at DESC LIMIT 100
+      LEFT JOIN pedidos_app_roles r ON u.role_id = r.id
+      ORDER BY 
+        CASE WHEN s.status = 'Activa' THEN 1 ELSE 2 END,
+        s.last_active DESC 
+      LIMIT 100
     `);
     res.json({ status: 'ok', data: rows });
   } catch (err) {
