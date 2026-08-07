@@ -974,7 +974,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
       SET delivery_user_id = $1, delivery_status = 'Pendiente',
           delivery_accepted_at = NULL, updated_at = NOW()
       WHERE id = $2 AND lower(delivery_type) = 'domicilio'
-        AND delivery_status NOT IN ('En camino', 'Entregado', 'Cancelado')
+        AND COALESCE(delivery_status, 'Pendiente') NOT IN ('En camino', 'Entregado', 'Cancelado')
       RETURNING *
     `, [userId, orderId]);
     if (!rows.length) return res.status(409).json({ error: 'Este pedido no puede reasignarse en su estado actual' });
