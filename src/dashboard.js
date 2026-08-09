@@ -9,7 +9,7 @@ const DASHBOARD_QUERY = `
     SELECT orders.*
     FROM pedidos_app_orders orders
     CROSS JOIN context
-    WHERE (orders.created_at AT TIME ZONE 'UTC' AT TIME ZONE context.timezone)::date =
+    WHERE (orders.created_at AT TIME ZONE context.timezone)::date =
           (NOW() AT TIME ZONE context.timezone)::date
   ),
   inventory_stock AS (
@@ -37,12 +37,12 @@ const DASHBOARD_QUERY = `
         'today', COUNT(*)::int,
         'new', COUNT(*) FILTER (WHERE status = 'Nuevo')::int,
         'preparing', COUNT(*) FILTER (WHERE status = 'En preparación')::int,
-        'ready', COUNT(*) FILTER (WHERE status = 'Listo')::int,
+        'ready', COUNT(*) FILTER (WHERE status IN ('Listo', 'Asignado externo', 'Entregado al operador externo'))::int,
         'onTheWay', COUNT(*) FILTER (WHERE status = 'En camino')::int,
         'pendingPayment', COUNT(*) FILTER (WHERE status = 'Pendiente Pago')::int,
         'completed', COUNT(*) FILTER (WHERE status IN ('Entregado', 'Completado'))::int,
         'cancelled', COUNT(*) FILTER (WHERE status = 'Cancelado')::int,
-        'active', COUNT(*) FILTER (WHERE status IN ('Nuevo', 'En preparación', 'Listo', 'En camino', 'Pendiente Pago'))::int,
+        'active', COUNT(*) FILTER (WHERE status IN ('Nuevo', 'En preparación', 'Listo', 'Asignado externo', 'Entregado al operador externo', 'En camino', 'Pendiente Pago'))::int,
         'revenue', COALESCE(SUM(total) FILTER (WHERE status IN ('Entregado', 'Completado')), 0),
         'averageTicket', COALESCE(ROUND(AVG(total) FILTER (WHERE status IN ('Entregado', 'Completado'))), 0)
       )

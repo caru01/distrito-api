@@ -144,6 +144,8 @@ test('el enlace firmado sigue el pedido y caduca después de finalizar', async (
     const token = issueTrackingToken(orderId, secret);
     const access = await authorizeTrackingAccess(client, { orderId, token, secret });
     assert.equal(access.method, 'token');
+    const codeAccess = await authorizeTrackingAccess(client, { orderId, code: '2233', secret });
+    assert.equal(codeAccess.method, 'code');
 
     await client.query(`
       UPDATE pedidos_app_orders
@@ -165,4 +167,113 @@ test('el enlace firmado sigue el pedido y caduca después de finalizar', async (
     client.release();
     await pool.end();
   }
+});
+
+async function createTestDriver(client, suffix) {
+  const { rows } = await client.query(`
+    INSERT INTO pedidos_app_users (username, password_hash, status)
+    VALUES ($1, 'test-only-hash', 'Activo') RETURNING id
+  `, [`delivery-flow-${suffix}`]);
+  await client.query(`
+    INSERT INTO pedidos_app_delivery_profiles
+      (user_id, availability_status, current_latitude, current_longitude, last_location_at)
+    VALUES ($1, 'Ocupado', 10.468235, -73.253628, NOW())
+  `, [rows[0].id]);
+  return rows[0].id;
+}
+
+async function createTestCompany(client, suffix) {
+  const { rows } = await client.query(`
+    INSERT INTO pedidos_app_delivery_companies
+      (name, phone, default_fee, estimated_delivery_minutes)
+    VALUES ($1, '3000000000', 8000, 45) RETURNING id
+  `, [`Operador prueba ${suffix}`]);
+  return rows[0].id;
+}
+
+test('escenario 1: domiciliario propio conserva GPS real', async () => {
+  const pool = createPool({ max: 1 }); const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const suffix = `${Date.now()}-${Math.random()}`;
+    const driverId = await createTestDriver(client, suffix);
+    const { rows } = await client.query(`
+      INSERT INTO pedidos_app_orders
+        (customer_name,customer_phone,delivery_type,payment_method,total,status,
+         delivery_status,delivery_provider_type,delivery_user_id,delivery_accepted_at)
+      VALUES ('GPS propio',$1,'domicilio','efectivo',50000,'En camino','En camino','own',$2,NOW()-INTERVAL '1 second')
+      RETURNING id
+    `, [`57${String(Date.now()).slice(-10)}`, driverId]);
+    const tracking = await client.query(`
+      SELECT order_data.delivery_provider_type, profile.current_latitude, profile.current_longitude
+      FROM pedidos_app_orders order_data
+      JOIN pedidos_app_delivery_profiles profile ON profile.user_id=order_data.delivery_user_id
+      WHERE order_data.id=$1 AND profile.last_location_at >= order_data.delivery_accepted_at
+    `, [rows[0].id]);
+    assert.equal(tracking.rows[0].delivery_provider_type, 'own');
+    assert.equal(Number(tracking.rows[0].current_latitude), 10.468235);
+    await client.query('ROLLBACK');
+  } catch (error) { await client.query('ROLLBACK'); throw error; }
+  finally { client.release(); await pool.end(); }
+});
+
+test('escenario 2: empresa externa avanza por estados y no crea GPS', async () => {
+  const pool = createPool({ max: 1 }); const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const suffix = `${Date.now()}-${Math.random()}`;
+    const companyId = await createTestCompany(client, suffix);
+    const inserted = await client.query(`
+      INSERT INTO pedidos_app_orders
+        (customer_name,customer_phone,delivery_type,payment_method,total,status,delivery_status,
+         delivery_fee,delivery_provider_type,external_delivery_company_id,external_delivery_cost,external_assigned_at)
+      VALUES ('Externo manual',$1,'domicilio','efectivo',56000,'Asignado externo','Asignado externo',6000,'external_manual',$2,8000,NOW())
+      RETURNING id
+    `, [`56${String(Date.now()).slice(-10)}`, companyId]);
+    const orderId = inserted.rows[0].id;
+    for (const [from, to] of [['Asignado externo','Entregado al operador externo'],['Entregado al operador externo','En camino'],['En camino','Entregado']]) {
+      const updated = await client.query('UPDATE pedidos_app_orders SET status=$1,delivery_status=$1 WHERE id=$2 AND delivery_status=$3 RETURNING id', [to, orderId, from]);
+      assert.equal(updated.rowCount, 1);
+    }
+    const result = await client.query(`
+      SELECT delivery_provider_type, delivery_user_id, delivery_fee-external_delivery_cost AS margin,
+             (SELECT COUNT(*)::int FROM pedidos_app_delivery_locations WHERE order_id=orders.id) AS gps_points
+      FROM pedidos_app_orders orders WHERE id=$1
+    `, [orderId]);
+    assert.equal(result.rows[0].delivery_provider_type, 'external_manual');
+    assert.equal(result.rows[0].delivery_user_id, null);
+    assert.equal(Number(result.rows[0].margin), -2000);
+    assert.equal(result.rows[0].gps_points, 0);
+    await client.query('ROLLBACK');
+  } catch (error) { await client.query('ROLLBACK'); throw error; }
+  finally { client.release(); await pool.end(); }
+});
+
+test('escenario 3: pedido propio pendiente se reasigna a una empresa externa', async () => {
+  const pool = createPool({ max: 1 }); const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const suffix = `${Date.now()}-${Math.random()}`;
+    const driverId = await createTestDriver(client, suffix);
+    const companyId = await createTestCompany(client, suffix);
+    const inserted = await client.query(`
+      INSERT INTO pedidos_app_orders
+        (customer_name,customer_phone,delivery_type,payment_method,total,status,delivery_status,
+         delivery_provider_type,delivery_user_id)
+      VALUES ('Reasignación',$1,'domicilio','efectivo',50000,'Listo','Pendiente','own',$2)
+      RETURNING id
+    `, [`55${String(Date.now()).slice(-10)}`, driverId]);
+    const { rows } = await client.query(`
+      UPDATE pedidos_app_orders SET status='Asignado externo',delivery_status='Asignado externo',
+        delivery_provider_type='external_manual',delivery_user_id=NULL,
+        external_delivery_company_id=$1,external_delivery_cost=8000,external_assigned_at=NOW()
+      WHERE id=$2 AND status='Listo' AND delivery_status='Pendiente'
+      RETURNING delivery_provider_type,delivery_user_id,external_delivery_company_id
+    `, [companyId, inserted.rows[0].id]);
+    assert.equal(rows[0].delivery_provider_type, 'external_manual');
+    assert.equal(rows[0].delivery_user_id, null);
+    assert.equal(rows[0].external_delivery_company_id, companyId);
+    await client.query('ROLLBACK');
+  } catch (error) { await client.query('ROLLBACK'); throw error; }
+  finally { client.release(); await pool.end(); }
 });

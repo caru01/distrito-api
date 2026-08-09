@@ -5,11 +5,12 @@
   "main": "index.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check horarios_api.js && node --check delivery_api.js",
+    "check": "node --check server.js && node --check horarios_api.js && node --check delivery_api.js && node --check external_delivery_api.js && node --check crm_api.js && node --check src/crm-service.js && node --check src/whatsapp-cloud.js",
     "migrate": "node scripts/migrate.js",
     "db:analyze": "node scripts/analyze-db.js",
+    "db:prune": "node scripts/prune-delivery-locations.js",
     "db:prune-delivery": "node scripts/prune-delivery-locations.js",
-    "test": "node --test test/schema.contract.test.js test/source.contract.test.js test/database.flows.test.js"
+    "test": "node --test test/schema.contract.test.js test/source.contract.test.js test/order-messages.test.js test/database.flows.test.js test/order-rules.test.js test/delivery-domain.test.js test/delivery-concurrency.test.js test/delivery-http.e2e.test.js test/crm-domain.test.js test/crm-database.test.js test/crm-http.e2e.test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

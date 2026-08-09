@@ -1,9 +1,13 @@
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const {
   CARRYING_DELIVERY_STATUSES,
   DELIVERY_ROLES,
   FINAL_DELIVERY_STATUSES,
 } = require('./src/delivery-rules');
+const { buildArrivalStatus } = require('./src/delivery-geo');
+const { createDeliveryLocationService } = require('./src/delivery-location-service');
 
 function normalizePhone(value) {
   return String(value || '').replace(/\D/g, '');
@@ -17,76 +21,6 @@ function parseCart(value) {
   } catch {
     return [];
   }
-}
-
-function haversineKilometers(fromLatitude, fromLongitude, toLatitude, toLongitude) {
-  const radians = (degrees) => degrees * Math.PI / 180;
-  const latDistance = radians(toLatitude - fromLatitude);
-  const lonDistance = radians(toLongitude - fromLongitude);
-  const value = Math.sin(latDistance / 2) ** 2
-    + Math.cos(radians(fromLatitude)) * Math.cos(radians(toLatitude)) * Math.sin(lonDistance / 2) ** 2;
-  return 6371 * 2 * Math.atan2(Math.sqrt(value), Math.sqrt(1 - value));
-}
-
-const DEFAULT_COMPLETION_RADIUS_METERS = 150;
-const MAX_GPS_ACCURACY_METERS = 200;
-const MAX_GPS_AGE_MS = 3 * 60 * 1000;
-
-function completionRadius(value) {
-  const radius = Number(value);
-  return Number.isInteger(radius) && radius >= 50 && radius <= 500
-    ? radius
-    : DEFAULT_COMPLETION_RADIUS_METERS;
-}
-
-function buildArrivalStatus({
-  destinationLatitude, destinationLongitude, latitude, longitude, accuracy,
-  locationAt, acceptedAt, radiusMeters,
-}) {
-  const radius = completionRadius(radiusMeters);
-  const hasExactDestination = destinationLatitude != null && destinationLongitude != null;
-  if (!hasExactDestination) {
-    return {
-      required: false,
-      hasExactDestination: false,
-      distanceMeters: null,
-      radiusMeters: radius,
-      hasCurrentLocation: latitude != null && longitude != null,
-      isFresh: false,
-      accuracyMeters: accuracy == null ? null : Math.round(Number(accuracy)),
-      isAccuracyAcceptable: true,
-      isWithinRange: true,
-    };
-  }
-
-  const hasCurrentLocation = latitude != null && longitude != null
-    && Number.isFinite(Number(latitude)) && Number.isFinite(Number(longitude));
-  const locationTime = locationAt ? new Date(locationAt).getTime() : NaN;
-  const acceptedTime = acceptedAt ? new Date(acceptedAt).getTime() : NaN;
-  const isFresh = hasCurrentLocation
-    && Number.isFinite(locationTime)
-    && Date.now() - locationTime <= MAX_GPS_AGE_MS
-    && (!Number.isFinite(acceptedTime) || locationTime >= acceptedTime);
-  const numericAccuracy = accuracy == null ? null : Number(accuracy);
-  const isAccuracyAcceptable = numericAccuracy == null
-    || (Number.isFinite(numericAccuracy) && numericAccuracy <= MAX_GPS_ACCURACY_METERS);
-  const distanceMeters = hasCurrentLocation
-    ? Math.round(haversineKilometers(
-      Number(latitude), Number(longitude), Number(destinationLatitude), Number(destinationLongitude),
-    ) * 1000)
-    : null;
-
-  return {
-    required: true,
-    hasExactDestination: true,
-    distanceMeters,
-    radiusMeters: radius,
-    hasCurrentLocation,
-    isFresh,
-    accuracyMeters: numericAccuracy == null ? null : Math.round(numericAccuracy),
-    isAccuracyAcceptable,
-    isWithinRange: isFresh && isAccuracyAcceptable && distanceMeters != null && distanceMeters <= radius,
-  };
 }
 
 function formatOrder(row, options = {}) {
@@ -110,8 +44,10 @@ function formatOrder(row, options = {}) {
     longitude: row.driver_longitude,
     accuracy: row.driver_accuracy,
     locationAt: row.driver_location_at,
-    acceptedAt: row.delivery_accepted_at,
+    startedAt: row.picked_up_at || row.on_the_way_at || row.delivery_accepted_at,
     radiusMeters: row.delivery_completion_radius_meters,
+    maxGpsAgeSeconds: row.gps_max_age_seconds,
+    maxGpsAccuracyMeters: row.gps_max_accuracy_meters,
   });
   return {
     id: row.id,
@@ -138,6 +74,24 @@ function formatOrder(row, options = {}) {
     orderStatus: row.status,
     deliveryStatus: row.delivery_status,
     deliveryUserId: row.delivery_user_id,
+    deliveryProviderType: row.delivery_provider_type || (row.delivery_user_id ? 'own' : null),
+    externalCompany: row.external_delivery_company_id ? {
+      id: Number(row.external_delivery_company_id),
+      name: row.external_company_name || null,
+      phone: row.external_company_phone || null,
+      integrationType: row.external_company_integration_type || 'manual',
+    } : null,
+    externalDriverName: row.external_driver_name || null,
+    externalDriverPhone: row.external_driver_phone || null,
+    externalVehicleId: row.external_vehicle_id || null,
+    externalDeliveryCost: Number(row.external_delivery_cost || 0),
+    logisticsMargin: Number(row.delivery_fee || row.configured_delivery_fee || 0) - Number(row.external_delivery_cost || 0),
+    externalDeliveryNotes: row.external_delivery_notes || '',
+    externalEtaMinutes: row.external_eta_minutes == null ? null : Number(row.external_eta_minutes),
+    externalAssignedAt: row.external_assigned_at || null,
+    externalHandedOffAt: row.external_handed_off_at || null,
+    externalConfirmedAt: row.external_delivery_confirmed_at || null,
+    externalConfirmedBy: row.external_delivery_confirmed_by_name || null,
     items: cart,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -149,6 +103,8 @@ function formatOrder(row, options = {}) {
     durationSeconds: row.delivery_duration_seconds == null ? null : Number(row.delivery_duration_seconds),
     deliveryNotes: row.delivery_notes || '',
     deliveryRating: row.delivery_rating == null ? null : Number(row.delivery_rating),
+    version: Number(row.version || 1),
+    geofenceOverrideId: row.geofence_override_id == null ? null : Number(row.geofence_override_id),
     googleMapsUrl: `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(destination)}`,
     driverName: row.driver_name || null,
     driverPhone: row.driver_phone || null,
@@ -166,6 +122,30 @@ function formatOrder(row, options = {}) {
     },
     ...(options.driverTrail ? { driverTrail: options.driverTrail } : {}),
     ...(options.includeEvidence ? { deliveryEvidence: row.delivery_evidence || null } : {}),
+  };
+}
+
+function formatAvailableOrder(row) {
+  const order = formatOrder(row);
+  return {
+    id: order.id,
+    customerName: order.customerName,
+    address: order.address,
+    barrio: order.barrio,
+    deliveryType: order.deliveryType,
+    paymentMethod: order.paymentMethod,
+    total: order.total,
+    deliveryFee: order.deliveryFee,
+    orderStatus: order.orderStatus,
+    deliveryStatus: order.deliveryStatus,
+    deliveryUserId: order.deliveryUserId,
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt,
+    destinationLatitude: order.destinationLatitude,
+    destinationLongitude: order.destinationLongitude,
+    store: order.store,
+    googleMapsUrl: order.googleMapsUrl,
+    restricted: true,
   };
 }
 
@@ -188,6 +168,13 @@ function createRealtimeHub() {
     });
     res.flushHeaders();
     res.write(`event: connected\ndata: ${JSON.stringify({ at: new Date().toISOString() })}\n\n`);
+    for (const replay of metadata.replayEvents || []) {
+      const payload = { ...(replay.payload || {}), eventId: replay.event_id, occurredAt: replay.occurred_at, replayed: true };
+      const eventName = replay.aggregate_type === 'order'
+        ? 'order_updated'
+        : replay.aggregate_type === 'driver' ? 'driver_presence' : replay.event_type;
+      res.write(`id: ${replay.event_id}\nevent: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`);
+    }
     const client = { res, ...metadata };
     client.nextValidationAt = Date.now() + 60000;
     client.heartbeat = setInterval(async () => {
@@ -213,7 +200,8 @@ function createRealtimeHub() {
   };
 
   const publish = (event, payload = {}, predicate = () => true) => {
-    const packet = `event: ${event}\ndata: ${JSON.stringify({ ...payload, emittedAt: new Date().toISOString() })}\n\n`;
+    const eventId = payload.eventId || payload.event_id || null;
+    const packet = `${eventId ? `id: ${eventId}\n` : ''}event: ${event}\ndata: ${JSON.stringify({ ...payload, emittedAt: new Date().toISOString() })}\n\n`;
     for (const client of clients) {
       if (!predicate(client)) continue;
       try {
@@ -230,15 +218,22 @@ function createRealtimeHub() {
       .map((client) => Number(client.userId)),
   );
 
-  return { add, publish, onlineUserIds };
+  const stats = () => ({
+    clients: clients.size,
+    authenticated: [...clients].filter((client) => client.kind === 'authenticated').length,
+    tracking: [...clients].filter((client) => client.kind === 'tracking').length,
+  });
+  return { add, publish, onlineUserIds, stats };
 }
 
 module.exports = function registerDeliveryApi(app, dependencies) {
   const {
     pool, authenticateToken, requirePermission, trackingLimiter, webpush,
     publicVapidKey, minPasswordLength, authorizeTrackingAccess, trackingSecret,
+    deliveryOrderService, publishEphemeral,
   } = dependencies;
   const realtime = createRealtimeHub();
+  const deliveryLocationService = createDeliveryLocationService({ pool });
 
   const requireDeliveryUser = async (req, res, next) => {
     try {
@@ -289,10 +284,54 @@ module.exports = function registerDeliveryApi(app, dependencies) {
     }));
   };
 
+  const requestDeviceId = (req) => String(
+    req.headers['x-device-id'] || req.body?.deviceId || req.query?.deviceId || '',
+  ).trim().slice(0, 100);
+
+  const sendDomainError = (res, error, fallback = 'No fue posible completar la operación') => {
+    console.error(JSON.stringify({
+      level: error.statusCode && error.statusCode < 500 ? 'warn' : 'error',
+      component: 'delivery-api', code: error.code || 'UNEXPECTED_ERROR', message: error.message,
+    }));
+    return res.status(error.statusCode || 500).json({
+      status: 'error',
+      code: error.code || 'DELIVERY_OPERATION_FAILED',
+      error: error.statusCode ? error.message : fallback,
+      details: error.details,
+    });
+  };
+
+  const publishLocationEvent = async (payload) => {
+    if (publishEphemeral) return publishEphemeral('delivery_location', payload);
+    realtime.publish('delivery_location', payload, (connectedClient) => {
+      const orderIds = Array.isArray(payload.orderIds) ? payload.orderIds.map(Number) : [Number(payload.orderId)];
+      if (connectedClient.kind === 'tracking') return orderIds.includes(Number(connectedClient.orderId));
+      if (DELIVERY_ROLES.has(connectedClient.role)) return Number(connectedClient.userId) === Number(payload.deliveryUserId);
+      return true;
+    });
+    return undefined;
+  };
+
+  const publishLocationResult = async (driverId, result) => {
+    if (!result.position) return;
+    await publishLocationEvent({
+      eventId: `gps-${driverId}-${result.position.capturedAt}`,
+      orderId: result.orderIds?.[0] || null,
+      orderIds: result.orderIds || [],
+      deliveryUserId: driverId,
+      latitude: result.position.latitude,
+      longitude: result.position.longitude,
+      accuracy: result.position.accuracy,
+      capturedAt: result.position.capturedAt,
+    });
+  };
+
   const orderSelect = `
     SELECT order_data.*,
            settings.delivery_cost AS configured_delivery_fee,
            settings.delivery_completion_radius_meters,
+           settings.gps_max_age_seconds,
+           settings.gps_max_accuracy_meters,
            settings.restaurant_name AS store_name,
            COALESCE(settings.kitchen_address, settings.address) AS store_address,
            settings.store_latitude,
@@ -305,19 +344,45 @@ module.exports = function registerDeliveryApi(app, dependencies) {
            profile.current_longitude AS driver_longitude,
            profile.current_accuracy AS driver_accuracy,
            profile.last_location_at AS driver_location_at
+           ,(SELECT override_data.id FROM pedidos_app_delivery_geofence_overrides override_data
+             WHERE override_data.order_id=order_data.id ORDER BY override_data.created_at DESC LIMIT 1) AS geofence_override_id
+           ,company.name AS external_company_name
+           ,company.phone AS external_company_phone
+           ,company.integration_type AS external_company_integration_type
     FROM pedidos_app_orders order_data
     LEFT JOIN pedidos_app_settings settings ON settings.id = 1
     LEFT JOIN pedidos_app_users driver ON driver.id = order_data.delivery_user_id
     LEFT JOIN pedidos_app_delivery_profiles profile ON profile.user_id = order_data.delivery_user_id
+    LEFT JOIN pedidos_app_delivery_companies company ON company.id = order_data.external_delivery_company_id
   `;
 
   app.get('/api/pedidos/push/public-key', (req, res) => {
     res.json({ status: 'ok', publicKey: publicVapidKey });
   });
 
-  app.get('/api/pedidos/realtime/stream', authenticateToken, (req, res) => {
+  app.get('/api/pedidos/realtime/stream', authenticateToken, async (req, res) => {
+    const lastEventId = String(req.headers['last-event-id'] || '').trim();
+    let replayEvents = [];
+    if (/^[0-9a-f-]{36}$/i.test(lastEventId)) {
+      const replay = await pool.query(`
+        WITH anchor AS (
+          SELECT occurred_at FROM pedidos_app_domain_events WHERE event_id=$1::uuid
+        )
+        SELECT event.event_id,event.aggregate_type,event.aggregate_id,event.event_type,
+               event.payload,event.occurred_at
+        FROM pedidos_app_domain_events event, anchor
+        WHERE (event.occurred_at,event.id) > (anchor.occurred_at,
+          (SELECT id FROM pedidos_app_domain_events WHERE event_id=$1::uuid))
+          AND (event.event_type <> 'session_revoked'
+               OR (event.payload->>'userId')::integer=$2)
+        ORDER BY event.occurred_at,event.id
+        LIMIT 200
+      `, [lastEventId, req.user.id]);
+      replayEvents = replay.rows;
+    }
     realtime.add(req, res, {
       kind: 'authenticated', userId: req.user.id, role: req.user.role,
+      replayEvents,
       validate: async () => {
         if (!req.user.jti) return false;
         const { rowCount } = await pool.query(`
@@ -339,6 +404,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
       const access = {
         orderId,
         phone: req.query.phone,
+        code: req.query.c,
         token: req.query.token,
         secret: trackingSecret,
       };
@@ -364,34 +430,51 @@ module.exports = function registerDeliveryApi(app, dependencies) {
   app.get('/api/pedidos/delivery/me', authenticateToken, requireDeliveryUser, async (req, res) => {
     try {
       await pool.query(`
-        INSERT INTO pedidos_app_delivery_profiles (user_id, availability_status, connected_at)
-        VALUES ($1, 'Libre', NOW())
+        INSERT INTO pedidos_app_delivery_profiles (user_id, availability_status)
+        VALUES ($1, 'Desconectado')
         ON CONFLICT (user_id) DO UPDATE
-        SET connected_at = NOW(),
-            availability_status = CASE
-              WHEN EXISTS (
-                SELECT 1 FROM pedidos_app_orders active_order
-                WHERE active_order.delivery_user_id = EXCLUDED.user_id
-                  AND active_order.delivery_status IN ('Aceptado', 'Recogido', 'En camino')
-              ) THEN 'Ocupado'
-              WHEN pedidos_app_delivery_profiles.availability_status = 'Desconectado' THEN 'Libre'
-              ELSE pedidos_app_delivery_profiles.availability_status
-            END,
+        SET connected_at = CASE WHEN pedidos_app_delivery_profiles.shift_active THEN NOW() ELSE connected_at END,
+            last_seen_at = CASE WHEN pedidos_app_delivery_profiles.shift_active THEN NOW() ELSE last_seen_at END,
             updated_at = NOW()
       `, [req.user.id]);
       const { rows } = await pool.query(`
         SELECT u.id, u.username, u.name, u.last_name, u.document, u.email, u.phone, u.photo_url,
                profile.vehicle_name, profile.vehicle_type, profile.plate, profile.documents,
                profile.availability_status, profile.max_active_orders,
+               profile.shift_active, profile.shift_started_at, profile.shift_ended_at,
+               profile.last_seen_at, profile.last_location_at, profile.tracking_device_id,
+               profile.tracking_mode, profile.gps_status,
                (SELECT COUNT(*)::int FROM pedidos_app_orders active_order
                 WHERE active_order.delivery_user_id = u.id
-                  AND active_order.delivery_status = ANY($2::text[])) AS active_orders,
+                  AND COALESCE(active_order.delivery_provider_type,'own')='own'
+                  AND active_order.delivery_status IN ('Pendiente','Aceptado','Recogido','En camino')) AS committed_orders,
+               (SELECT COUNT(*)::int FROM pedidos_app_orders active_order
+                WHERE active_order.delivery_user_id = u.id
+                  AND active_order.delivery_status = 'Pendiente') AS reserved_orders,
+               (SELECT COUNT(*)::int FROM pedidos_app_orders active_order
+                WHERE active_order.delivery_user_id = u.id
+                  AND active_order.delivery_status = 'Aceptado') AS accepted_orders,
+               (SELECT COUNT(*)::int FROM pedidos_app_orders active_order
+                WHERE active_order.delivery_user_id = u.id
+                  AND active_order.delivery_status IN ('Recogido','En camino')) AS on_the_way_orders,
                CASE WHEN profile.rating_count > 0 THEN ROUND(profile.rating_sum / profile.rating_count, 2) ELSE 0 END AS rating
         FROM pedidos_app_users u
         JOIN pedidos_app_delivery_profiles profile ON profile.user_id = u.id
         WHERE u.id = $1
-      `, [req.user.id, CARRYING_DELIVERY_STATUSES]);
-      res.json({ status: 'ok', profile: rows[0] });
+      `, [req.user.id]);
+      const settingsResult = await pool.query(`
+        SELECT gps_delivery_interval_seconds, gps_free_interval_seconds,
+               presence_heartbeat_interval_seconds, presence_timeout_seconds,
+               gps_max_age_seconds, gps_max_accuracy_meters, offline_location_queue_limit,
+               default_max_driver_capacity, sse_reconnect_initial_ms, sse_reconnect_max_ms
+        FROM pedidos_app_settings WHERE id=1
+      `);
+      const profile = rows[0];
+      res.json({
+        status: 'ok',
+        profile: { ...profile, active_orders: Number(profile.accepted_orders || 0) + Number(profile.on_the_way_orders || 0) },
+        operation: settingsResult.rows[0] || {},
+      });
     } catch (error) {
       console.error('Error cargando perfil delivery:', error);
       res.status(500).json({ error: 'No fue posible cargar el perfil' });
@@ -442,26 +525,174 @@ module.exports = function registerDeliveryApi(app, dependencies) {
     }
   });
 
-  app.post('/api/pedidos/delivery/availability', authenticateToken, requireDeliveryUser, async (req, res) => {
-    const requested = req.body.status;
-    if (!['Libre', 'Desconectado'].includes(requested)) return res.status(400).json({ error: 'Estado no permitido' });
-    const active = await pool.query(`
-      SELECT 1 FROM pedidos_app_orders
-      WHERE delivery_user_id = $1 AND delivery_status = ANY($2::text[])
-      LIMIT 1
-    `, [req.user.id, ['Aceptado', 'Recogido', 'En camino']]);
-    if (active.rowCount && requested === 'Libre') return res.status(409).json({ error: 'Termina el pedido activo antes de marcarte libre' });
+  app.post('/api/pedidos/delivery/shift/start', authenticateToken, requireDeliveryUser, async (req, res) => {
+    try {
+      const result = await deliveryOrderService.startShift({
+        driverId: req.user.id,
+        actor: req.user,
+        deviceId: requestDeviceId(req),
+        idempotencyKey: req.headers['idempotency-key'] || req.body.operationId,
+        transfer: false,
+      });
+      res.json(result);
+    } catch (error) {
+      sendDomainError(res, error, 'No fue posible iniciar el turno');
+    }
+  });
+
+  app.post('/api/pedidos/delivery/shift/heartbeat', authenticateToken, requireDeliveryUser, async (req, res) => {
+    try {
+      const presence = await deliveryOrderService.heartbeat({
+        driverId: req.user.id,
+        deviceId: requestDeviceId(req),
+        gpsStatus: req.body.gpsStatus,
+      });
+      res.json({ status: 'ok', presence });
+    } catch (error) {
+      sendDomainError(res, error, 'No fue posible actualizar la presencia');
+    }
+  });
+
+  app.post('/api/pedidos/delivery/shift/end', authenticateToken, requireDeliveryUser, async (req, res) => {
+    try {
+      const result = await deliveryOrderService.endShift({
+        driverId: req.user.id,
+        actor: req.user,
+        deviceId: requestDeviceId(req),
+        idempotencyKey: req.headers['idempotency-key'] || req.body.operationId,
+      });
+      res.json(result);
+    } catch (error) {
+      sendDomainError(res, error, 'No fue posible finalizar el turno');
+    }
+  });
+
+  app.post('/api/pedidos/delivery/shift/transfer-device', authenticateToken, requireDeliveryUser, async (req, res) => {
+    if (req.body.confirm !== true) return res.status(400).json({ code: 'TRANSFER_CONFIRMATION_REQUIRED', error: 'Confirma la transferencia del GPS a este dispositivo.' });
+    try {
+      const result = await deliveryOrderService.transferTrackingDevice({
+        driverId: req.user.id,
+        actor: req.user,
+        deviceId: requestDeviceId(req),
+        idempotencyKey: req.headers['idempotency-key'] || req.body.operationId,
+      });
+      res.json(result);
+    } catch (error) {
+      sendDomainError(res, error, 'No fue posible transferir el dispositivo GPS');
+    }
+  });
+
+  app.post('/api/pedidos/delivery/native/bootstrap', authenticateToken, requireDeliveryUser, async (req, res) => {
+    const deviceId = requestDeviceId(req);
+    const { rows } = await pool.query(`
+      SELECT shift_active, tracking_device_id
+      FROM pedidos_app_delivery_profiles
+      WHERE user_id=$1
+    `, [req.user.id]);
+    if (!rows[0]?.shift_active) return res.status(409).json({ code: 'SHIFT_NOT_ACTIVE', error: 'Inicia el turno antes de activar el servicio nativo.' });
+    if (rows[0].tracking_device_id !== deviceId) {
+      return res.status(409).json({ code: 'TRACKING_ACTIVE_ON_ANOTHER_DEVICE', error: 'Este dispositivo no controla el GPS del turno.' });
+    }
+    const bootstrapCode = crypto.randomBytes(32).toString('base64url');
+    const codeHash = crypto.createHash('sha256').update(bootstrapCode).digest('hex');
     await pool.query(`
-      INSERT INTO pedidos_app_delivery_profiles (user_id, availability_status, connected_at)
-      VALUES ($1, $2, NOW())
-      ON CONFLICT (user_id) DO UPDATE SET availability_status = $2, updated_at = NOW()
-    `, [req.user.id, requested]);
-    realtime.publish('driver_presence', { userId: req.user.id, status: requested });
-    res.json({ status: 'ok' });
+      INSERT INTO pedidos_app_delivery_native_bootstrap
+        (code_hash,driver_id,device_id,expires_at)
+      VALUES ($1,$2,$3,NOW()+INTERVAL '90 seconds')
+    `, [codeHash, req.user.id, deviceId]);
+    res.json({ status: 'ok', bootstrapCode, expiresInSeconds: 90 });
+  });
+
+  app.post('/api/pedidos/delivery/native/exchange', trackingLimiter, async (req, res) => {
+    const code = String(req.body.bootstrapCode || '').trim();
+    const deviceId = String(req.body.deviceId || '').trim().slice(0, 100);
+    if (!code || !deviceId) return res.status(400).json({ code: 'NATIVE_BOOTSTRAP_REQUIRED', error: 'Código y dispositivo son obligatorios.' });
+    const codeHash = crypto.createHash('sha256').update(code).digest('hex');
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const bootstrap = await client.query(`
+        SELECT bootstrap.driver_id,bootstrap.device_id,bootstrap.expires_at,bootstrap.consumed_at,
+               profile.shift_active,profile.tracking_device_id
+        FROM pedidos_app_delivery_native_bootstrap bootstrap
+        JOIN pedidos_app_delivery_profiles profile ON profile.user_id=bootstrap.driver_id
+        WHERE bootstrap.code_hash=$1
+        FOR UPDATE OF bootstrap
+      `, [codeHash]);
+      const record = bootstrap.rows[0];
+      if (!record || record.consumed_at || new Date(record.expires_at).getTime() <= Date.now()
+          || record.device_id !== deviceId || !record.shift_active || record.tracking_device_id !== deviceId) {
+        await client.query('ROLLBACK');
+        return res.status(401).json({ code: 'NATIVE_BOOTSTRAP_INVALID', error: 'El código nativo expiró o no corresponde a este dispositivo.' });
+      }
+      await client.query('UPDATE pedidos_app_delivery_native_bootstrap SET consumed_at=NOW() WHERE code_hash=$1', [codeHash]);
+      await client.query('COMMIT');
+      const trackingToken = jwt.sign({
+        type: 'delivery_tracking', id: record.driver_id, deviceId,
+      }, trackingSecret, { audience: 'delivery-location', issuer: 'distrito-api', expiresIn: '12h' });
+      return res.json({ status: 'ok', trackingToken, expiresInSeconds: 12 * 60 * 60 });
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      return res.status(500).json({ code: 'NATIVE_BOOTSTRAP_FAILED', error: 'No fue posible activar el seguimiento nativo.' });
+    } finally {
+      client.release();
+    }
+  });
+
+  const authenticateNativeTracking = (req, res, next) => {
+    const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    try {
+      const payload = jwt.verify(token, trackingSecret, { audience: 'delivery-location', issuer: 'distrito-api' });
+      if (payload.type !== 'delivery_tracking' || !payload.id || !payload.deviceId) throw new Error('invalid scope');
+      req.nativeDelivery = payload;
+      next();
+    } catch {
+      res.status(401).json({ code: 'TRACKING_TOKEN_INVALID', error: 'La autorización nativa de ubicación no es válida.' });
+    }
+  };
+
+  const ingestLocations = async (req, res, identity) => {
+    try {
+      const result = await deliveryLocationService.ingestBatch({
+        driverId: identity.driverId,
+        deviceId: identity.deviceId,
+        points: req.body.points,
+      });
+      await publishLocationResult(identity.driverId, result);
+      res.status(202).json(result);
+    } catch (error) {
+      sendDomainError(res, error, 'No fue posible sincronizar las posiciones GPS');
+    }
+  };
+
+  app.post('/api/pedidos/delivery/location/batch', authenticateToken, requireDeliveryUser, async (req, res) => (
+    ingestLocations(req, res, { driverId: req.user.id, deviceId: requestDeviceId(req) })
+  ));
+
+  app.post('/api/pedidos/delivery/native/location/batch', authenticateNativeTracking, async (req, res) => (
+    ingestLocations(req, res, { driverId: req.nativeDelivery.id, deviceId: req.nativeDelivery.deviceId })
+  ));
+
+  app.post('/api/pedidos/delivery/availability', authenticateToken, requireDeliveryUser, async (req, res) => {
+    return res.status(410).json({
+      code: 'AVAILABILITY_REPLACED_BY_SHIFT',
+      error: 'La disponibilidad ahora se controla con Iniciar turno y Finalizar turno.',
+    });
   });
 
   app.get('/api/pedidos/delivery/orders/available', authenticateToken, requireDeliveryUser, async (req, res) => {
     try {
+      const operation = await pool.query(`
+        SELECT shift_active, last_seen_at, tracking_device_id,
+               (SELECT COUNT(*)::int FROM pedidos_app_orders committed
+                WHERE committed.delivery_user_id=$1
+                  AND COALESCE(committed.delivery_provider_type,'own')='own'
+                  AND committed.delivery_status IN ('Pendiente','Aceptado','Recogido','En camino')) AS committed_orders
+        FROM pedidos_app_delivery_profiles WHERE user_id=$1
+      `, [req.user.id]);
+      if (!operation.rows[0]?.shift_active) {
+        return res.json({ status: 'ok', capacity: req.deliveryUser.max_active_orders, committed: 0, orders: [], shiftActive: false });
+      }
       const { rows } = await pool.query(`${orderSelect}
         WHERE lower(order_data.delivery_type) = 'domicilio'
           AND order_data.status = 'Listo'
@@ -470,7 +701,11 @@ module.exports = function registerDeliveryApi(app, dependencies) {
         ORDER BY order_data.created_at ASC
         LIMIT 100
       `, [req.user.id]);
-      res.json({ status: 'ok', capacity: req.deliveryUser.max_active_orders, orders: rows.map(formatOrder) });
+      res.json({
+        status: 'ok', capacity: req.deliveryUser.max_active_orders,
+        committed: Number(operation.rows[0].committed_orders || 0), shiftActive: true,
+        orders: rows.map(formatAvailableOrder),
+      });
     } catch (error) {
       console.error('Error cargando pedidos disponibles:', error);
       res.status(500).json({ error: 'No fue posible cargar los pedidos disponibles' });
@@ -501,16 +736,18 @@ module.exports = function registerDeliveryApi(app, dependencies) {
         )
     `, [orderId, req.user.id]);
     if (!rows.length) return res.status(404).json({ error: 'Pedido no disponible' });
+    const ownsOrder = Number(rows[0].delivery_user_id) === Number(req.user.id);
     let driverTrail = [];
-    if (Number(rows[0].delivery_user_id) === Number(req.user.id) && rows[0].delivery_status === 'En camino') {
+    if (ownsOrder && ['Recogido', 'En camino'].includes(rows[0].delivery_status)) {
       const trailResult = await pool.query(`
-        SELECT latitude, longitude, accuracy, recorded_at AS "recordedAt"
-        FROM pedidos_app_delivery_locations
-        WHERE order_id = $1 AND user_id = $2
-          AND recorded_at >= COALESCE($3::timestamptz, recorded_at)
-        ORDER BY recorded_at DESC
+        SELECT latitude, longitude, accuracy, captured_at AS "recordedAt"
+        FROM pedidos_app_driver_location_points
+        WHERE driver_id = $1
+          AND captured_at >= COALESCE($2::timestamptz, captured_at)
+          AND captured_at <= COALESCE($3::timestamptz, NOW())
+        ORDER BY captured_at DESC
         LIMIT 120
-      `, [orderId, req.user.id, rows[0].delivery_accepted_at]);
+      `, [req.user.id, rows[0].picked_up_at || rows[0].on_the_way_at, rows[0].delivery_completed_at]);
       driverTrail = trailResult.rows.reverse().map((point) => ({
         latitude: Number(point.latitude),
         longitude: Number(point.longitude),
@@ -518,279 +755,78 @@ module.exports = function registerDeliveryApi(app, dependencies) {
         recordedAt: point.recordedAt,
       }));
     }
-    res.json({ status: 'ok', order: formatOrder(rows[0], { driverTrail }) });
+    res.json({
+      status: 'ok',
+      order: ownsOrder ? formatOrder(rows[0], { driverTrail }) : formatAvailableOrder(rows[0]),
+    });
   });
 
   app.post('/api/pedidos/delivery/orders/:id/accept', authenticateToken, requireDeliveryUser, async (req, res) => {
-    const client = await pool.connect();
     try {
       const orderId = Number(req.params.id);
-      await client.query('BEGIN');
-      await client.query(`
-        INSERT INTO pedidos_app_delivery_profiles (user_id, availability_status, connected_at)
-        VALUES ($1, 'Libre', NOW())
-        ON CONFLICT (user_id) DO NOTHING
-      `, [req.user.id]);
-      const capacityResult = await client.query(`
-        SELECT profile.max_active_orders,
-               (SELECT COUNT(*)::int
-                FROM pedidos_app_orders active_order
-                WHERE active_order.delivery_user_id = profile.user_id
-                  AND active_order.delivery_status = ANY($2::text[])) AS active_orders
-        FROM pedidos_app_delivery_profiles profile
-        WHERE profile.user_id = $1
-        FOR UPDATE
-      `, [req.user.id, CARRYING_DELIVERY_STATUSES]);
-      const capacity = Number(capacityResult.rows[0]?.max_active_orders || 1);
-      const activeOrders = Number(capacityResult.rows[0]?.active_orders || 0);
-      if (activeOrders >= capacity) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({
-          code: 'DELIVERY_CAPACITY_REACHED',
-          error: `Alcanzaste tu capacidad de ${capacity} pedido${capacity === 1 ? '' : 's'} simultáneo${capacity === 1 ? '' : 's'}. Finaliza uno antes de aceptar otro.`,
-          activeOrders,
-          capacity,
-        });
-      }
-      const { rows } = await client.query(`
-        UPDATE pedidos_app_orders
-        SET delivery_user_id = $1,
-            delivery_status = 'En camino',
-            status = 'En camino',
-            delivery_accepted_at = COALESCE(delivery_accepted_at, NOW()),
-            picked_up_at = COALESCE(picked_up_at, NOW()),
-            on_the_way_at = COALESCE(on_the_way_at, NOW()),
-            updated_at = NOW()
-        WHERE id = $2
-          AND lower(delivery_type) = 'domicilio'
-          AND status = 'Listo'
-          AND delivery_status = 'Pendiente'
-          AND (delivery_user_id IS NULL OR delivery_user_id = $1)
-        RETURNING *
-      `, [req.user.id, orderId]);
-      if (!rows.length) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({ error: 'Otro domiciliario ya tomó este pedido o ya no está disponible' });
-      }
-      await client.query(`
-        INSERT INTO pedidos_app_delivery_profiles (user_id, availability_status, connected_at)
-        VALUES ($1, 'Ocupado', NOW())
-        ON CONFLICT (user_id) DO UPDATE SET availability_status = 'Ocupado', updated_at = NOW()
-      `, [req.user.id]);
-      await client.query('COMMIT');
-      realtime.publish('order_assigned', { orderId, deliveryUserId: req.user.id });
-      realtime.publish('order_updated', {
+      if (!Number.isInteger(orderId)) return res.status(400).json({ code: 'INVALID_ORDER_ID', error: 'Pedido inválido' });
+      const result = await deliveryOrderService.acceptOrder({
         orderId,
-        deliveryUserId: req.user.id,
-        deliveryStatus: 'En camino',
-        orderStatus: 'En camino',
+        driverId: req.user.id,
+        actor: req.user,
+        deviceId: requestDeviceId(req),
+        idempotencyKey: req.headers['idempotency-key'] || req.body.operationId,
       });
-      res.json({ status: 'ok', order: formatOrder(rows[0]) });
+      res.json({ status: 'ok', order: formatOrder(result.order), replayed: result.replayed });
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
-      console.error('Error aceptando pedido:', error);
-      if (error.code === '23505') return res.status(409).json({ error: 'Otro domiciliario ya tomó este pedido' });
-      res.status(500).json({ error: 'No fue posible aceptar el pedido' });
-    } finally {
-      client.release();
+      sendDomainError(res, error, 'No fue posible aceptar el pedido');
     }
   });
 
   app.post('/api/pedidos/delivery/orders/:id/pickup', authenticateToken, requireDeliveryUser, async (req, res) => {
-    const { rows } = await pool.query(`
-      UPDATE pedidos_app_orders
-      SET delivery_status = 'En camino', status = 'En camino',
-          picked_up_at = COALESCE(picked_up_at, NOW()),
-          on_the_way_at = COALESCE(on_the_way_at, NOW()), updated_at = NOW()
-      WHERE id = $1 AND delivery_user_id = $2 AND delivery_status IN ('Aceptado', 'Recogido')
-      RETURNING *
-    `, [Number(req.params.id), req.user.id]);
-    if (!rows.length) return res.status(409).json({ error: 'El pedido no se puede marcar como recogido' });
-    realtime.publish('order_updated', { orderId: rows[0].id, deliveryStatus: 'En camino', orderStatus: 'En camino' });
-    res.json({ status: 'ok', order: formatOrder(rows[0]) });
+    try {
+      const result = await deliveryOrderService.startDelivery({
+        orderId: Number(req.params.id), driverId: req.user.id, actor: req.user,
+        deviceId: requestDeviceId(req),
+        idempotencyKey: req.headers['idempotency-key'] || req.body.operationId,
+      });
+      res.json({ status: 'ok', order: formatOrder(result.order), replayed: result.replayed });
+    } catch (error) {
+      sendDomainError(res, error, 'No fue posible iniciar la entrega');
+    }
   });
 
   app.post('/api/pedidos/delivery/orders/:id/location', authenticateToken, requireDeliveryUser, async (req, res) => {
-    const orderId = Number(req.params.id);
-    const latitude = Number(req.body.latitude);
-    const longitude = Number(req.body.longitude);
-    const accuracy = req.body.accuracy == null ? null : Number(req.body.accuracy);
-    if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
-      return res.status(400).json({ error: 'Ubicación inválida' });
-    }
-    const client = await pool.connect();
-    let arrival;
     try {
-      await client.query('BEGIN');
-      const ownsOrder = await client.query(`
-        SELECT order_data.id, order_data.delivery_latitude, order_data.delivery_longitude,
-               order_data.delivery_accepted_at, settings.delivery_completion_radius_meters
-        FROM pedidos_app_orders order_data
-        LEFT JOIN pedidos_app_settings settings ON settings.id = 1
-        WHERE order_data.id = $1 AND order_data.delivery_user_id = $2 AND order_data.delivery_status = 'En camino'
-        FOR UPDATE OF order_data
-      `, [orderId, req.user.id]);
-      if (!ownsOrder.rowCount) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({ error: 'Este pedido no está compartiendo ubicación' });
-      }
-      const previous = await client.query(`
-        SELECT latitude, longitude
-        FROM pedidos_app_delivery_locations
-        WHERE order_id = $1 AND user_id = $2
-        ORDER BY recorded_at DESC LIMIT 1
-      `, [orderId, req.user.id]);
-      let traveled = 0;
-      if (previous.rowCount && (accuracy == null || accuracy <= 200)) {
-        traveled = haversineKilometers(
-          Number(previous.rows[0].latitude), Number(previous.rows[0].longitude), latitude, longitude,
-        );
-        if (!Number.isFinite(traveled) || traveled > 3) traveled = 0;
-      }
-      await client.query(`
-        INSERT INTO pedidos_app_delivery_locations
-          (user_id, order_id, latitude, longitude, accuracy, speed, heading)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-      `, [req.user.id, orderId, latitude, longitude, accuracy, req.body.speed ?? null, req.body.heading ?? null]);
-      await client.query(`
-        UPDATE pedidos_app_delivery_profiles
-        SET current_latitude = $1, current_longitude = $2, current_accuracy = $3,
-            last_location_at = NOW(), availability_status = 'Ocupado', updated_at = NOW()
-        WHERE user_id = $4
-      `, [latitude, longitude, accuracy, req.user.id]);
-      if (traveled > 0) {
-        await client.query(`
-          UPDATE pedidos_app_orders
-          SET delivery_distance_km = COALESCE(delivery_distance_km, 0) + $1
-          WHERE id = $2
-        `, [traveled, orderId]);
-      }
-      arrival = buildArrivalStatus({
-        destinationLatitude: ownsOrder.rows[0].delivery_latitude,
-        destinationLongitude: ownsOrder.rows[0].delivery_longitude,
-        latitude,
-        longitude,
-        accuracy,
-        locationAt: new Date(),
-        acceptedAt: ownsOrder.rows[0].delivery_accepted_at,
-        radiusMeters: ownsOrder.rows[0].delivery_completion_radius_meters,
+      const orderId = Number(req.params.id);
+      const result = await deliveryLocationService.ingestBatch({
+        driverId: req.user.id,
+        deviceId: requestDeviceId(req),
+        points: [{
+          id: req.body.pointId,
+          latitude: req.body.latitude, longitude: req.body.longitude,
+          accuracy: req.body.accuracy, speed: req.body.speed,
+          bearing: req.body.heading, altitude: req.body.altitude,
+          capturedAt: req.body.capturedAt || new Date().toISOString(),
+          provider: 'web-compat',
+        }],
       });
-      await client.query('COMMIT');
+      if (!result.orderIds.includes(orderId)) {
+        return res.status(409).json({ code: 'ORDER_NOT_TRACKING', error: 'Este pedido no está compartiendo ubicación.' });
+      }
+      await publishLocationResult(req.user.id, result);
+      res.status(202).json({ status: 'ok', arrival: result.arrivals[orderId], duplicated: result.duplicated });
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
-      console.error('Error registrando ubicación delivery:', error);
-      return res.status(500).json({ error: 'No fue posible registrar la ubicación' });
-    } finally {
-      client.release();
+      sendDomainError(res, error, 'No fue posible registrar la ubicación');
     }
-    realtime.publish('delivery_location', { orderId, deliveryUserId: req.user.id, latitude, longitude, accuracy }, (connectedClient) => {
-      if (connectedClient.kind === 'tracking') return connectedClient.orderId === orderId;
-      if (DELIVERY_ROLES.has(connectedClient.role)) return Number(connectedClient.userId) === Number(req.user.id);
-      return true;
-    });
-    res.status(202).json({ status: 'ok', arrival });
   });
 
   app.post('/api/pedidos/delivery/orders/:id/complete', authenticateToken, requireDeliveryUser, async (req, res) => {
-    if (req.body.confirmReceived !== true) return res.status(400).json({ error: 'Debes confirmar que el cliente recibió el pedido' });
-    const rating = req.body.rating == null || req.body.rating === '' ? null : Number(req.body.rating);
-    if (rating !== null && (!Number.isInteger(rating) || rating < 1 || rating > 5)) return res.status(400).json({ error: 'Calificación inválida' });
-    const evidence = req.body.evidence || null;
-    if (evidence && String(evidence).length > 2_800_000) return res.status(413).json({ error: 'La fotografía supera el límite de 2 MB' });
-    const client = await pool.connect();
     try {
-      await client.query('BEGIN');
-      const completionOrder = await client.query(`
-        SELECT order_data.id, order_data.delivery_latitude, order_data.delivery_longitude,
-               order_data.delivery_accepted_at, settings.delivery_completion_radius_meters
-        FROM pedidos_app_orders order_data
-        LEFT JOIN pedidos_app_settings settings ON settings.id = 1
-        WHERE order_data.id = $1 AND order_data.delivery_user_id = $2
-          AND order_data.delivery_status = 'En camino'
-        FOR UPDATE OF order_data
-      `, [Number(req.params.id), req.user.id]);
-      if (!completionOrder.rowCount) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({ error: 'El pedido no está listo para finalizar' });
-      }
-      const destinationIsExact = completionOrder.rows[0].delivery_latitude != null
-        && completionOrder.rows[0].delivery_longitude != null;
-      if (destinationIsExact) {
-        const profileResult = await client.query(`
-          SELECT current_latitude, current_longitude, current_accuracy, last_location_at
-          FROM pedidos_app_delivery_profiles
-          WHERE user_id = $1
-          FOR UPDATE
-        `, [req.user.id]);
-        const profile = profileResult.rows[0] || {};
-        const arrival = buildArrivalStatus({
-          destinationLatitude: completionOrder.rows[0].delivery_latitude,
-          destinationLongitude: completionOrder.rows[0].delivery_longitude,
-          latitude: profile.current_latitude,
-          longitude: profile.current_longitude,
-          accuracy: profile.current_accuracy,
-          locationAt: profile.last_location_at,
-          acceptedAt: completionOrder.rows[0].delivery_accepted_at,
-          radiusMeters: completionOrder.rows[0].delivery_completion_radius_meters,
-        });
-        if (!arrival.hasCurrentLocation) {
-          await client.query('ROLLBACK');
-          return res.status(409).json({ code: 'GPS_LOCATION_REQUIRED', error: 'Activa el GPS para validar que llegaste al destino.', arrival });
-        }
-        if (!arrival.isFresh) {
-          await client.query('ROLLBACK');
-          return res.status(409).json({ code: 'GPS_LOCATION_STALE', error: 'Estamos actualizando tu ubicación. Espera unos segundos e inténtalo de nuevo.', arrival });
-        }
-        if (!arrival.isAccuracyAcceptable) {
-          await client.query('ROLLBACK');
-          return res.status(409).json({ code: 'GPS_ACCURACY_LOW', error: 'La señal GPS aún no es suficientemente precisa. Muévete a un lugar abierto e inténtalo de nuevo.', arrival });
-        }
-        if (!arrival.isWithinRange) {
-          await client.query('ROLLBACK');
-          return res.status(409).json({
-            code: 'OUTSIDE_DELIVERY_GEOFENCE',
-            error: `Aún estás a ${arrival.distanceMeters} m del destino. Acércate a ${arrival.radiusMeters} m para finalizar.`,
-            arrival,
-          });
-        }
-      }
-      const { rows } = await client.query(`
-        UPDATE pedidos_app_orders
-        SET delivery_status = 'Entregado', status = 'Entregado',
-            delivery_completed_at = NOW(), delivered_at = COALESCE(delivered_at, NOW()),
-            completed_at = COALESCE(completed_at, NOW()), delivery_notes = $1,
-            delivery_rating = $2, delivery_evidence = $3,
-            delivery_duration_seconds = GREATEST(0, EXTRACT(EPOCH FROM (NOW() - created_at))::integer),
-            updated_at = NOW()
-        WHERE id = $4 AND delivery_user_id = $5 AND delivery_status = 'En camino'
-        RETURNING *
-      `, [String(req.body.notes || '').slice(0, 2000), rating, evidence, Number(req.params.id), req.user.id]);
-      if (!rows.length) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({ error: 'El pedido no está listo para finalizar' });
-      }
-      await client.query(`
-        UPDATE pedidos_app_delivery_profiles
-        SET availability_status = CASE
-              WHEN EXISTS (
-                SELECT 1 FROM pedidos_app_orders active_order
-                WHERE active_order.delivery_user_id = $2
-                  AND active_order.delivery_status = ANY($3::text[])
-              ) THEN 'Ocupado' ELSE 'Libre' END,
-            rating_sum = rating_sum + COALESCE($1, 0),
-            rating_count = rating_count + CASE WHEN $1 IS NULL THEN 0 ELSE 1 END,
-            updated_at = NOW()
-        WHERE user_id = $2
-      `, [rating, req.user.id, CARRYING_DELIVERY_STATUSES]);
-      await client.query('COMMIT');
-      realtime.publish('order_updated', { orderId: rows[0].id, deliveryStatus: 'Entregado', orderStatus: 'Entregado' });
-      res.json({ status: 'ok', order: formatOrder(rows[0]) });
+      const result = await deliveryOrderService.completeDelivery({
+        orderId: Number(req.params.id), driverId: req.user.id, actor: req.user,
+        deviceId: requestDeviceId(req),
+        idempotencyKey: req.headers['idempotency-key'] || req.body.operationId,
+        completion: req.body,
+      });
+      res.json({ status: 'ok', order: formatOrder(result.order), arrival: result.arrival, replayed: result.replayed });
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
-      console.error('Error finalizando entrega:', error);
-      res.status(500).json({ error: 'No fue posible finalizar la entrega' });
-    } finally {
-      client.release();
+      sendDomainError(res, error, 'No fue posible finalizar la entrega');
     }
   });
 
@@ -811,10 +847,18 @@ module.exports = function registerDeliveryApi(app, dependencies) {
     const [summary, daily, hourly] = await Promise.all([
       pool.query(`
         SELECT COUNT(*)::int AS deliveries,
-               COALESCE(SUM(delivery_fee), 0)::numeric AS income,
-               COALESCE(SUM(delivery_distance_km), 0)::numeric AS kilometers,
+               COALESCE(SUM(delivery_fee), 0)::numeric AS delivery_value,
+               COALESCE((SELECT SUM(point.distance_from_previous_km)
+                         FROM pedidos_app_driver_location_points point
+                         WHERE point.driver_id=$1 AND point.captured_at >= NOW()-$2::interval),0)::numeric AS kilometers,
                COALESCE(AVG(delivery_duration_seconds), 0)::numeric AS average_seconds,
-               COALESCE(AVG(delivery_rating), 0)::numeric AS average_rating
+               COALESCE(AVG(delivery_rating), 0)::numeric AS average_rating,
+               COALESCE(AVG(EXTRACT(EPOCH FROM (delivery_accepted_at-created_at)))
+                        FILTER (WHERE delivery_accepted_at IS NOT NULL),0)::numeric AS ready_to_accept_seconds,
+               COALESCE(AVG(EXTRACT(EPOCH FROM (picked_up_at-delivery_accepted_at)))
+                        FILTER (WHERE picked_up_at IS NOT NULL AND delivery_accepted_at IS NOT NULL),0)::numeric AS accept_to_pickup_seconds,
+               COALESCE(AVG(EXTRACT(EPOCH FROM (delivery_completed_at-picked_up_at)))
+                        FILTER (WHERE delivery_completed_at IS NOT NULL AND picked_up_at IS NOT NULL),0)::numeric AS transport_seconds
         FROM pedidos_app_orders
         WHERE delivery_user_id = $1 AND delivery_status = 'Entregado'
           AND delivery_completed_at >= NOW() - $2::interval
@@ -841,8 +885,13 @@ module.exports = function registerDeliveryApi(app, dependencies) {
       status: 'ok',
       range,
       summary: {
-        deliveries: Number(data.deliveries), income: Number(data.income), kilometers: Number(data.kilometers),
+        deliveries: Number(data.deliveries),
+        deliveryValue: Number(data.delivery_value), income: Number(data.delivery_value),
+        kilometers: Number(data.kilometers),
         averageSeconds: Number(data.average_seconds), averageRating: Number(data.average_rating),
+        readyToAcceptSeconds: Number(data.ready_to_accept_seconds),
+        acceptToPickupSeconds: Number(data.accept_to_pickup_seconds),
+        transportSeconds: Number(data.transport_seconds),
       },
       daily: daily.rows.map((row) => ({ label: row.label, deliveries: Number(row.deliveries), income: Number(row.income) })),
       hourly: hourly.rows.map((row) => ({ hour: Number(row.hour), deliveries: Number(row.deliveries) })),
@@ -880,10 +929,13 @@ module.exports = function registerDeliveryApi(app, dependencies) {
                profile.vehicle_name, profile.vehicle_type, profile.plate,
                profile.max_active_orders,
                profile.current_latitude, profile.current_longitude, profile.current_accuracy,
-               profile.last_location_at, profile.connected_at,
+               profile.last_location_at, profile.connected_at, profile.last_seen_at,
+               profile.shift_active, profile.shift_started_at, profile.tracking_mode,
+               profile.tracking_device_id, profile.gps_status,
                CASE
-                 WHEN profile.last_location_at IS NOT NULL AND profile.last_location_at >= NOW() - INTERVAL '2 minutes'
-                   THEN profile.availability_status
+                 WHEN profile.shift_active
+                   AND profile.last_seen_at >= NOW() - make_interval(secs => COALESCE(settings.presence_timeout_seconds,90))
+                   THEN CASE WHEN COALESCE(active_order.active_order_count,0)>0 THEN 'Ocupado' ELSE 'Libre' END
                  ELSE 'Desconectado'
                END AS live_status,
                CASE WHEN profile.rating_count > 0 THEN ROUND(profile.rating_sum / profile.rating_count, 2) ELSE 0 END AS rating,
@@ -906,16 +958,20 @@ module.exports = function registerDeliveryApi(app, dependencies) {
                    ) ORDER BY o.created_at ASC
                  ), '[]'::json)
                  FROM pedidos_app_orders o
-                 WHERE o.delivery_user_id = u.id AND o.delivery_status IN ('Aceptado', 'Recogido', 'En camino')
+                  WHERE o.delivery_user_id = u.id
+                    AND COALESCE(o.delivery_provider_type,'own')='own'
+                    AND o.delivery_status IN ('Pendiente','Aceptado','Recogido','En camino')
                ) AS active_orders
         FROM pedidos_app_users u
-        JOIN pedidos_app_roles role ON role.id = u.role_id AND role.name = 'Domiciliario'
+        JOIN pedidos_app_roles role ON role.id = u.role_id AND role.name IN ('Domiciliario', 'Repartidor')
         LEFT JOIN pedidos_app_delivery_profiles profile ON profile.user_id = u.id
+        LEFT JOIN pedidos_app_settings settings ON settings.id=1
         LEFT JOIN LATERAL (
           SELECT id, delivery_status, customer_name, address, delivery_latitude, delivery_longitude,
                  COUNT(*) OVER ()::int AS active_order_count
           FROM pedidos_app_orders
-          WHERE delivery_user_id = u.id AND delivery_status IN ('Aceptado', 'Recogido', 'En camino')
+          WHERE delivery_user_id = u.id AND COALESCE(delivery_provider_type,'own')='own'
+            AND delivery_status IN ('Pendiente','Aceptado','Recogido','En camino')
           ORDER BY created_at ASC LIMIT 1
         ) active_order ON TRUE
         WHERE u.status = 'Activo'
@@ -925,6 +981,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
         WHERE lower(order_data.delivery_type) = 'domicilio'
           AND order_data.status = 'Listo'
           AND order_data.delivery_status = 'Pendiente'
+          AND order_data.delivery_user_id IS NULL
         ORDER BY order_data.created_at ASC
       `),
       pool.query(`
@@ -934,13 +991,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
         WHERE id = 1
       `),
     ]);
-    const online = realtime.onlineUserIds();
-    const liveDrivers = drivers.rows.map((driver) => ({
-      ...driver,
-      live_status: online.has(Number(driver.id))
-        ? (driver.active_order_id ? 'Ocupado' : 'Libre')
-        : driver.live_status,
-    }));
+    const liveDrivers = drivers.rows;
     const restaurant = settings.rows[0] || {};
     res.json({
       status: 'ok',
@@ -957,37 +1008,80 @@ module.exports = function registerDeliveryApi(app, dependencies) {
 
   app.post('/api/pedidos/admin/delivery/orders/:id/assign', authenticateToken, requirePermission('Domicilios', 'asignar'), async (req, res) => {
     const orderId = Number(req.params.id);
-    const userId = req.body.userId == null || req.body.userId === '' ? null : Number(req.body.userId);
-    if (!Number.isInteger(orderId) || (userId !== null && !Number.isInteger(userId))) return res.status(400).json({ error: 'Asignación inválida' });
-    if (userId !== null) {
-      const driver = await pool.query(`
-        SELECT u.id FROM pedidos_app_users u
-        JOIN pedidos_app_roles role ON role.id = u.role_id
-        WHERE u.id = $1 AND u.status = 'Activo' AND role.name = 'Domiciliario'
-      `, [userId]);
-      if (!driver.rowCount) return res.status(400).json({ error: 'El usuario seleccionado no es un domiciliario activo' });
+    const userId = Number(req.body.userId);
+    if (!Number.isInteger(orderId) || !Number.isInteger(userId)) {
+      return res.status(400).json({ error: 'Selecciona un domiciliario activo para asignar el pedido' });
     }
-    const { rows: previousRows } = await pool.query('SELECT delivery_user_id FROM pedidos_app_orders WHERE id = $1', [orderId]);
-    const previousUserId = previousRows[0]?.delivery_user_id || null;
-    const { rows } = await pool.query(`
-      UPDATE pedidos_app_orders
-      SET delivery_user_id = $1, delivery_status = 'Pendiente',
-          delivery_accepted_at = NULL, updated_at = NOW()
-      WHERE id = $2 AND lower(delivery_type) = 'domicilio'
-        AND COALESCE(delivery_status, 'Pendiente') NOT IN ('En camino', 'Entregado', 'Cancelado')
-      RETURNING *
-    `, [userId, orderId]);
-    if (!rows.length) return res.status(409).json({ error: 'Este pedido no puede reasignarse en su estado actual' });
-    realtime.publish('order_available', { orderId, deliveryUserId: userId });
-    if (userId) {
+    try {
+      const result = await deliveryOrderService.reserveOrder({
+        orderId, driverId: userId, actor: req.user,
+        idempotencyKey: req.headers['idempotency-key'] || req.body.operationId,
+      });
       sendPush({ userId, title: 'Nuevo pedido asignado', body: `Tienes asignado el pedido #${orderId}`, url: `/pedidos/${orderId}` })
         .catch((error) => console.error('Error enviando push de asignación:', error));
+      res.json({ status: 'ok', order: formatOrder(result.order), replayed: result.replayed });
+    } catch (error) {
+      sendDomainError(res, error, 'No fue posible asignar el pedido');
     }
-    if (previousUserId && Number(previousUserId) !== Number(userId)) {
-      sendPush({ userId: previousUserId, title: 'Pedido reasignado', body: `El pedido #${orderId} ya no está asignado a tu usuario`, url: '/' })
-        .catch((error) => console.error('Error enviando push de reasignación:', error));
+  });
+
+  app.post('/api/pedidos/admin/delivery/drivers/:id/shift/end', authenticateToken, requirePermission('Domicilios', 'forzar_turno'), async (req, res) => {
+    try {
+      const result = await deliveryOrderService.endShift({
+        driverId: Number(req.params.id), actor: req.user, deviceId: 'admin-force',
+        idempotencyKey: req.headers['idempotency-key'] || req.body.operationId,
+        forced: true, reason: req.body.reason,
+      });
+      res.json(result);
+    } catch (error) {
+      sendDomainError(res, error, 'No fue posible forzar el fin del turno');
     }
-    res.json({ status: 'ok', order: formatOrder(rows[0]) });
+  });
+
+  app.post('/api/pedidos/admin/delivery/orders/:id/geofence-override', authenticateToken, requirePermission('Domicilios', 'override_geocerca'), async (req, res) => {
+    const reason = String(req.body.reason || '').trim();
+    if (reason.length < 10) return res.status(400).json({ code: 'GEOFENCE_OVERRIDE_REASON_REQUIRED', error: 'Explica el motivo de la excepción con al menos 10 caracteres.' });
+    try {
+      const { rows } = await pool.query(`
+        INSERT INTO pedidos_app_delivery_geofence_overrides
+          (order_id,authorized_by,driver_id,reason,exception_type,latitude,longitude,distance_meters)
+        SELECT order_data.id,$2,order_data.delivery_user_id,$3,$4,
+               profile.current_latitude,profile.current_longitude,
+               CASE WHEN order_data.delivery_latitude IS NOT NULL AND profile.current_latitude IS NOT NULL
+                 THEN ROUND(6371000 * 2 * ASIN(SQRT(
+                   POWER(SIN(RADIANS((order_data.delivery_latitude-profile.current_latitude)/2)),2)+
+                   COS(RADIANS(profile.current_latitude))*COS(RADIANS(order_data.delivery_latitude))*
+                   POWER(SIN(RADIANS((order_data.delivery_longitude-profile.current_longitude)/2)),2)
+                 )))::integer ELSE NULL END
+        FROM pedidos_app_orders order_data
+        LEFT JOIN pedidos_app_delivery_profiles profile ON profile.user_id=order_data.delivery_user_id
+        WHERE order_data.id=$1 AND order_data.delivery_status='En camino'
+        RETURNING *
+      `, [Number(req.params.id), req.user.id, reason, req.body.exceptionType || 'manual_admin']);
+      if (!rows.length) return res.status(409).json({ code: 'INVALID_ORDER_STATE', error: 'La excepción solo puede autorizarse para una entrega en camino.' });
+      await pool.query(`
+        INSERT INTO pedidos_app_audit_logs
+          (user_id,username_attempted,module,action,details,request_data)
+        VALUES ($1,$2,'Domicilios','Override geocerca',$3,$4::jsonb)
+      `, [req.user.id, req.user.username || null, `Excepción de geocerca para pedido #${req.params.id}`, JSON.stringify({
+        overrideId: rows[0].id, orderId: Number(req.params.id), reason,
+        distanceMeters: rows[0].distance_meters,
+      })]);
+      res.status(201).json({ status: 'ok', override: rows[0] });
+    } catch (error) {
+      sendDomainError(res, error, 'No fue posible autorizar la excepción de geocerca');
+    }
+  });
+
+  app.get('/api/pedidos/admin/delivery/orders/:id/evidence', authenticateToken, requirePermission('Domicilios', 'ver'), async (req, res) => {
+    const { rows } = await pool.query(`
+      SELECT mime_type, contents, sha256 FROM pedidos_app_delivery_evidence_files WHERE order_id=$1
+    `, [Number(req.params.id)]);
+    if (!rows.length) return res.status(404).json({ error: 'Este pedido no tiene evidencia fotográfica.' });
+    res.set('Content-Type', rows[0].mime_type);
+    res.set('ETag', `"${rows[0].sha256}"`);
+    res.set('Cache-Control', 'private, max-age=300');
+    res.send(rows[0].contents);
   });
 
   return {

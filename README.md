@@ -14,6 +14,8 @@ deben conservarse al implementar cambios.
 - Helmet, CORS, compresión y límites de solicitudes.
 - Web Push mediante VAPID.
 - SMTP mediante Nodemailer para recuperación de contraseña.
+- WhatsApp Business Platform / Cloud API oficial de Meta.
+- Outbox transaccional, PostgreSQL `LISTEN/NOTIFY` y SSE recuperable.
 - Tests nativos de Node.js.
 
 ## Preparación local
@@ -45,6 +47,15 @@ despliegue puede inyectar otro puerto.
 | `PORT` | Puerto HTTP |
 | `CORS_ORIGINS` | Orígenes adicionales separados por coma para pruebas por IP |
 | `OPEN_FOOD_FACTS_USER_AGENT` | Identificación de la consulta opcional de códigos de barras |
+| `WHATSAPP_VERIFY_TOKEN` | Token privado elegido para verificar el webhook (`WHATSAPP_WEBHOOK_VERIFY_TOKEN` queda como alias temporal) |
+| `WHATSAPP_ACCESS_TOKEN` | Token privado del usuario del sistema de Meta |
+| `WHATSAPP_PHONE_NUMBER_ID` | Identificador del número emisor |
+| `WHATSAPP_BUSINESS_ACCOUNT_ID` | Identificador de la cuenta WhatsApp Business |
+| `WHATSAPP_APP_SECRET` | Secreto usado para validar la firma del webhook |
+| `WHATSAPP_GRAPH_API_VERSION` | Versión habilitada de Graph API, con formato `vNN.N` |
+| `WHATSAPP_WEBHOOK_LOG_PAYLOAD` | Registro temporal del payload válido; usar `false` después de verificar la integración |
+| `CRM_WEBHOOK_RETENTION_DAYS` | Retención de cuerpos de webhook procesados |
+| `CRM_JOB_RETENTION_DAYS` | Retención de trabajos de envío terminados |
 
 `src/db.js` carga `.env` y crea el pool usado por servidor, migraciones, pruebas y
 scripts de diagnóstico. No se deben instanciar pools adicionales ni copiar cadenas
@@ -59,6 +70,8 @@ de conexión a otros archivos.
 | `npm test` | Ejecuta contratos y flujos transaccionales |
 | `npm run migrate` | Aplica migraciones SQL pendientes |
 | `npm run db:analyze` | Ejecuta `VACUUM ANALYZE` sobre tablas críticas |
+| `npm run db:prune` | Aplica retención a GPS, eventos y datos operativos CRM |
+| `npm run db:prune-delivery` | Alias compatible del comando anterior |
 
 Scripts de lectura disponibles en `scripts/`:
 
@@ -73,8 +86,19 @@ Scripts de lectura disponibles en `scripts/`:
 distrito-api/
 ├── server.js                 # Entrada HTTP y reglas de negocio actuales
 ├── horarios_api.js           # Estado y administración de horarios
+├── delivery_api.js           # Domiciliarios propios, GPS, capacidad y tiempo real
+├── external_delivery_api.js  # Empresas aliadas y flujo externo manual
+├── crm_api.js                # CRM, Inbox, segmentos, campañas y reportes
 ├── src/db.js                 # Única fábrica de conexiones PostgreSQL
 ├── src/dashboard.js          # Agregación optimizada del resumen operativo
+├── src/delivery-domain.js    # Máquina de estados logística
+├── src/delivery-geo.js       # Distancia y geocerca autoritativa
+├── src/delivery-order-service.js # Operaciones transaccionales e idempotentes
+├── src/delivery-location-service.js # Ingestión GPS normalizada
+├── src/outbox.js             # Publicación multiinstancia de eventos
+├── src/crm-service.js        # Webhooks, cola, estados, automatizaciones y atribución
+├── src/whatsapp-cloud.js     # Cliente oficial Graph API y firma HMAC
+├── src/crm/                  # Teléfono, clasificación y segmentos seguros
 ├── migrations/               # Fuente de verdad del esquema
 ├── scripts/migrate.js        # Ejecutor transaccional de migraciones
 ├── scripts/analyze-db.js     # Mantenimiento de estadísticas
@@ -99,7 +123,7 @@ si el origen es `http://localhost:3001`, el cliente construye
 
 | Método y ruta | Función |
 | --- | --- |
-| `GET /health` | Estado de PostgreSQL y cantidad de migraciones aplicadas |
+| `GET /health` | PostgreSQL, migraciones, outbox, SSE, GPS y turnos activos |
 | `GET /init` | Catálogo activo, categorías, configuración y anuncio |
 | `GET /horarios/status` | Determina si se pueden recibir pedidos |
 | `POST /checkout` | Valida productos y crea un pedido con total calculado |
@@ -121,19 +145,23 @@ Todas requieren autenticación, salvo login y recuperación de contraseña.
 | --- | --- |
 | Autenticación | Login, refresh, logout, verificación y restablecimiento de contraseña |
 | Dashboard | `GET /admin/dashboard`: métricas del día, catálogo, inventario, últimos pedidos y productos solicitados |
-| Pedidos | Listado, cambio de estado, edición validada y eliminación |
-| Clientes | Búsqueda por nombre o teléfono sobre el histórico de pedidos |
+| Pedidos | Listado, cambio de estado validado y edición transaccional |
+| Clientes | Fichas históricas enlazadas al contacto CRM canónico |
+| CRM | Dashboard, contactos, Inbox, segmentos, campañas, automatizaciones, reportes y configuración WhatsApp |
 | Catálogo | CRUD de categorías y productos |
-| Configuración | Lectura y actualización mediante una lista permitida de campos |
+| Configuración | Identidad, domicilio, cocina, temas y preferencias de voz/idioma mediante una lista permitida de campos |
 | Horarios | Semana regular, configuración y excepciones por fecha |
 | Inventario | Stock, umbral, costo, código de barras y movimientos por producto |
 | Contabilidad | Gastos, reportes por rango con comparativo, vista previa de cierre, cierre y reapertura |
 | Comunicación | Campaña programada, frecuencia, CTA, imagen y envío de notificaciones Push |
+| Domicilios | Capacidad propia, mapa operativo, empresas externas, costos separados y trazabilidad |
 | Seguridad | Perfil, sesiones, auditoría, usuarios, roles y permisos |
 
 El CRUD de usuarios, roles y permisos aplica comprobaciones `módulo:acción` en el
-servidor. La interfaz también oculta opciones sin permiso, pero la API es la capa
-que autoriza definitivamente.
+servidor. Una frontera adicional consulta el rol real y bloquea cuentas de reparto
+en el prefijo administrativo; solo se permite leer Configuración para aplicar el
+tema de Delivery. La autorización fina del resto de rutas se detalla como trabajo
+pendiente en `../distrito-docs/AUDITORIA_FUNCIONAL_2026-08-09.md`.
 
 El dashboard usa una consulta agregada con CTE para evitar que el navegador tenga
 que descargar pedidos, productos e inventario completos. El estado del horario se
@@ -171,8 +199,21 @@ vigentes y produce el total. El carrito persistido conserva solamente:
 - `category`
 - `quantity`
 
+Para `domicilio`, la misma transacción lee `settings.delivery_cost`, lo guarda en
+`delivery_fee` y suma el valor al total. La tienda y Tomar pedido muestran una
+estimación, pero reemplazan sus cifras por `subtotal`, `delivery_fee` y `total`
+devueltos por la API.
+
 La edición completa usa `/admin/orders/:id/edit`. La ruta
-`/admin/orders/:id` está reservada para cambios de estado válidos.
+`/admin/orders/:id` está reservada para cambios de estado válidos. La máquina de
+estados vive en `src/order-rules.js`, admite operaciones idempotentes y rechaza
+saltos o reaperturas de estados terminales con
+`409 INVALID_ORDER_TRANSITION`.
+
+Los estados de operador externo solo se modifican mediante
+`external_delivery_api.js`; la ruta genérica de estado los rechaza para impedir
+pedidos sin empresa, costo o auditoría. El contrato completo está documentado en
+`../distrito-docs/ENTREGAS_EXTERNAS.md`.
 
 La creación y edición completa comparten `normalizeDeliveryLocation`: para un
 domicilio guardan juntas latitud/longitud, Place ID, referencia, indicador de
@@ -206,7 +247,7 @@ endpoints `/media/*` decodifican y entregan el contenido binario con caché HTTP
 El checkout tampoco copia imágenes al carrito. La migración
 `002_compact_order_cart.sql` compactó los pedidos históricos. Resultado medido:
 
-- 214 pedidos.
+- 234 pedidos durante la auditoría del 9 de agosto de 2026.
 - Carrito promedio cercano a 160 bytes.
 - Tabla de pedidos cercana a 1.6 MB.
 - Tablas `pedidos_app_*` cercanas a 25 MB.
@@ -239,10 +280,34 @@ Migraciones actuales:
     dirección/Place ID de la cocina como punto de salida.
 11. `011_delivery_completion_geofence.sql`: radio central de 50 a 500 metros para
     validar por GPS cuándo el domiciliario puede finalizar una entrega.
+12. `012_notification_preferences.sql`: idioma y estilo de voz centralizados para
+    los avisos de pedidos del ERP y Delivery.
+13. `013_branding_campaigns_customers_closures.sql`: identidad visual por
+    superficie, campañas completas, CRM de clientes y cierres contables
+    conciliados.
+14. `014_external_delivery_companies.sql`: catálogo, costos y trazabilidad de
+    empresas externas de reparto.
+15. `015_delivery_professional_core.sql`: versión de pedido, turnos, presencia,
+    dispositivo GPS oficial, modos de rastreo, lotes normalizados, idempotencia,
+    geocerca excepcional, evidencia separada y outbox transaccional.
+16. `016_delivery_runtime_settings.sql`: capacidad predeterminada e intervalos
+    centrales de reconexión SSE.
+17. `017_delivery_native_bootstrap.sql`: intercambio de un solo uso para que el
+    servicio Android obtenga un token GPS limitado sin exponerlo a JavaScript.
+18. `018_crm_foundation.sql`: contacto canónico E.164, consentimiento,
+    conversaciones, mensajes, timeline y backfill no destructivo.
+19. `019_crm_commercial.sql`: segmentos, plantillas, campañas, cola,
+    automatizaciones, estados del proveedor y atribución.
+20. `020_crm_normalization_and_integrity.sql`: paridad entre normalización SQL y
+    Node.js para marcación internacional.
+21. `021_crm_search_indexes.sql`: índices GIN/trigram para búsquedas parciales del
+    directorio CRM.
+22. `022_crm_acquisition_source.sql`: recupera la fuente de adquisición desde el
+    primer pedido y la conserva al sincronizar órdenes nuevas.
 
 Para cambiar el esquema:
 
-1. Crea la siguiente migración correlativa, por ejemplo `012_descripcion.sql`.
+1. Crea la siguiente migración correlativa, por ejemplo `023_descripcion.sql`.
 2. Escribe una migración reejecutable cuando sea posible.
 3. Ejecuta `npm run migrate` contra la base configurada.
 4. Ejecuta `npm test` y `npm run check`.
@@ -265,8 +330,23 @@ Las migraciones se ejecutan bajo bloqueo asesor y transacción. El registro est�
 - La configuración solo permite campos declarados en `SETTINGS_FIELDS`.
 - Checkout y autenticación cuentan con rate limiting.
 - Las coordenadas se validan por rango y PostgreSQL exige latitud/longitud juntas.
-- El cálculo del domicilio usa un parámetro booleano independiente del texto de
-  `delivery_type`, evitando inferencias incompatibles en consultas preparadas.
+- Las cuentas Domiciliario/Repartidor reciben `403` al intentar consumir módulos
+  del ERP, aunque su JWT sea válido.
+- Solo un dispositivo por turno es el emisor GPS oficial. El token nativo tiene
+  alcance exclusivo de ubicación, duración limitada y se obtiene con un código de
+  un solo uso de 90 segundos.
+- Las operaciones críticas exigen identidad de dispositivo e idempotencia; el
+  servidor usa bloqueos de fila y control de versión para resolver carreras.
+- La geocerca, la vigencia y la precisión del GPS se validan nuevamente en la API.
+  Una excepción requiere permiso específico, motivo y registro auditable.
+- Las evidencias se validan por formato, firma y tamaño, y no forman parte del JSON
+  de la orden.
+- Los logs estructurados contienen `request_id` y contexto operativo, pero nunca
+  tokens ni cuerpos de solicitudes.
+- Las transiciones comerciales se validan contra `src/order-rules.js`; Entregado,
+  Completado y Cancelado son terminales.
+- El cálculo del domicilio usa un valor numérico leído de Configuración antes del
+  `INSERT`, evitando expresiones SQL ambiguas y errores de inferencia de parámetros.
 
 ## Pruebas
 
@@ -279,6 +359,18 @@ Las migraciones se ejecutan bajo bloqueo asesor y transacción. El registro est�
 - Pool PostgreSQL único.
 - Prefijo de API único en ambos frontends.
 - Ausencia de módulos administrativos en la tienda pública.
+- Presentación centralizada de estados y ruta funcional de Estadísticas Delivery.
+- Reglas permitidas y prohibidas de transición de pedidos.
+- Frontera de acceso administrativo para roles de reparto.
+- Carreras entre dos conductores por el mismo pedido.
+- Carreras por capacidad y entre reserva administrativa/aceptación.
+- Repetición idempotente de aceptar, iniciar y completar.
+- Matriz de geocerca, antigüedad y precisión GPS.
+- Duplicados en lotes de ubicación.
+- Normalización E.164, clasificación CRM y segmentos parametrizados.
+- Consentimiento, frequency cap, atribución y rollback de flujos CRM.
+- Webhook firmado, rechazo de firmas inválidas e idempotencia HTTP.
+- Estados de Meta fuera de orden y permisos separados para leer, enviar y exportar.
 
 Las pruebas de flujo abren transacciones y hacen `ROLLBACK`; no deben dejar datos de
 prueba persistidos.
@@ -297,21 +389,24 @@ prueba persistidos.
 
 `delivery_api.js` registra la API especializada sin duplicar autenticación ni acceso
 a datos. Reutiliza `authenticateToken`, `requirePermission`, el pool central y las
-claves VAPID configuradas en `server.js`.
+claves VAPID configuradas en `server.js`. Las mutaciones se delegan a
+`DeliveryOrderService`; la ruta HTTP no implementa otra máquina de estados.
 
-- `GET /delivery/orders/available` devuelve domicilios en estado comercial `Listo`
-  y reparto `Pendiente`.
-- `POST /delivery/orders/:id/accept` usa un `UPDATE` condicional dentro de una
-  transacción; dos repartidores nunca pueden aceptar el mismo pedido y el ganador
-  avanza inmediatamente el ERP a `En camino`. La fila del perfil se bloquea para
-  validar atómicamente su `max_active_orders` antes de aceptar.
-- `POST /delivery/orders/:id/pickup` se conserva para compatibilidad con pedidos
-  que estuvieran en estados del flujo anterior.
-- `POST /delivery/orders/:id/location` solo acepta coordenadas del responsable y
-  durante `En camino`.
+- `POST /delivery/shift/start|heartbeat|transfer-device|end` administra turno,
+  presencia y propiedad del GPS independientemente de la sesión web.
+- `GET /delivery/orders/available` devuelve una proyección mínima de domicilios en
+  `Listo/Pendiente`; teléfono, pago, referencia, notas e ítems quedan fuera hasta
+  que el usuario sea responsable.
+- `POST /delivery/orders/:id/accept` bloquea perfil y orden, cuenta compromisos y
+  avanza a `Aceptado`. Dos repartidores nunca aceptan el mismo pedido ni superan el
+  cupo por solicitudes concurrentes.
+- `POST /delivery/orders/:id/pickup` inicia el recorrido y sincroniza estado
+  comercial/logístico a `En camino`.
+- `POST /delivery/location/batch` y su variante nativa reciben posiciones por
+  conductor/dispositivo, deduplican y determinan el modo `FREE` o `DELIVERY`.
 - `POST /delivery/orders/:id/complete` exige recepción confirmada y sincroniza el
-  ERP a `Entregado`.
-- `GET /realtime/stream` mantiene un canal SSE autenticado para delivery y admin.
+  ERP a `Entregado` después de validar la geocerca en servidor.
+- `GET /realtime/stream` mantiene SSE autenticado con ID, replay y resincronización.
 - `GET /track/:id` y su stream autorizan por pedido/teléfono o por un JWT exclusivo
   de seguimiento. El token dura como máximo 48 horas, no concede acceso al ERP y
   finaliza 15 minutos después de entregar o cancelar. La ubicación se oculta fuera
@@ -326,13 +421,55 @@ claves VAPID configuradas en `server.js`.
 - `/admin/delivery/overview` y `/admin/delivery/orders/:id/assign` alimentan el
   Mapa de Domicilios y requieren permisos del módulo `Domicilios`. El overview
   entrega una sola coordenada de sede desde Configuración y la ubicación vigente
-  de cada perfil; los movimientos posteriores llegan por SSE.
+  de cada perfil; la conexión se calcula por turno y heartbeat, no solo por GPS.
+  La asignación reserva capacidad y vuelve a validar todo con bloqueos de fila.
+- Admin dispone de fin de turno forzado, excepción de geocerca de un solo uso y
+  lectura protegida de evidencia mediante permisos diferenciados.
 
-El hub SSE actual vive en el proceso Node. Si la API escala horizontalmente, conecta
-los eventos a PostgreSQL `LISTEN/NOTIFY` o Redis para propagarlos entre instancias.
+Cada checkout confirmado publica `order_created` por SSE. El ERP usa ese evento
+para el aviso global “Nuevo Pedido”; Delivery recibe `order_available` cuando la
+cocina marca la orden como `Listo`.
 
-Programa `npm run db:prune-delivery` diariamente o semanalmente para borrar muestras
-GPS de pedidos finalizados con más de 90 días. Se puede aumentar el plazo con
-`DELIVERY_LOCATION_RETENTION_DAYS`; el script impide configurarlo por debajo de 30
-días, borra lotes de 5.000 filas y actualiza estadísticas sin bloquear una tabla
-completa durante un único `DELETE`.
+Cada mutación crítica inserta un evento de dominio dentro de su propia transacción.
+El dispatcher usa `FOR UPDATE SKIP LOCKED`, un cursor incremental por instancia y
+PostgreSQL `LISTEN/NOTIFY` como acelerador. Esto también funciona con poolers que no
+propagan notificaciones: cada instancia lee los eventos nuevos del log compartido.
+El cliente usa `Last-Event-ID` y REST para recuperar estado al reconectar.
+
+Programa `npm run db:prune` diariamente o semanalmente. El script aplica la
+retención configurada a puntos normalizados y heredados, claves de idempotencia,
+eventos publicados, cuerpos de webhook y trabajos CRM finalizados; después
+actualiza estadísticas. La cola offline del cliente es independiente y está
+acotada por Configuración.
+
+La arquitectura y activación operativa del canal oficial están documentadas en
+[`../distrito-docs/CRM_WHATSAPP_2026-08-09.md`](../distrito-docs/CRM_WHATSAPP_2026-08-09.md).
+
+## Personalización, campañas, clientes y cierres
+
+La migración `013_branding_campaigns_customers_closures.sql` agrega:
+
+- identidad visual y contenido por superficie (`web_*`, `admin_*`, `delivery_*`),
+  con rutas de medios que entregan cada logo y usan el logo general como respaldo;
+- campañas múltiples con prioridad, audiencia, formato, cupón, vistas y clics;
+- perfil CRM de clientes sincronizado al insertar o actualizar pedidos;
+- conciliación de efectivo, conteos, notas y auditoría de reapertura en cierres.
+
+Rutas principales:
+
+| Ruta | Función |
+| --- | --- |
+| `GET/POST /admin/announcements` | Lista y crea campañas |
+| `PUT/DELETE /admin/announcements/:id` | Edita o elimina una campaña |
+| `POST /announcements/:id/view|click` | Registra resultados sin datos personales |
+| `GET/POST /admin/customers` | Directorio paginado y alta manual |
+| `GET/PUT /admin/customers/:id` | Perfil, métricas e historial / edición |
+| `POST /admin/customers/:id/contact` | Registra la última gestión de contacto |
+| `GET /admin/closures/preview` | Recalcula el período en servidor |
+| `POST /admin/closures` | Crea un cierre transaccional sin solapamientos |
+| `PUT /admin/closures/:id/reopen` | Reabre exigiendo motivo |
+
+Los campos históricos `total_orders` y `total_spent` de clientes no se usan para
+reportar: los indicadores se agregan desde `pedidos_app_orders`, que sigue siendo
+la fuente única de ventas. El cliente enviado por el navegador nunca puede fijar
+los totales de un cierre; la API vuelve a calcularlos dentro de la transacción.

@@ -8,15 +8,23 @@ const jwt = require('jsonwebtoken');
 const webpush = require('web-push');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const crypto = require('crypto');
 const { createPool, getDatabaseUrl } = require('./src/db');
 const { getDashboardSnapshot } = require('./src/dashboard');
 const { authorizeTrackingAccess, issueTrackingToken, isFinalOrder } = require('./src/tracking');
 const {
   CARRYING_DELIVERY_STATUSES,
+  COMMITTED_DELIVERY_STATUSES,
   DEFAULT_MAX_ACTIVE_ORDERS,
   DELIVERY_ROLES,
   normalizeMaxActiveOrders,
 } = require('./src/delivery-rules');
+const { ORDER_STATUSES, canTransitionOrder } = require('./src/order-rules');
+const { createDeliveryOrderService } = require('./src/delivery-order-service');
+const { createOutboxDispatcher } = require('./src/outbox');
+const { createWhatsAppClient } = require('./src/whatsapp-cloud');
+const { createCrmWorker } = require('./src/crm-service');
+const { normalizePhoneE164 } = require('./src/crm/phone');
 
 const publicVapidKey = process.env.VAPID_PUBLIC_KEY;
 const privateVapidKey = process.env.VAPID_PRIVATE_KEY;
@@ -35,6 +43,30 @@ if (!JWT_SECRET) {
 
 const app = express();
 app.set('trust proxy', 1);
+app.use((req, res, next) => {
+  const supplied = String(req.headers['x-request-id'] || '').trim();
+  req.requestId = /^[a-z0-9._-]{1,100}$/i.test(supplied) ? supplied : crypto.randomUUID();
+  res.setHeader('X-Request-Id', req.requestId);
+  const startedAt = Date.now();
+  res.on('finish', () => {
+    const requestPath = String(req.originalUrl || req.url).split('?')[0];
+    if (!/^\/api\/pedidos\/(delivery|admin\/delivery|auth\/me|track\/|webhooks\/whatsapp|admin\/crm\/)/.test(requestPath)) return;
+    const component = requestPath.includes('/crm/') || requestPath.includes('/webhooks/whatsapp')
+      ? 'crm-http'
+      : 'delivery-http';
+    console.log(JSON.stringify({
+      level: res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info',
+      component, request_id: req.requestId,
+      method: req.method, path: requestPath,
+      status: res.statusCode, duration_ms: Date.now() - startedAt,
+      user_id: req.user?.id || null, driver_id: req.deliveryUser?.id || null,
+      order_id: /^\d+$/.test(String(req.params?.id || '')) ? Number(req.params.id) : null,
+      crm_entity_id: component === 'crm-http' && /^\d+$/.test(String(req.params?.id || '')) ? Number(req.params.id) : null,
+      device_id: String(req.headers['x-device-id'] || '').slice(0, 100) || null,
+    }));
+  });
+  next();
+});
 
 // Restringir CORS a dominios conocidos
 const configuredOrigins = (process.env.CORS_ORIGINS || '')
@@ -66,7 +98,14 @@ app.use(cors({
 }));
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(compression());
-app.use(express.json({ limit: '25mb' }));
+app.use(express.json({
+  limit: '25mb',
+  verify: (req, res, buffer) => {
+    if (String(req.originalUrl || req.url).startsWith('/api/pedidos/webhooks/whatsapp')) {
+      req.rawBody = Buffer.from(buffer);
+    }
+  },
+}));
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -99,10 +138,14 @@ const DEFAULT_IDLE_MINUTES = 60;
 const MIN_PASSWORD_LENGTH = 10;
 
 let getHorariosStatus = async () => ({ isOpen: false, statusText: 'No disponible' });
+let outboxReady = false;
+let crmWorkerReady = false;
 app.use(express.urlencoded({ limit: '25mb', extended: true }));
 
 const dbUrl = getDatabaseUrl();
 const pool = createPool();
+const whatsappClient = createWhatsAppClient();
+const crmWorker = createCrmWorker({ pool, whatsappClient });
 pool.connect()
   .then(client => {
     console.log('✅ Conectado a Neon correctamente');
@@ -116,25 +159,32 @@ app.get('/api/pedidos/health', async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT current_database() AS database,
-             (SELECT COUNT(*)::int FROM pedidos_app_schema_migrations) AS migrations
+             (SELECT COUNT(*)::int FROM pedidos_app_schema_migrations) AS migrations,
+             (SELECT COUNT(*)::int FROM pedidos_app_domain_events WHERE published_at IS NULL) AS outbox_pending,
+             (SELECT MIN(occurred_at) FROM pedidos_app_domain_events WHERE published_at IS NULL) AS outbox_oldest,
+             (SELECT COUNT(*)::int FROM pedidos_app_driver_location_points WHERE received_at >= NOW()-INTERVAL '5 minutes') AS gps_points_5m,
+             (SELECT COUNT(*)::int FROM pedidos_app_delivery_profiles WHERE shift_active) AS active_shifts,
+             (SELECT COUNT(*)::int FROM pedidos_app_crm_message_jobs WHERE status IN ('PENDING','RETRY','PROCESSING')) AS crm_queue_depth,
+             (SELECT MAX(received_at) FROM pedidos_app_crm_webhook_events WHERE provider='WHATSAPP') AS whatsapp_last_webhook
     `);
-    res.json({ status: 'ok', database: rows[0].database, migrations: rows[0].migrations });
+    res.json({
+      status: 'ok', database: rows[0].database, migrations: rows[0].migrations,
+      components: {
+        postgres: 'ok', outbox: outboxReady ? 'ok' : 'starting',
+        sse: { clients: deliveryRealtime.stats?.().clients || 0 },
+         push: publicVapidKey && privateVapidKey ? 'configured' : 'unavailable',
+         gps: { pointsLast5Minutes: rows[0].gps_points_5m, activeShifts: rows[0].active_shifts },
+         crm: { queue: crmWorkerReady ? 'ok' : 'starting', queueDepth: rows[0].crm_queue_depth },
+         whatsapp: { configured: whatsappClient.isConfigured(), lastWebhookAt: rows[0].whatsapp_last_webhook },
+      },
+      outbox: { pending: rows[0].outbox_pending, oldest: rows[0].outbox_oldest },
+    });
   } catch (error) {
     res.status(503).json({ status: 'error', error: 'Base de datos no disponible' });
   }
 });
 
 const FINAL_ORDER_STATUSES = new Set(['Entregado', 'Completado']);
-const ORDER_STATUSES = new Set([
-  'Nuevo',
-  'En preparación',
-  'Listo',
-  'En camino',
-  'Entregado',
-  'Pendiente Pago',
-  'Cancelado',
-  'Completado',
-]);
 let deliveryRealtime = { publish: () => {}, sendPush: async () => {} };
 
 function normalizeDeliveryLocation(customer = {}) {
@@ -262,10 +312,14 @@ function announcementForResponse(req, announcement) {
 function settingsForResponse(req, settings) {
   if (!settings) return settings;
   const data = { ...settings };
+  const version = data.updated_at ? new Date(data.updated_at).getTime() : '';
   if (data.logo) {
-    const version = data.updated_at ? new Date(data.updated_at).getTime() : '';
     data.logo = `${absoluteApiUrl(req, '/media/settings-logo')}${version ? `?v=${version}` : ''}`;
   }
+  ['web', 'admin', 'delivery'].forEach((surface) => {
+    const key = `${surface}_logo`;
+    if (data[key]) data[key] = `${absoluteApiUrl(req, `/media/settings-logo/${surface}`)}${version ? `?v=${version}` : ''}`;
+  });
   return data;
 }
 
@@ -379,6 +433,8 @@ async function releaseProductStock(client, order, createdBy = 'Sistema') {
   }
 }
 
+const deliveryOrderService = createDeliveryOrderService({ pool, releaseProductStock });
+
 app.get('/api/pedidos/media/products/:id', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT image FROM pedidos_app_products WHERE id::text = $1', [req.params.id]);
@@ -400,6 +456,18 @@ app.get('/api/pedidos/media/announcements/:id', async (req, res) => {
 app.get('/api/pedidos/media/settings-logo', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT logo FROM pedidos_app_settings WHERE id = 1');
+    return sendStoredMedia(res, rows[0]?.logo);
+  } catch (error) {
+    return res.status(500).json({ error: 'No fue posible cargar el logo' });
+  }
+});
+
+app.get('/api/pedidos/media/settings-logo/:surface', async (req, res) => {
+  const fields = { web: 'web_logo', admin: 'admin_logo', delivery: 'delivery_logo' };
+  const field = fields[req.params.surface];
+  if (!field) return res.status(404).end();
+  try {
+    const { rows } = await pool.query(`SELECT COALESCE(${field}, logo) AS logo FROM pedidos_app_settings WHERE id = 1`);
     return sendStoredMedia(res, rows[0]?.logo);
   } catch (error) {
     return res.status(500).json({ error: 'No fue posible cargar el logo' });
@@ -442,12 +510,14 @@ app.get('/api/pedidos/init', async (req, res) => {
     try {
       const { rows: announcements } = await pool.query(`
         SELECT id, title, body, cta_label, cta_url, starts_at, ends_at,
-               display_frequency, is_active, updated_at, image_url IS NOT NULL AS has_image
+               display_frequency, campaign_type, audience, priority, coupon_code,
+               views_count, clicks_count, is_active, updated_at, image_url IS NOT NULL AS has_image
         FROM pedidos_app_announcements
         WHERE is_active = TRUE
           AND (starts_at IS NULL OR starts_at <= NOW())
           AND (ends_at IS NULL OR ends_at >= NOW())
-        ORDER BY updated_at DESC, id DESC LIMIT 1
+          AND audience = 'all'
+        ORDER BY priority DESC, updated_at DESC, id DESC LIMIT 1
       `);
       if (announcements.length > 0) announcementRow = announcements[0];
     } catch (err) {
@@ -490,6 +560,20 @@ const isDateClosed = async (isoDate) => {
   } catch (e) { return false; }
 };
 
+function parseColombiaTimestamp(value) {
+  if (!value) return null;
+  let normalized = String(value).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) normalized += 'T12:00:00-05:00';
+  else if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?$/.test(normalized)) normalized += '-05:00';
+  const parsed = new Date(normalized);
+  if (Number.isNaN(parsed.getTime())) {
+    const error = new Error('La fecha y hora del pedido no son válidas.');
+    error.statusCode = 400;
+    throw error;
+  }
+  return parsed.toISOString();
+}
+
 app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
   let client;
   try {
@@ -509,13 +593,19 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
     client = await pool.connect();
     await client.query('BEGIN');
     const normalized = await normalizeOrderCart(client, cart);
+    const isDelivery = String(customer.deliveryType || '').toLowerCase() === 'domicilio';
+    const settingsResult = await client.query('SELECT COALESCE(delivery_cost, 0)::integer AS delivery_cost FROM pedidos_app_settings WHERE id = 1');
+    const deliveryFee = isDelivery ? Math.max(0, Number(settingsResult.rows[0]?.delivery_cost || 0)) : 0;
+    const orderTotal = normalized.total + deliveryFee;
+    const cashAmount = Number(customer.cashAmount);
+    if (String(customer.paymentMethod || '').toLowerCase() === 'efectivo'
+        && Number.isFinite(cashAmount) && cashAmount > 0 && cashAmount < orderTotal) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: `El efectivo indicado no cubre el total de $${orderTotal.toLocaleString('es-CO')}.` });
+    }
 
     let customDateStr = req.body.created_at || (customer && customer.created_at);
-    let customDate = null;
-    if (customDateStr) {
-      if (customDateStr.length === 10) customDateStr += 'T12:00:00-05:00';
-      customDate = new Date(customDateStr).toISOString();
-    }
+    const customDate = parseColombiaTimestamp(customDateStr);
 
     if (customDate && await isDateClosed(customDate)) {
       await client.query('ROLLBACK');
@@ -539,23 +629,21 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
           const token = authHeader.split(' ')[1];
           const jwt = require('jsonwebtoken');
           const user = jwt.verify(token, process.env.JWT_SECRET);
-          if (user && user.role) finalStatus = req.body.status;
+          if (user && user.role && !DELIVERY_ROLES.has(user.role) && ORDER_STATUSES.has(req.body.status)) {
+            finalStatus = req.body.status;
+          }
         } catch (e) {}
       }
     }
 
     const deliveryLocation = normalizeDeliveryLocation(customer);
-    const isDelivery = String(customer.deliveryType || '').toLowerCase() === 'domicilio';
     const { rows } = await client.query(
       `INSERT INTO pedidos_app_orders 
        (customer_name, customer_phone, address, barrio, delivery_type, payment_method, total, cart_json, source, notes, voucher_reference, created_at,
         delivery_fee, delivery_reference, change_required, delivery_latitude, delivery_longitude,
         delivery_place_id, delivery_location_adjusted, delivery_apartment, delivery_tower, delivery_floor, status)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12, NOW()),
-         CASE WHEN $15::boolean
-           THEN COALESCE((SELECT delivery_cost FROM pedidos_app_settings WHERE id = 1), 0)
-           ELSE 0
-         END, $13, $14, $16, $17, $18, $19, $20, $21, $22, $23)
+         $15, $13, $14, $16, $17, $18, $19, $20, $21, $22, $23)
        RETURNING id`,
       [
         customer.name,
@@ -564,17 +652,17 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
         customer.barrio || '',
         customer.deliveryType,
         customer.paymentMethod,
-        normalized.total,
+        orderTotal,
         JSON.stringify(normalized.cart),
         req.body.source || customer.source || 'Web',
         customer.notes || customer.comment || '',
         customer.voucher_reference || '',
         customDate,
         customer.reference || customer.deliveryReference || '',
-        customer.paymentMethod === 'efectivo' && Number(customer.cashAmount) > normalized.total
-          ? Math.round(Number(customer.cashAmount) - normalized.total)
+        customer.paymentMethod === 'efectivo' && Number(customer.cashAmount) >= orderTotal
+          ? Math.round(Number(customer.cashAmount) - orderTotal)
           : null,
-        isDelivery,
+        deliveryFee,
         isDelivery ? deliveryLocation.latitude : null,
         isDelivery ? deliveryLocation.longitude : null,
         isDelivery ? String(customer.placeId || customer.googlePlaceId || '').trim().slice(0, 255) || null : null,
@@ -587,12 +675,24 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
     );
 
     await reserveProductStock(client, normalized, rows[0].id, req.body.source || 'Web');
+    await deliveryOrderService.appendDomainEvent(client, 'order_created', 'order', rows[0].id, {
+      orderId: rows[0].id,
+      orderStatus: finalStatus,
+      source: req.body.source || customer.source || 'Web',
+      deliveryType: customer.deliveryType,
+      total: orderTotal,
+    });
     await client.query('COMMIT');
 
     res.status(201).json({
       status: 'ok',
       order_id: rows[0].id,
-      total: normalized.total,
+      subtotal: normalized.total,
+      delivery_fee: deliveryFee,
+      total: orderTotal,
+      change_required: customer.paymentMethod === 'efectivo' && Number(customer.cashAmount) >= orderTotal
+        ? Math.round(Number(customer.cashAmount) - orderTotal)
+        : null,
       tracking_token: issueTrackingToken(rows[0].id, JWT_SECRET),
     });
   } catch (error) {
@@ -619,15 +719,18 @@ app.get('/api/pedidos/rastrear/:id', trackingLimiter, async (req, res) => {
              order_data.delivery_latitude, order_data.delivery_longitude,
              order_data.cart_json, order_data.created_at, order_data.updated_at,
              order_data.completed_at, order_data.delivered_at, order_data.delivery_completed_at,
+             order_data.picked_up_at, order_data.on_the_way_at,
              order_data.delivery_duration_seconds, order_data.delivery_user_id,
+             order_data.delivery_provider_type, order_data.external_delivery_company_id,
+             order_data.external_eta_minutes, company.name AS external_company_name,
              CASE WHEN order_data.delivery_status = 'En camino'
-                       AND profile.last_location_at >= order_data.delivery_accepted_at
+                       AND profile.last_location_at >= COALESCE(order_data.picked_up_at,order_data.on_the_way_at)
                   THEN profile.current_latitude ELSE NULL END AS driver_latitude,
              CASE WHEN order_data.delivery_status = 'En camino'
-                       AND profile.last_location_at >= order_data.delivery_accepted_at
+                       AND profile.last_location_at >= COALESCE(order_data.picked_up_at,order_data.on_the_way_at)
                   THEN profile.current_longitude ELSE NULL END AS driver_longitude,
              CASE WHEN order_data.delivery_status = 'En camino'
-                       AND profile.last_location_at >= order_data.delivery_accepted_at
+                       AND profile.last_location_at >= COALESCE(order_data.picked_up_at,order_data.on_the_way_at)
                   THEN profile.last_location_at ELSE NULL END AS driver_location_at,
              CASE WHEN order_data.delivery_status = 'En camino' THEN TRIM(CONCAT(driver.name, ' ', driver.last_name)) ELSE NULL END AS driver_name,
              CASE WHEN order_data.delivery_status = 'En camino' THEN profile.vehicle_type ELSE NULL END AS vehicle_type,
@@ -637,6 +740,7 @@ app.get('/api/pedidos/rastrear/:id', trackingLimiter, async (req, res) => {
       FROM pedidos_app_orders order_data
       LEFT JOIN pedidos_app_users driver ON driver.id = order_data.delivery_user_id
       LEFT JOIN pedidos_app_delivery_profiles profile ON profile.user_id = order_data.delivery_user_id
+      LEFT JOIN pedidos_app_delivery_companies company ON company.id = order_data.external_delivery_company_id
       LEFT JOIN pedidos_app_settings settings ON settings.id = 1
       WHERE order_data.id = $1
     `, [id]);
@@ -657,11 +761,13 @@ app.get('/api/pedidos/rastrear/:id', trackingLimiter, async (req, res) => {
     let driverTrail = [];
     if (!isFinal && order.delivery_status === 'En camino' && order.delivery_user_id != null) {
       const trailResult = await pool.query(`
-        SELECT latitude, longitude, recorded_at
-        FROM pedidos_app_delivery_locations
-        WHERE order_id = $1 AND user_id = $2
-        ORDER BY recorded_at DESC LIMIT 120
-      `, [id, order.delivery_user_id]);
+        SELECT latitude, longitude, captured_at AS recorded_at
+        FROM pedidos_app_driver_location_points
+        WHERE driver_id = $1
+          AND captured_at >= COALESCE($2::timestamptz,captured_at)
+          AND captured_at <= COALESCE($3::timestamptz,NOW())
+        ORDER BY captured_at DESC LIMIT 120
+      `, [order.delivery_user_id, order.picked_up_at || order.on_the_way_at, order.delivery_completed_at]);
       driverTrail = trailResult.rows.reverse().map((p) => ({
         latitude: Number(p.latitude),
         longitude: Number(p.longitude),
@@ -679,6 +785,12 @@ app.get('/api/pedidos/rastrear/:id', trackingLimiter, async (req, res) => {
         total: Number(order.total),
         order_status: order.status,
         delivery_status: order.delivery_status,
+        delivery_provider_type: order.delivery_provider_type || (order.delivery_user_id ? 'own' : null),
+        tracking_mode: String(order.delivery_provider_type || '').startsWith('external_') ? 'status' : 'gps',
+        external_delivery: order.external_delivery_company_id == null ? null : {
+          company_name: order.external_company_name,
+          eta_minutes: order.external_eta_minutes == null ? null : Number(order.external_eta_minutes),
+        },
         items: (order.cart_json || []).map((item) => ({ title: item.title, quantity: item.quantity || item.qty || 1 })),
         created_at: order.created_at,
         updated_at: order.updated_at,
@@ -696,7 +808,7 @@ app.get('/api/pedidos/rastrear/:id', trackingLimiter, async (req, res) => {
           latitude: Number(order.delivery_latitude),
           longitude: Number(order.delivery_longitude),
         },
-        driver: order.delivery_user_id == null ? null : {
+        driver: order.delivery_user_id == null || String(order.delivery_provider_type || '').startsWith('external_') ? null : {
           name: order.driver_name,
           vehicle_type: order.vehicle_type,
           plate: order.plate,
@@ -705,6 +817,8 @@ app.get('/api/pedidos/rastrear/:id', trackingLimiter, async (req, res) => {
           updated_at: order.driver_location_at,
         },
         driver_trail: driverTrail,
+        has_live_gps: !String(order.delivery_provider_type || '').startsWith('external_')
+          && order.driver_latitude != null && order.driver_longitude != null,
       },
     });
   } catch (error) {
@@ -730,15 +844,18 @@ app.get('/api/pedidos/track/:id', trackingLimiter, async (req, res) => {
              order_data.delivery_latitude, order_data.delivery_longitude,
              order_data.cart_json, order_data.created_at, order_data.updated_at,
              order_data.completed_at, order_data.delivered_at, order_data.delivery_completed_at,
+             order_data.picked_up_at, order_data.on_the_way_at,
              order_data.delivery_duration_seconds, order_data.delivery_user_id,
+             order_data.delivery_provider_type, order_data.external_delivery_company_id,
+             order_data.external_eta_minutes, company.name AS external_company_name,
              CASE WHEN order_data.delivery_status = 'En camino'
-                       AND profile.last_location_at >= order_data.delivery_accepted_at
+                       AND profile.last_location_at >= COALESCE(order_data.picked_up_at,order_data.on_the_way_at)
                   THEN profile.current_latitude ELSE NULL END AS driver_latitude,
              CASE WHEN order_data.delivery_status = 'En camino'
-                       AND profile.last_location_at >= order_data.delivery_accepted_at
+                       AND profile.last_location_at >= COALESCE(order_data.picked_up_at,order_data.on_the_way_at)
                   THEN profile.current_longitude ELSE NULL END AS driver_longitude,
              CASE WHEN order_data.delivery_status = 'En camino'
-                       AND profile.last_location_at >= order_data.delivery_accepted_at
+                       AND profile.last_location_at >= COALESCE(order_data.picked_up_at,order_data.on_the_way_at)
                   THEN profile.last_location_at ELSE NULL END AS driver_location_at,
              CASE WHEN order_data.delivery_status = 'En camino' THEN TRIM(CONCAT(driver.name, ' ', driver.last_name)) ELSE NULL END AS driver_name,
              CASE WHEN order_data.delivery_status = 'En camino' THEN profile.vehicle_type ELSE NULL END AS vehicle_type,
@@ -748,6 +865,7 @@ app.get('/api/pedidos/track/:id', trackingLimiter, async (req, res) => {
       FROM pedidos_app_orders order_data
       LEFT JOIN pedidos_app_users driver ON driver.id = order_data.delivery_user_id
       LEFT JOIN pedidos_app_delivery_profiles profile ON profile.user_id = order_data.delivery_user_id
+      LEFT JOIN pedidos_app_delivery_companies company ON company.id = order_data.external_delivery_company_id
       LEFT JOIN pedidos_app_settings settings ON settings.id = 1
       WHERE order_data.id = $1
     `, [id]);
@@ -756,12 +874,14 @@ app.get('/api/pedidos/track/:id', trackingLimiter, async (req, res) => {
     let driverTrail = [];
     if (order.delivery_status === 'En camino' && order.delivery_user_id != null) {
       const trailResult = await pool.query(`
-        SELECT latitude, longitude, recorded_at
-        FROM pedidos_app_delivery_locations
-        WHERE order_id = $1 AND user_id = $2
-        ORDER BY recorded_at DESC
+        SELECT latitude, longitude, captured_at AS recorded_at
+        FROM pedidos_app_driver_location_points
+        WHERE driver_id = $1
+          AND captured_at >= COALESCE($2::timestamptz,captured_at)
+          AND captured_at <= COALESCE($3::timestamptz,NOW())
+        ORDER BY captured_at DESC
         LIMIT 120
-      `, [id, order.delivery_user_id]);
+      `, [order.delivery_user_id, order.picked_up_at || order.on_the_way_at, order.delivery_completed_at]);
       driverTrail = trailResult.rows.reverse().map((point) => ({
         latitude: Number(point.latitude),
         longitude: Number(point.longitude),
@@ -777,6 +897,12 @@ app.get('/api/pedidos/track/:id', trackingLimiter, async (req, res) => {
         total: Number(order.total),
         order_status: order.status,
         delivery_status: order.delivery_status,
+        delivery_provider_type: order.delivery_provider_type || (order.delivery_user_id ? 'own' : null),
+        tracking_mode: String(order.delivery_provider_type || '').startsWith('external_') ? 'status' : 'gps',
+        external_delivery: order.external_delivery_company_id == null ? null : {
+          company_name: order.external_company_name,
+          eta_minutes: order.external_eta_minutes == null ? null : Number(order.external_eta_minutes),
+        },
         items: (order.cart_json || []).map((item) => ({ title: item.title, quantity: item.quantity || item.qty || 1 })),
         created_at: order.created_at,
         updated_at: order.updated_at,
@@ -795,7 +921,7 @@ app.get('/api/pedidos/track/:id', trackingLimiter, async (req, res) => {
           latitude: Number(order.delivery_latitude),
           longitude: Number(order.delivery_longitude),
         },
-        driver: order.delivery_user_id == null ? null : {
+        driver: order.delivery_user_id == null || String(order.delivery_provider_type || '').startsWith('external_') ? null : {
           id: Number(order.delivery_user_id),
           name: order.driver_name,
           vehicle_type: order.vehicle_type,
@@ -805,6 +931,8 @@ app.get('/api/pedidos/track/:id', trackingLimiter, async (req, res) => {
           updated_at: order.driver_location_at,
           trail: driverTrail,
         },
+        has_live_gps: !String(order.delivery_provider_type || '').startsWith('external_')
+          && order.driver_latitude != null && order.driver_longitude != null,
       },
     });
   } catch (error) {
@@ -939,7 +1067,6 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 
 const transporter = nodemailer.createTransport({
@@ -1167,8 +1294,32 @@ app.post('/api/pedidos/admin/refresh-token', async (req, res) => {
 
 app.post('/api/pedidos/admin/logout', authenticateToken, async (req, res) => {
   if (req.user && req.user.jti && dbUrl) {
-    await pool.query("UPDATE pedidos_app_sessions SET status = 'Cerrada por usuario' WHERE token_jti = $1", [req.user.jti]);
-    await pool.query("INSERT INTO pedidos_app_audit_logs (user_id, action) VALUES ($1, 'Cierre de Sesión')", [req.user.id]);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(`
+        UPDATE pedidos_app_sessions
+        SET status='Cerrada por usuario', revoked_at=NOW()
+        WHERE token_jti=$1 AND user_id=$2
+        RETURNING device_id
+      `, [req.user.jti, req.user.id]);
+      if (rows[0]?.device_id) {
+        await client.query(`
+          UPDATE pedidos_app_delivery_profiles
+          SET tracking_device_id=NULL, tracking_lease_at=NULL, gps_status='unavailable',
+              availability_status=CASE WHEN shift_active THEN 'Desconectado' ELSE availability_status END,
+              updated_at=NOW()
+          WHERE user_id=$1 AND tracking_device_id=$2
+        `, [req.user.id, rows[0].device_id]);
+      }
+      await client.query("INSERT INTO pedidos_app_audit_logs (user_id, action) VALUES ($1, 'Cierre de Sesión')", [req.user.id]);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
   }
   res.json({ status: 'ok' });
 });
@@ -1178,6 +1329,111 @@ app.get('/api/pedidos/admin/verify', authenticateToken, async (req, res) => {
   if (!authData) return res.status(401).json({ error: 'Usuario no disponible' });
   res.json({ status: 'ok', ...authData });
 });
+
+// Sesiones del propio usuario. Estas rutas son compartidas por Admin y Delivery
+// y no dependen del prefijo administrativo.
+app.get('/api/pedidos/auth/me/sessions', authenticateToken, async (req, res) => {
+  try {
+    await expireInactiveSessions(pool, req.user.id);
+    const { rows } = await pool.query(`
+      SELECT id, device_id, device_name, browser, os, ip, location, status,
+             created_at, last_active, expires_at, token_jti=$2 AS is_current
+      FROM pedidos_app_sessions
+      WHERE user_id=$1
+      ORDER BY (status='Activa') DESC, last_active DESC
+      LIMIT 20
+    `, [req.user.id, req.user.jti]);
+    res.json({ status: 'ok', data: rows });
+  } catch (error) {
+    console.error('Error consultando sesiones propias:', error);
+    res.status(500).json({ error: 'No fue posible consultar tus dispositivos' });
+  }
+});
+
+app.delete('/api/pedidos/auth/me/sessions/:id', authenticateToken, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const session = await client.query(`
+      SELECT id, device_id, token_jti, status
+      FROM pedidos_app_sessions
+      WHERE id=$1 AND user_id=$2
+      FOR UPDATE
+    `, [req.params.id, req.user.id]);
+    if (!session.rowCount || session.rows[0].status !== 'Activa') {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Sesión activa no encontrada' });
+    }
+    const wasCurrent = session.rows[0].token_jti === req.user.jti;
+    await client.query(`
+      UPDATE pedidos_app_sessions
+      SET status='Cerrada desde perfil', revoked_at=NOW()
+      WHERE id=$1 AND user_id=$2
+    `, [req.params.id, req.user.id]);
+    const releasedTracking = await client.query(`
+      UPDATE pedidos_app_delivery_profiles
+      SET tracking_device_id=NULL, tracking_lease_at=NULL, gps_status='unavailable',
+          availability_status=CASE WHEN shift_active THEN 'Desconectado' ELSE availability_status END,
+          updated_at=NOW()
+      WHERE user_id=$1 AND tracking_device_id=$2
+      RETURNING user_id
+    `, [req.user.id, session.rows[0].device_id]);
+    await client.query(`
+      INSERT INTO pedidos_app_audit_logs
+        (user_id,username_attempted,module,action,details,request_data)
+      VALUES ($1,$2,'Perfil','Revocar dispositivo',$3,$4::jsonb)
+    `, [req.user.id, req.user.username || null, `Sesión #${req.params.id} revocada por su propietario`, JSON.stringify({
+      sessionId: Number(req.params.id), deviceId: session.rows[0].device_id,
+      wasCurrent, releasedTracking: releasedTracking.rowCount > 0,
+    })]);
+    const eventId = crypto.randomUUID();
+    await client.query(`
+      INSERT INTO pedidos_app_domain_events
+        (event_id,aggregate_type,aggregate_id,event_type,payload)
+      VALUES ($1,'session',$2,'session_revoked',$3::jsonb)
+    `, [eventId, String(req.params.id), JSON.stringify({
+      eventId, userId: req.user.id, sessionId: Number(req.params.id),
+      deviceId: session.rows[0].device_id, releasedTracking: releasedTracking.rowCount > 0,
+    })]);
+    await client.query('COMMIT');
+    res.json({ status: 'ok', was_current: wasCurrent, released_tracking: releasedTracking.rowCount > 0 });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('Error revocando sesión propia:', error);
+    res.status(500).json({ error: 'No fue posible cerrar la sesión seleccionada' });
+  } finally {
+    client.release();
+  }
+});
+
+const requireAdministrativeUser = async (req, res, next) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT COALESCE(role_data.name, app_user.role) AS role
+      FROM pedidos_app_users app_user
+      LEFT JOIN pedidos_app_roles role_data ON role_data.id = app_user.role_id
+      WHERE app_user.id = $1 AND app_user.status = 'Activo'
+    `, [req.user.id]);
+    if (!rows.length) {
+      return res.status(403).json({ error: 'Esta cuenta no tiene acceso al panel administrativo' });
+    }
+    const isDeliveryThemeRead = DELIVERY_ROLES.has(rows[0].role)
+      && req.method === 'GET'
+      && /\/admin\/settings(?:\?|$)/.test(req.originalUrl);
+    if (DELIVERY_ROLES.has(rows[0].role) && !isDeliveryThemeRead) {
+      return res.status(403).json({ error: 'Esta cuenta no tiene acceso al panel administrativo' });
+    }
+    req.user.role = rows[0].role;
+    next();
+  } catch (error) {
+    console.error('Error validando acceso administrativo:', error);
+    res.status(500).json({ error: 'No fue posible validar el acceso administrativo' });
+  }
+};
+
+// Login, recuperación, refresh, logout y verify están arriba porque la
+// autenticación es compartida. El resto del prefijo /admin pertenece al ERP.
+app.use('/api/pedidos/admin', authenticateToken, requireAdministrativeUser);
 
 app.get('/api/pedidos/admin/dashboard', authenticateToken, async (req, res) => {
   try {
@@ -1262,28 +1518,187 @@ app.get('/api/pedidos/admin/clientes/buscar', authenticateToken, async (req, res
     const { q } = req.query;
     if (!q || q.length < 1) return res.json({ status: 'ok', clientes: [] });
 
-    // Buscar en el historial de pedidos
     const { rows } = await pool.query(`
-      SELECT customer_name as name, customer_phone as phone, address, barrio, delivery_type, payment_method, source, notes
-      FROM pedidos_app_orders
-      WHERE customer_name ILIKE $1 OR customer_phone LIKE $2
-      ORDER BY created_at DESC
-    `, [`${q}%`, `${q.replace(/\D/g, '')}%`]);
-
-    // Deduplicar
-    const unique = [];
-    const seen = new Set();
-    for (const r of rows) {
-      const key = (r.phone || r.name).toLowerCase();
-      if (!seen.has(key)) {
-        seen.add(key);
-        unique.push(r);
-      }
-    }
-    res.json({ status: 'ok', clientes: unique.slice(0, 10) });
+      SELECT customer.name,customer.phone,customer.address,customer.barrio,
+             customer.preferred_delivery_type AS delivery_type,
+             customer.preferred_payment_method AS payment_method,
+             COALESCE(contact.source,'MANUAL') AS source,customer.notes
+      FROM pedidos_app_customers customer
+      LEFT JOIN pedidos_app_crm_contact_customers link ON link.customer_id=customer.id
+      LEFT JOIN pedidos_app_crm_contacts contact ON contact.id=link.contact_id
+      WHERE customer.name ILIKE $1
+         OR customer.phone LIKE $2
+         OR customer.phone_e164 LIKE $3
+      ORDER BY COALESCE(contact.last_purchase_at,customer.updated_at) DESC NULLS LAST
+      LIMIT 10
+    `, [`${q}%`, `${q.replace(/\D/g, '')}%`, `%${q.replace(/\D/g, '')}%`]);
+    res.json({ status: 'ok', clientes: rows });
   } catch (error) {
     res.status(500).json({ status: 'error', error: error.message });
   }
+});
+
+const CUSTOMER_SEGMENT_SQL = `CASE contact.status
+  WHEN 'VIP' THEN 'VIP'
+  WHEN 'INACTIVO' THEN 'En riesgo'
+  WHEN 'NO_CONTACTAR' THEN 'En riesgo'
+  WHEN 'NUEVO_CONTACTO' THEN 'Sin pedidos'
+  WHEN 'PROSPECTO' THEN 'Sin pedidos'
+  WHEN 'CLIENTE_NUEVO' THEN 'Nuevo'
+  ELSE CASE WHEN contact.id IS NULL THEN 'Sin pedidos' ELSE 'Frecuente' END END`;
+
+app.get('/api/pedidos/admin/customers', authenticateToken, async (req, res) => {
+  try {
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(10, Number.parseInt(req.query.limit, 10) || 25));
+    const search = String(req.query.search || '').trim();
+    const status = ['Activo', 'Inactivo', 'Bloqueado'].includes(req.query.status) ? req.query.status : '';
+    const allowedSegments = ['Sin pedidos', 'En riesgo', 'VIP', 'Frecuente', 'Nuevo'];
+    const segment = allowedSegments.includes(req.query.segment) ? req.query.segment : '';
+    const params = [`%${search}%`, status, segment, limit, (page - 1) * limit];
+    const base = `
+      WITH enriched AS (
+        SELECT c.id, c.name, c.phone, c.avatar_url, c.email, c.address, c.barrio,
+               c.status, c.tags, c.notes, c.birthday, c.marketing_opt_in,
+               c.preferred_delivery_type, c.preferred_payment_method, c.last_contact_at,
+               c.created_at, c.updated_at, contact.id AS crm_contact_id,contact.status AS crm_status,
+               contact.source AS crm_source,COALESCE(contact.orders_count,0) AS orders_count,
+               COALESCE(contact.orders_count,0) AS completed_orders,
+               COALESCE(contact.cancelled_orders,0) AS cancelled_orders,
+               COALESCE(contact.total_spent,0) AS total_spent,
+               COALESCE(contact.average_ticket,0) AS average_ticket,
+               contact.first_purchase_at AS first_order_at, contact.last_purchase_at AS last_order_at,
+               ${CUSTOMER_SEGMENT_SQL} AS segment
+        FROM pedidos_app_customers c
+        LEFT JOIN pedidos_app_crm_contact_customers link ON link.customer_id=c.id
+        LEFT JOIN pedidos_app_crm_contacts contact ON contact.id=link.contact_id
+      )`;
+    const where = `WHERE ($1 = '%%' OR name ILIKE $1 OR phone ILIKE $1 OR email ILIKE $1 OR barrio ILIKE $1)
+                     AND ($2 = '' OR status = $2) AND ($3 = '' OR segment = $3)`;
+    const [listResult, summaryResult] = await Promise.all([
+      pool.query(`${base} SELECT *, COUNT(*) OVER()::int AS filtered_count FROM enriched ${where}
+        ORDER BY last_order_at DESC NULLS LAST, updated_at DESC LIMIT $4 OFFSET $5`, params),
+      pool.query(`${base} SELECT COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE status = 'Activo')::int AS active,
+        COUNT(*) FILTER (WHERE segment = 'VIP')::int AS vip,
+        COUNT(*) FILTER (WHERE segment = 'En riesgo')::int AS at_risk,
+        COALESCE(SUM(total_spent),0)::bigint AS lifetime_value FROM enriched`),
+    ]);
+    const total = listResult.rows[0]?.filtered_count || 0;
+    res.json({ status: 'ok', customers: listResult.rows.map(({ filtered_count, ...row }) => row),
+      summary: summaryResult.rows[0], pagination: { page, limit, total, pages: Math.max(1, Math.ceil(total / limit)) } });
+  } catch (error) { res.status(500).json({ status: 'error', error: error.message }); }
+});
+
+app.get('/api/pedidos/admin/customers/:id', authenticateToken, async (req, res) => {
+  try {
+    const customer = await pool.query(`
+      SELECT customer.*,contact.id AS crm_contact_id,contact.status AS crm_status,contact.source AS crm_source,
+        COALESCE(contact.orders_count,0) AS orders_count,COALESCE(contact.cancelled_orders,0) AS cancelled_orders,
+        COALESCE(contact.total_spent,0) AS total_spent,COALESCE(contact.average_ticket,0) AS average_ticket,
+        contact.first_purchase_at AS first_order_at,contact.last_purchase_at AS last_order_at
+      FROM pedidos_app_customers customer
+      LEFT JOIN pedidos_app_crm_contact_customers link ON link.customer_id=customer.id
+      LEFT JOIN pedidos_app_crm_contacts contact ON contact.id=link.contact_id
+      WHERE customer.id=$1
+    `, [req.params.id]);
+    if (!customer.rows.length) return res.status(404).json({ error: 'Cliente no encontrado' });
+    const orders = await pool.query(`
+      SELECT id, created_at, delivery_type, payment_method, total, status, source, address, barrio, cart_json
+      FROM pedidos_app_orders
+      WHERE crm_contact_id=$1 OR ($1::bigint IS NULL AND customer_phone_e164=$2)
+      ORDER BY created_at DESC LIMIT 100`, [customer.rows[0].crm_contact_id, customer.rows[0].phone_e164]);
+    res.json({ status: 'ok', customer: customer.rows[0], orders: orders.rows });
+  } catch (error) { res.status(500).json({ status: 'error', error: error.message }); }
+});
+
+async function syncCustomerMarketingConsent(client, customerId, granted, actorUserId, { recordOptOut = false } = {}) {
+  if (!granted && !recordOptOut) return;
+  const contact = await client.query(`
+    UPDATE pedidos_app_crm_contacts crm_contact
+    SET marketing_opt_in=$2,
+        marketing_opt_out=CASE WHEN $2 THEN FALSE ELSE TRUE END,
+        no_contact=CASE WHEN $2 THEN FALSE ELSE TRUE END,
+        opt_out_reason=CASE WHEN $2 THEN NULL ELSE 'Preferencia actualizada desde Clientes' END,
+        status=CASE WHEN $2 THEN crm_contact.status ELSE 'NO_CONTACTAR' END,
+        updated_at=NOW()
+    FROM pedidos_app_crm_contact_customers link
+    WHERE link.customer_id=$1 AND crm_contact.id=link.contact_id
+    RETURNING crm_contact.id
+  `, [customerId, granted]);
+  if (!contact.rows.length) return;
+  await client.query(`
+    INSERT INTO pedidos_app_crm_consents
+      (contact_id,channel,consent_type,granted,source,evidence,actor_user_id)
+    VALUES ($1,'WHATSAPP','MARKETING',$2,'CUSTOMER_PROFILE',$3::jsonb,$4)
+  `, [contact.rows[0].id, granted, JSON.stringify({ customerId: Number(customerId) }), actorUserId || null]);
+  await client.query('SELECT pedidos_app_crm_refresh_contact($1)', [contact.rows[0].id]);
+}
+
+app.post('/api/pedidos/admin/customers', authenticateToken, async (req, res) => {
+  const normalizedPhone = normalizePhoneE164(req.body.phone);
+  const phone = normalizedPhone?.slice(1) || '';
+  const name = String(req.body.name || '').trim();
+  if (!name || !normalizedPhone) return res.status(400).json({ error: 'Nombre y teléfono colombiano válido son obligatorios' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(`INSERT INTO pedidos_app_customers
+      (name, phone, email, address, barrio, status, tags, notes, birthday, marketing_opt_in)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+    [name, phone, String(req.body.email || '').trim() || null, String(req.body.address || '').trim() || null,
+      String(req.body.barrio || '').trim() || null, ['Activo','Inactivo','Bloqueado'].includes(req.body.status) ? req.body.status : 'Activo',
+      Array.isArray(req.body.tags) ? req.body.tags.slice(0, 20).map(String) : [], String(req.body.notes || '').slice(0, 3000),
+      req.body.birthday || null, Boolean(req.body.marketing_opt_in)]);
+    await syncCustomerMarketingConsent(client, rows[0].id, Boolean(req.body.marketing_opt_in), req.user.id);
+    await client.query('COMMIT');
+    res.status(201).json({ status: 'ok', customer: rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(error.code === '23505' ? 409 : 500).json({ error: error.code === '23505' ? 'Ya existe un cliente con este teléfono' : error.message });
+  } finally { client.release(); }
+});
+
+app.put('/api/pedidos/admin/customers/:id', authenticateToken, async (req, res) => {
+  const normalizedPhone = normalizePhoneE164(req.body.phone);
+  const phone = normalizedPhone?.slice(1) || '';
+  const name = String(req.body.name || '').trim();
+  if (!name || !normalizedPhone) return res.status(400).json({ error: 'Nombre y teléfono colombiano válido son obligatorios' });
+  const status = ['Activo','Inactivo','Bloqueado'].includes(req.body.status) ? req.body.status : 'Activo';
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const previous = await client.query('SELECT marketing_opt_in FROM pedidos_app_customers WHERE id=$1 FOR UPDATE', [req.params.id]);
+    if (!previous.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Cliente no encontrado' });
+    }
+    const { rows } = await client.query(`UPDATE pedidos_app_customers SET
+      name=$1, phone=$2, email=$3, address=$4, barrio=$5, status=$6, tags=$7,
+      notes=$8, birthday=$9, marketing_opt_in=$10, updated_at=NOW()
+      WHERE id=$11 RETURNING *`,
+    [name, phone, String(req.body.email || '').trim() || null, String(req.body.address || '').trim() || null,
+      String(req.body.barrio || '').trim() || null, status,
+      Array.isArray(req.body.tags) ? req.body.tags.slice(0, 20).map(String) : [], String(req.body.notes || '').slice(0, 3000),
+      req.body.birthday || null, Boolean(req.body.marketing_opt_in), req.params.id]);
+    const consentChanged = Boolean(previous.rows[0].marketing_opt_in) !== Boolean(req.body.marketing_opt_in);
+    if (consentChanged) {
+      await syncCustomerMarketingConsent(client, rows[0].id, Boolean(req.body.marketing_opt_in), req.user.id, { recordOptOut: true });
+    }
+    await client.query('COMMIT');
+    res.json({ status: 'ok', customer: rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(error.code === '23505' ? 409 : 500).json({ error: error.code === '23505' ? 'Ya existe un cliente con este teléfono' : error.message });
+  } finally { client.release(); }
+});
+
+app.post('/api/pedidos/admin/customers/:id/contact', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query('UPDATE pedidos_app_customers SET last_contact_at=NOW(), updated_at=NOW() WHERE id=$1 RETURNING last_contact_at', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Cliente no encontrado' });
+    res.json({ status: 'ok', last_contact_at: rows[0].last_contact_at });
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.get('/api/pedidos/admin/orders', authenticateToken, async (req, res) => {
@@ -1300,7 +1715,14 @@ app.get('/api/pedidos/admin/orders', authenticateToken, async (req, res) => {
              delivery_location_adjusted, delivery_apartment, delivery_tower, delivery_floor,
              change_required, delivery_accepted_at, picked_up_at, on_the_way_at,
              delivery_completed_at, delivery_distance_km, delivery_duration_seconds,
-             tracking_sent_at
+             tracking_sent_at, delivery_provider_type, external_delivery_company_id,
+             external_driver_name, external_driver_phone, external_vehicle_id,
+             external_delivery_cost, external_delivery_notes, external_eta_minutes,
+             external_assigned_at, external_handed_off_at, external_delivery_confirmed_at,
+             external_delivery_confirmed_by_name, external_delivery_confirmation_notes,
+             (SELECT name FROM pedidos_app_delivery_companies company
+              WHERE company.id = external_delivery_company_id) AS external_company_name,
+             (delivery_fee - external_delivery_cost) AS logistics_margin
       FROM pedidos_app_orders
       ORDER BY created_at DESC
       LIMIT $1
@@ -1350,6 +1772,37 @@ app.put('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => 
       if (!ORDER_STATUSES.has(status)) {
         return res.status(400).json({ status: 'error', error: 'Estado de pedido inválido' });
       }
+      if (['Asignado externo', 'Entregado al operador externo'].includes(status)) {
+        return res.status(400).json({
+          status: 'error',
+          error: 'Usa la acción de entrega externa para registrar empresa, costo y auditoría.',
+        });
+      }
+      if (status === 'Cancelado') {
+        try {
+          const result = await deliveryOrderService.cancelOrder({
+            orderId: Number(id),
+            actor: req.user,
+            idempotencyKey: req.headers['idempotency-key'] || req.body.operationId,
+            reason: req.body.reason || 'Cancelado desde el panel administrativo',
+          });
+          if (result.order?.delivery_user_id) {
+            deliveryRealtime.sendPush({
+              userId: result.order.delivery_user_id,
+              title: 'Pedido cancelado',
+              body: `El pedido #${id} fue cancelado`,
+              url: '/',
+            }).catch((pushError) => console.error('Error enviando push de cancelación:', pushError));
+          }
+          return res.json({ status: 'ok', order: result.order, replayed: result.replayed });
+        } catch (error) {
+          return res.status(error.statusCode || 500).json({
+            status: 'error', code: error.code || 'ORDER_CANCEL_FAILED',
+            error: error.statusCode ? error.message : 'No fue posible cancelar el pedido',
+            details: error.details,
+          });
+        }
+      }
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
@@ -1363,6 +1816,34 @@ app.put('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => 
         }
 
         const currentOrder = currentRows[0];
+        const ownDelivery = String(currentOrder.delivery_type || '').toLowerCase() === 'domicilio'
+          && !String(currentOrder.delivery_provider_type || 'own').startsWith('external_');
+        if (ownDelivery && ['En camino', 'Entregado'].includes(status)) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({
+            status: 'error',
+            code: 'DELIVERY_DOMAIN_ACTION_REQUIRED',
+            error: status === 'En camino'
+              ? 'El domiciliario debe confirmar que inició la entrega desde Delivery.'
+              : 'La entrega debe finalizarse desde Delivery con GPS o con una excepción de geocerca autorizada.',
+          });
+        }
+        if (req.body.version != null && Number(req.body.version) !== Number(currentOrder.version || 0)) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({
+            status: 'error', code: 'ORDER_VERSION_CONFLICT',
+            error: 'El pedido cambió en otro dispositivo. Actualiza la información antes de continuar.',
+            currentVersion: Number(currentOrder.version || 0),
+          });
+        }
+        if (!canTransitionOrder(currentOrder.status, status)) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({
+            status: 'error',
+            code: 'INVALID_ORDER_TRANSITION',
+            error: `No se puede cambiar el pedido de ${currentOrder.status} a ${status}.`,
+          });
+        }
         const willBeFinal = FINAL_ORDER_STATUSES.has(status);
         if (currentOrder.status !== 'Cancelado' && status === 'Cancelado') {
           await releaseProductStock(client, currentOrder, req.user?.username);
@@ -1382,8 +1863,9 @@ app.put('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => 
                updated_at = NOW(),
                completed_at = CASE WHEN $2 THEN COALESCE(completed_at, NOW()) ELSE completed_at END,
                delivered_at = CASE WHEN $2 THEN COALESCE(delivered_at, NOW()) ELSE NULL END,
-               delivery_status = COALESCE($4, delivery_status),
-               delivery_completed_at = CASE WHEN $4 = 'Entregado' THEN COALESCE(delivery_completed_at, NOW()) ELSE delivery_completed_at END
+               delivery_status = COALESCE($4::varchar, delivery_status),
+               delivery_completed_at = CASE WHEN $4::varchar = 'Entregado' THEN COALESCE(delivery_completed_at, NOW()) ELSE delivery_completed_at END,
+               version = version + 1
            WHERE id = $3 RETURNING *`,
           [status, willBeFinal, id, deliveryStatus]
         );
@@ -1394,12 +1876,28 @@ app.put('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => 
             WHERE user_id = $1
           `, [rows[0].delivery_user_id]);
         }
+        if (status === 'Cancelado' && String(rows[0].delivery_provider_type || '').startsWith('external_')) {
+          await client.query(`
+            INSERT INTO pedidos_app_delivery_events
+              (order_id,event_type,provider_type,company_id,actor_user_id,actor_name,external_cost,notes)
+            VALUES ($1,'cancelled',$2,$3,$4,$5,$6,'Entrega externa cancelada desde el ERP')
+          `, [id, rows[0].delivery_provider_type, rows[0].external_delivery_company_id, req.user.id, req.user.username || null, rows[0].external_delivery_cost]);
+        }
+        await deliveryOrderService.appendDomainEvent(
+          client,
+          status === 'Listo' && String(rows[0].delivery_type || '').toLowerCase() === 'domicilio'
+            ? 'order_available'
+            : 'order_status_changed',
+          'order',
+          rows[0].id,
+          {
+            orderId: rows[0].id,
+            orderStatus: rows[0].status,
+            deliveryStatus: rows[0].delivery_status,
+            version: Number(rows[0].version || 0),
+          },
+        );
         await client.query('COMMIT');
-        deliveryRealtime.publish('order_updated', {
-          orderId: Number(id),
-          orderStatus: status,
-          deliveryStatus: rows[0].delivery_status,
-        });
         if (status === 'Cancelado' && rows[0].delivery_user_id) {
           deliveryRealtime.sendPush({
             userId: rows[0].delivery_user_id,
@@ -1456,15 +1954,8 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
     if (currentOrder.status !== 'Cancelado') await releaseProductStock(client, currentOrder, req.user?.username);
     const normalized = await normalizeOrderCart(client, cart, { activeOnly: false });
     const cartStr = JSON.stringify(normalized.cart);
-    let customDateStr = (customer && customer.created_at) || req.body.created_at;
-    let customDate = null;
-    if (customDateStr) {
-      if (customDateStr.length === 10) customDateStr += 'T12:00:00-05:00';
-      const parsedDate = new Date(customDateStr);
-      if (!isNaN(parsedDate.getTime())) {
-        customDate = parsedDate.toISOString();
-      }
-    }
+    const customDateStr = (customer && customer.created_at) || req.body.created_at;
+    const customDate = parseColombiaTimestamp(customDateStr);
 
     if (customDate && await isDateClosed(customDate)) {
       await client.query('ROLLBACK');
@@ -1481,6 +1972,9 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
 
     const deliveryLocation = normalizeDeliveryLocation(customer);
     const isDelivery = String(customer.deliveryType || '').toLowerCase() === 'domicilio';
+    const settingsResult = await client.query('SELECT COALESCE(delivery_cost, 0)::integer AS delivery_cost FROM pedidos_app_settings WHERE id = 1');
+    const deliveryFee = isDelivery ? Math.max(0, Number(settingsResult.rows[0]?.delivery_cost || 0)) : 0;
+    const orderTotal = normalized.total + deliveryFee;
     const { rows } = await client.query(
       `UPDATE pedidos_app_orders 
        SET cart_json = $1, total = $2, customer_name = $3, customer_phone = $4, address = $5,
@@ -1490,13 +1984,10 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
            delivery_reference = $14, delivery_latitude = $15, delivery_longitude = $16,
            delivery_place_id = $17, delivery_location_adjusted = $18,
            delivery_apartment = $19, delivery_tower = $20, delivery_floor = $21,
-           delivery_fee = CASE WHEN $22::boolean
-             THEN COALESCE(NULLIF(delivery_fee, 0), (SELECT delivery_cost FROM pedidos_app_settings WHERE id = 1), 0)
-             ELSE 0
-           END
+           delivery_fee = $22
        WHERE id = $11 RETURNING *`,
       [
-        cartStr, normalized.total, customer.name, formattedPhone, customer.address,
+        cartStr, orderTotal, customer.name, formattedPhone, customer.address,
         customer.deliveryType, customer.paymentMethod, customer.barrio || '',
         req.body.source || customer.source || 'Web', customDate, id, customer.notes || '',
         customer.voucher_reference || '',
@@ -1508,7 +1999,7 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
         isDelivery ? String(customer.apartment || '').trim().slice(0, 50) || null : null,
         isDelivery ? String(customer.tower || '').trim().slice(0, 50) || null : null,
         isDelivery ? String(customer.floor || '').trim().slice(0, 30) || null : null,
-        isDelivery,
+        deliveryFee,
       ]
     );
     if (currentOrder.status !== 'Cancelado') await reserveProductStock(client, normalized, id, req.user?.username);
@@ -1745,7 +2236,17 @@ const SETTINGS_FIELDS = new Set([
   'date_format', 'time_format', 'web_primary_color', 'web_background_color',
   'web_surface_color', 'web_text_color', 'admin_primary_color', 'admin_background_color',
   'admin_surface_color', 'admin_text_color', 'store_latitude', 'store_longitude',
-  'kitchen_address', 'kitchen_place_id', 'delivery_completion_radius_meters'
+  'kitchen_address', 'kitchen_place_id', 'delivery_completion_radius_meters',
+  'notification_voice', 'notification_language', 'web_logo', 'web_page_title',
+  'web_hero_title', 'web_hero_subtitle', 'web_font_family', 'web_card_style',
+  'admin_logo', 'admin_page_title', 'admin_sidebar_title', 'admin_font_family',
+  'admin_density', 'delivery_logo', 'delivery_page_title', 'delivery_heading',
+  'delivery_subtitle', 'delivery_font_family', 'delivery_card_style',
+  'delivery_primary_color', 'delivery_background_color', 'delivery_surface_color',
+  'delivery_text_color', 'gps_delivery_interval_seconds', 'gps_free_interval_seconds',
+  'presence_heartbeat_interval_seconds', 'presence_timeout_seconds',
+  'gps_max_age_seconds', 'gps_max_accuracy_meters', 'offline_location_queue_limit'
+  , 'default_max_driver_capacity', 'sse_reconnect_initial_ms', 'sse_reconnect_max_ms'
 ]);
 
 const COLOR_SETTING_FIELDS = new Set([...SETTINGS_FIELDS].filter((key) => key.endsWith('_color')));
@@ -1769,6 +2270,10 @@ app.put('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
   try {
     const data = { ...req.body };
     if (typeof data.logo === 'string' && data.logo.includes('/api/pedidos/media/settings-logo')) delete data.logo;
+    ['web', 'admin', 'delivery'].forEach((surface) => {
+      const key = `${surface}_logo`;
+      if (typeof data[key] === 'string' && data[key].includes(`/api/pedidos/media/settings-logo/${surface}`)) delete data[key];
+    });
     const requestedKeys = Object.keys(data).filter(k => k !== 'id' && k !== 'updated_at');
     const invalidKeys = requestedKeys.filter(k => !SETTINGS_FIELDS.has(k));
     if (invalidKeys.length) {
@@ -1788,6 +2293,61 @@ app.put('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
         return res.status(400).json({ status: 'error', error: 'El radio para finalizar debe estar entre 50 y 500 metros.' });
       }
     }
+    const boundedDeliverySettings = {
+      gps_delivery_interval_seconds: [3, 60],
+      gps_free_interval_seconds: [15, 300],
+      presence_heartbeat_interval_seconds: [10, 120],
+      presence_timeout_seconds: [30, 600],
+      gps_max_age_seconds: [30, 900],
+      gps_max_accuracy_meters: [20, 1000],
+      offline_location_queue_limit: [100, 20000],
+      default_max_driver_capacity: [1, 5],
+      sse_reconnect_initial_ms: [500, 10000],
+      sse_reconnect_max_ms: [5000, 120000],
+    };
+    const invalidDeliverySetting = requestedKeys.find((key) => {
+      const bounds = boundedDeliverySettings[key];
+      if (!bounds) return false;
+      const value = Number(data[key]);
+      if (!Number.isInteger(value) || value < bounds[0] || value > bounds[1]) return true;
+      data[key] = value;
+      return false;
+    });
+    if (invalidDeliverySetting) {
+      const [minimum, maximum] = boundedDeliverySettings[invalidDeliverySetting];
+      return res.status(400).json({ status: 'error', error: `${invalidDeliverySetting} debe estar entre ${minimum} y ${maximum}.` });
+    }
+    if (requestedKeys.some((key) => ['sse_reconnect_initial_ms', 'sse_reconnect_max_ms'].includes(key))) {
+      const initial = Number(data.sse_reconnect_initial_ms ?? 1500);
+      const maximum = Number(data.sse_reconnect_max_ms ?? 30000);
+      if (maximum < initial) return res.status(400).json({ status: 'error', error: 'El máximo de reconexión SSE no puede ser menor que el intervalo inicial.' });
+    }
+    if (requestedKeys.includes('notification_voice')
+        && !['female-clear', 'female-energetic', 'female-calm', 'male', 'system'].includes(data.notification_voice)) {
+      return res.status(400).json({ status: 'error', error: 'El tipo de voz seleccionado no es válido.' });
+    }
+    if (requestedKeys.includes('notification_language')
+        && !['es-CO', 'es-MX', 'es-ES', 'en-US', 'pt-BR'].includes(data.notification_language)) {
+      return res.status(400).json({ status: 'error', error: 'El idioma de las alertas no es válido.' });
+    }
+    const fontKeys = ['web_font_family', 'admin_font_family', 'delivery_font_family'];
+    if (requestedKeys.some((key) => fontKeys.includes(key) && !['modern', 'friendly', 'classic', 'system'].includes(data[key]))) {
+      return res.status(400).json({ status: 'error', error: 'La familia tipográfica seleccionada no es válida.' });
+    }
+    if ((requestedKeys.includes('web_card_style') && !['rounded', 'compact', 'outlined'].includes(data.web_card_style))
+        || (requestedKeys.includes('delivery_card_style') && !['rounded', 'compact', 'outlined'].includes(data.delivery_card_style))) {
+      return res.status(400).json({ status: 'error', error: 'El estilo de tarjetas no es válido.' });
+    }
+    if (requestedKeys.includes('admin_density') && !['comfortable', 'compact'].includes(data.admin_density)) {
+      return res.status(400).json({ status: 'error', error: 'La densidad del panel no es válida.' });
+    }
+    const textLimits = {
+      web_page_title: 120, web_hero_title: 160, web_hero_subtitle: 300,
+      admin_page_title: 120, admin_sidebar_title: 120,
+      delivery_page_title: 120, delivery_heading: 160, delivery_subtitle: 300,
+    };
+    const invalidText = requestedKeys.find((key) => textLimits[key] && String(data[key] || '').trim().length > textLimits[key]);
+    if (invalidText) return res.status(400).json({ status: 'error', error: `El campo ${invalidText} supera el máximo permitido.` });
     const latitude = Number(data.store_latitude);
     const longitude = Number(data.store_longitude);
     const hasLatitude = data.store_latitude !== null && data.store_latitude !== undefined && data.store_latitude !== '';
@@ -1803,7 +2363,26 @@ app.put('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
     const values = keys.map(k => data[k]);
 
     const query = `UPDATE pedidos_app_settings SET ${setString}, updated_at = NOW() WHERE id = 1 RETURNING *`;
-    const { rows } = await pool.query(query, values);
+    const client = await pool.connect();
+    let rows;
+    try {
+      await client.query('BEGIN');
+      ({ rows } = await client.query(query, values));
+      await client.query(`
+        INSERT INTO pedidos_app_audit_logs
+          (user_id,username_attempted,module,action,details,request_data)
+        VALUES ($1,$2,'Configuracion','Actualizar configuración','Configuración central actualizada',$3::jsonb)
+      `, [req.user.id, req.user.username || null, JSON.stringify({ changedFields: keys, requestId: req.requestId })]);
+      await deliveryOrderService.appendDomainEvent(client, 'settings_updated', 'settings', 1, {
+        changedFields: keys, actorUserId: req.user.id, requestId: req.requestId,
+      });
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
 
     res.json({ status: 'ok', settings: settingsForResponse(req, rows[0]) });
   } catch (error) {
@@ -2203,15 +2782,18 @@ app.post('/api/pedidos/admin/push/send', authenticateToken, async (req, res) => 
 
 app.get('/api/pedidos/announcement', async (req, res) => {
   try {
+    const audience = req.query.returning === '1' ? 'returning' : 'new';
     const { rows } = await pool.query(`
       SELECT id, title, body, cta_label, cta_url, starts_at, ends_at,
-             display_frequency, is_active, updated_at, image_url IS NOT NULL AS has_image
+             display_frequency, campaign_type, audience, priority, coupon_code,
+             views_count, clicks_count, is_active, updated_at, image_url IS NOT NULL AS has_image
       FROM pedidos_app_announcements
       WHERE is_active = TRUE
         AND (starts_at IS NULL OR starts_at <= NOW())
         AND (ends_at IS NULL OR ends_at >= NOW())
-      ORDER BY updated_at DESC, id DESC LIMIT 1
-    `);
+        AND audience IN ('all', $1)
+      ORDER BY priority DESC, updated_at DESC, id DESC LIMIT 1
+    `, [audience]);
     if (rows.length > 0) {
       res.json({ status: 'ok', announcement: announcementForResponse(req, rows[0]) });
     } else {
@@ -2220,6 +2802,101 @@ app.get('/api/pedidos/announcement', async (req, res) => {
   } catch (error) {
     res.status(500).json({ status: 'error', error: error.message });
   }
+});
+
+app.post('/api/pedidos/announcements/:id/view', trackingLimiter, async (req, res) => {
+  try {
+    await pool.query('UPDATE pedidos_app_announcements SET views_count = views_count + 1 WHERE id = $1', [req.params.id]);
+    res.status(204).end();
+  } catch { res.status(204).end(); }
+});
+
+app.post('/api/pedidos/announcements/:id/click', trackingLimiter, async (req, res) => {
+  try {
+    await pool.query('UPDATE pedidos_app_announcements SET clicks_count = clicks_count + 1 WHERE id = $1', [req.params.id]);
+    res.status(204).end();
+  } catch { res.status(204).end(); }
+});
+
+function parseCampaignInput(body = {}) {
+  const campaign = {
+    title: String(body.title || '').trim(), body: String(body.body || '').trim(),
+    image_url: String(body.image_url || ''), cta_label: String(body.cta_label || 'Continuar').trim(),
+    cta_url: String(body.cta_url || '').trim(), starts_at: body.starts_at || null,
+    ends_at: body.ends_at || null, is_active: Boolean(body.is_active),
+    display_frequency: ['always', 'session', 'daily'].includes(body.display_frequency) ? body.display_frequency : 'session',
+    campaign_type: ['modal', 'banner'].includes(body.campaign_type) ? body.campaign_type : 'modal',
+    audience: ['all', 'new', 'returning'].includes(body.audience) ? body.audience : 'all',
+    priority: Number.isInteger(Number(body.priority)) ? Number(body.priority) : 0,
+    coupon_code: String(body.coupon_code || '').trim().slice(0, 50) || null,
+  };
+  if (!campaign.title || campaign.title.length > 255) return { error: 'El título es obligatorio y admite hasta 255 caracteres' };
+  if (campaign.body.length > 1000) return { error: 'El mensaje admite hasta 1000 caracteres' };
+  if (!campaign.cta_label || campaign.cta_label.length > 80) return { error: 'El texto del botón admite hasta 80 caracteres' };
+  if (campaign.cta_url && !campaign.cta_url.startsWith('/') && !/^https:\/\//i.test(campaign.cta_url)) return { error: 'El enlace debe iniciar con / o usar HTTPS' };
+  if (campaign.starts_at && !Number.isFinite(new Date(campaign.starts_at).getTime())) return { error: 'La fecha de inicio no es válida' };
+  if (campaign.ends_at && !Number.isFinite(new Date(campaign.ends_at).getTime())) return { error: 'La fecha de cierre no es válida' };
+  if (campaign.starts_at && campaign.ends_at && new Date(campaign.ends_at) <= new Date(campaign.starts_at)) return { error: 'La fecha de cierre debe ser posterior al inicio' };
+  if (campaign.priority < 0 || campaign.priority > 100) return { error: 'La prioridad debe estar entre 0 y 100' };
+  return { campaign };
+}
+
+app.get('/api/pedidos/admin/announcements', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, title, body, cta_label, cta_url, starts_at, ends_at, display_frequency,
+             campaign_type, audience, priority, coupon_code, views_count, clicks_count,
+             published_at, is_active, updated_at, image_url IS NOT NULL AS has_image
+      FROM pedidos_app_announcements ORDER BY updated_at DESC, id DESC
+    `);
+    res.json({ status: 'ok', announcements: rows.map((row) => announcementForResponse(req, row)) });
+  } catch (error) { res.status(500).json({ status: 'error', error: error.message }); }
+});
+
+app.post('/api/pedidos/admin/announcements', authenticateToken, async (req, res) => {
+  const parsed = parseCampaignInput(req.body);
+  if (parsed.error) return res.status(400).json({ error: parsed.error });
+  const c = parsed.campaign;
+  try {
+    const { rows } = await pool.query(`
+      INSERT INTO pedidos_app_announcements
+        (title, image_url, body, cta_label, cta_url, starts_at, ends_at, display_frequency,
+         campaign_type, audience, priority, coupon_code, is_active, published_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,CASE WHEN $13 THEN NOW() ELSE NULL END)
+      RETURNING *
+    `, [c.title, c.image_url, c.body, c.cta_label, c.cta_url, c.starts_at, c.ends_at,
+      c.display_frequency, c.campaign_type, c.audience, c.priority, c.coupon_code, c.is_active]);
+    res.status(201).json({ status: 'ok', announcement: announcementForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image_url) }) });
+  } catch (error) { res.status(500).json({ status: 'error', error: error.message }); }
+});
+
+app.put('/api/pedidos/admin/announcements/:id', authenticateToken, async (req, res) => {
+  const parsed = parseCampaignInput(req.body);
+  if (parsed.error) return res.status(400).json({ error: parsed.error });
+  const c = parsed.campaign;
+  try {
+    const existing = await pool.query('SELECT id, image_url FROM pedidos_app_announcements WHERE id = $1', [req.params.id]);
+    if (!existing.rows.length) return res.status(404).json({ error: 'Campaña no encontrada' });
+    const imageUrl = isManagedMediaUrl(c.image_url, 'announcements', req.params.id) ? existing.rows[0].image_url : c.image_url;
+    const { rows } = await pool.query(`
+      UPDATE pedidos_app_announcements SET title=$1, image_url=$2, body=$3, cta_label=$4,
+        cta_url=$5, starts_at=$6, ends_at=$7, display_frequency=$8, campaign_type=$9,
+        audience=$10, priority=$11, coupon_code=$12, is_active=$13,
+        published_at=CASE WHEN $13 AND published_at IS NULL THEN NOW() ELSE published_at END,
+        updated_at=NOW()
+      WHERE id=$14 RETURNING *
+    `, [c.title, imageUrl, c.body, c.cta_label, c.cta_url, c.starts_at, c.ends_at,
+      c.display_frequency, c.campaign_type, c.audience, c.priority, c.coupon_code, c.is_active, req.params.id]);
+    res.json({ status: 'ok', announcement: announcementForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image_url) }) });
+  } catch (error) { res.status(500).json({ status: 'error', error: error.message }); }
+});
+
+app.delete('/api/pedidos/admin/announcements/:id', authenticateToken, async (req, res) => {
+  try {
+    const { rowCount } = await pool.query('DELETE FROM pedidos_app_announcements WHERE id = $1', [req.params.id]);
+    if (!rowCount) return res.status(404).json({ error: 'Campaña no encontrada' });
+    res.json({ status: 'ok' });
+  } catch (error) { res.status(500).json({ status: 'error', error: error.message }); }
 });
 
 app.get('/api/pedidos/admin/announcement', authenticateToken, async (req, res) => {
@@ -2363,7 +3040,10 @@ function buildReportData(orderRows, purchaseRows) {
 
   const totalSales = completedOrders.reduce((sum, order) => sum + Number(order.total || 0), 0);
   const totalPurchases = purchaseRows.reduce((sum, purchase) => sum + Number(purchase.total_amount || 0), 0);
-  const grossProfit = totalSales - totalPurchases;
+  const externalOrders = completedOrders.filter((order) => String(order.delivery_provider_type || '').startsWith('external_'));
+  const externalDeliveryCost = externalOrders.reduce((sum, order) => sum + Number(order.external_delivery_cost || 0), 0);
+  const externalDeliveryRevenue = externalOrders.reduce((sum, order) => sum + Number(order.delivery_fee || 0), 0);
+  const grossProfit = totalSales - totalPurchases - externalDeliveryCost;
   const cancelled = orderRows.filter((order) => order.status === 'Cancelado').length;
   const topProducts = Object.values(salesByProduct).sort((a, b) => b.total - a.total).slice(0, 10);
   const clientList = Object.values(topCustomers).map((customer) => {
@@ -2381,6 +3061,10 @@ function buildReportData(orderRows, purchaseRows) {
       ticketPromedio: completedOrders.length ? Math.round(totalSales / completedOrders.length) : 0,
       utilidadBruta: Math.round(grossProfit),
       totalCompras: Math.round(totalPurchases),
+      domiciliosExternos: externalOrders.length,
+      costoDomiciliosExternos: Math.round(externalDeliveryCost),
+      ingresoDomiciliosExternos: Math.round(externalDeliveryRevenue),
+      margenLogisticoExterno: Math.round(externalDeliveryRevenue - externalDeliveryCost),
       margenUtilidad: totalSales ? Math.round((grossProfit / totalSales) * 1000) / 10 : 0,
       tasaFinalizacion: orderRows.length ? Math.round((completedOrders.length / orderRows.length) * 1000) / 10 : 0,
     },
@@ -2408,6 +3092,7 @@ app.get('/api/pedidos/admin/reports', authenticateToken, async (req, res) => {
     const previousFrom = shiftIsoDate(previousTo, -(days - 1));
     const orderSql = `
       SELECT id, customer_name, customer_phone, payment_method, total, cart_json, status,
+             delivery_fee, delivery_provider_type, external_delivery_cost,
              created_at, TO_CHAR(created_at, 'YYYY-MM-DD') AS report_date
       FROM pedidos_app_orders
       WHERE created_at >= $1::date AND created_at < ($2::date + INTERVAL '1 day')
@@ -2481,118 +3166,127 @@ app.delete('/api/pedidos/admin/expenses/:id', authenticateToken, async (req, res
 });
 
 // ================= CIERRES CONTABLES =================
-app.get('/api/pedidos/admin/closures/preview', authenticateToken, async (req, res) => {
-  try {
-    const { startDate, endDate } = req.query;
-    if (!startDate || !endDate) return res.status(400).json({ error: 'Faltan fechas' });
+function validateClosurePeriod(startDate, endDate) {
+  if (!validIsoDate(startDate) || !validIsoDate(endDate)) return 'Las fechas del cierre no son válidas';
+  if (startDate > endDate) return 'La fecha inicial debe ser anterior o igual a la final';
+  const days = Math.round((new Date(`${endDate}T12:00:00Z`) - new Date(`${startDate}T12:00:00Z`)) / 86400000);
+  if (days > 366) return 'Un cierre no puede abarcar más de 366 días';
+  return '';
+}
 
-    // 1. Pedidos (Ventas, Métodos de Pago, Categorías)
-    const ordersRes = await pool.query(
-      `SELECT * FROM pedidos_app_orders 
-       WHERE DATE(created_at) >= $1 AND DATE(created_at) <= $2 
-       AND status IN ('Entregado', 'Listo', 'Completado')`,
-      [startDate, endDate]
-    );
-    const orders = ordersRes.rows;
-
-    let totalVentas = 0;
-    let totalPedidos = orders.length;
-    let metodosPago = {};
-    let productosVendidos = {}; // productId -> quantity
-    let categoriasVentas = {};
-
-    orders.forEach(o => {
-      totalVentas += Number(o.total || 0);
-
-      const pm = o.payment_method || 'efectivo';
-      metodosPago[pm] = (metodosPago[pm] || 0) + Number(o.total || 0);
-
-      const cart = o.cart_json || [];
-      cart.forEach(item => {
-        productosVendidos[item.id] = (productosVendidos[item.id] || 0) + (item.quantity || 1);
-        const cat = item.category || 'General';
-        categoriasVentas[cat] = (categoriasVentas[cat] || 0) + (Number(item.price || 0) * (item.quantity || 1));
-      });
-    });
-
-    // 2. Costos directos configurados en cada producto vendible
-    let totalCostoProduccion = 0;
-    let desgloseCostos = {};
-    const productCosts = await pool.query(`
-      SELECT id, title, inventory_unit_cost FROM pedidos_app_products
-      WHERE id::text = ANY($1::text[])
-    `, [Object.keys(productosVendidos)]);
-    productCosts.rows.forEach(product => {
-      const qSold = productosVendidos[product.id] || 0;
-      if (qSold > 0) {
-        const productCost = Number(product.inventory_unit_cost || 0) * qSold;
-        totalCostoProduccion += productCost;
-        desgloseCostos[product.title] = productCost;
-      }
-    });
-
-    // 3. Gastos
-    const expensesRes = await pool.query(
-      `SELECT * FROM pedidos_app_expenses 
-       WHERE expense_date >= $1 AND expense_date <= $2`,
-      [startDate, endDate]
-    );
-    let totalGastos = 0;
-    let desgloseGastos = {};
-    expensesRes.rows.forEach(e => {
-      totalGastos += Number(e.amount);
-      desgloseGastos[e.category] = (desgloseGastos[e.category] || 0) + Number(e.amount);
-    });
-
-    const invRes = await pool.query(`
-      SELECT title AS product_name, inventory_unit AS unit,
-             COALESCE(stock, 0) AS quantity,
-             COALESCE(stock, 0) * inventory_unit_cost AS value
-      FROM pedidos_app_products WHERE track_stock = TRUE ORDER BY title
-    `);
-    const inventarioSnapshot = invRes.rows.map(r => ({
-      name: r.product_name,
-      unit: r.unit,
-      quantity: Number(r.quantity),
-      value: Number(r.value)
-    }));
-
-    const utilidadNeta = totalVentas - totalCostoProduccion - totalGastos;
-
-    res.json({
-      status: 'ok',
-      data: {
-        totalVentas,
-        totalPedidos,
-        totalCostoProduccion,
-        totalGastos,
-        utilidadNeta,
-        metodosPago,
-        categoriasVentas,
-        desgloseCostos,
-        desgloseGastos,
-        inventarioSnapshot
-      }
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+async function buildClosurePreview(startDate, endDate, db = pool) {
+  const [ordersRes, cancelledRes, expensesRes, invRes] = await Promise.all([
+    db.query(`SELECT id, total, payment_method, cart_json, delivery_provider_type, external_delivery_cost FROM pedidos_app_orders
+      WHERE (created_at AT TIME ZONE 'America/Bogota')::date BETWEEN $1 AND $2
+        AND status IN ('Entregado', 'Completado')`, [startDate, endDate]),
+    db.query(`SELECT COUNT(*)::int AS count FROM pedidos_app_orders
+      WHERE (created_at AT TIME ZONE 'America/Bogota')::date BETWEEN $1 AND $2 AND status = 'Cancelado'`, [startDate, endDate]),
+    db.query('SELECT category, amount FROM pedidos_app_expenses WHERE expense_date BETWEEN $1 AND $2', [startDate, endDate]),
+    db.query(`SELECT title AS product_name, inventory_unit AS unit, COALESCE(stock, 0) AS quantity,
+      COALESCE(stock, 0) * COALESCE(inventory_unit_cost, 0) AS value
+      FROM pedidos_app_products WHERE track_stock = TRUE ORDER BY title`),
+  ]);
+  const metodosPago = {};
+  const productosVendidos = {};
+  const categoriasVentas = {};
+  let totalVentas = 0;
+  for (const order of ordersRes.rows) {
+    const total = Number(order.total || 0);
+    totalVentas += total;
+    const method = String(order.payment_method || 'Efectivo').trim();
+    metodosPago[method] = (metodosPago[method] || 0) + total;
+    const cart = Array.isArray(order.cart_json) ? order.cart_json : [];
+    for (const item of cart) {
+      const id = String(item.id || item.product_id || item.productId || '');
+      const quantity = Math.max(0, Number(item.quantity || item.qty || 1));
+      if (id) productosVendidos[id] = (productosVendidos[id] || 0) + quantity;
+      const category = String(item.category || 'General');
+      categoriasVentas[category] = (categoriasVentas[category] || 0) + Number(item.price || 0) * quantity;
+    }
   }
+  const productIds = Object.keys(productosVendidos);
+  const productCosts = productIds.length
+    ? await db.query('SELECT id, title, inventory_unit_cost FROM pedidos_app_products WHERE id::text = ANY($1::text[])', [productIds])
+    : { rows: [] };
+  let totalCostoProduccion = 0;
+  const desgloseCostos = {};
+  for (const product of productCosts.rows) {
+    const cost = Number(product.inventory_unit_cost || 0) * Number(productosVendidos[product.id] || 0);
+    totalCostoProduccion += cost;
+    if (cost) desgloseCostos[product.title] = cost;
+  }
+  let totalGastos = 0;
+  const desgloseGastos = {};
+  for (const expense of expensesRes.rows) {
+    const amount = Number(expense.amount || 0);
+    totalGastos += amount;
+    const category = expense.category || 'Otros';
+    desgloseGastos[category] = (desgloseGastos[category] || 0) + amount;
+  }
+  const costoDomiciliosExternos = ordersRes.rows.reduce((sum, order) =>
+    sum + (String(order.delivery_provider_type || '').startsWith('external_') ? Number(order.external_delivery_cost || 0) : 0), 0);
+  if (costoDomiciliosExternos > 0) {
+    totalGastos += costoDomiciliosExternos;
+    desgloseGastos['Operadores logísticos externos'] = costoDomiciliosExternos;
+  }
+  const inventarioSnapshot = invRes.rows.map((row) => ({ name: row.product_name, unit: row.unit,
+    quantity: Number(row.quantity), value: Number(row.value) }));
+  const efectivoEsperado = Object.entries(metodosPago).reduce((sum, [method, value]) =>
+    sum + (/efectivo/i.test(method) ? Number(value) : 0), 0);
+  return {
+    totalVentas, totalPedidos: ordersRes.rows.length, pedidosCancelados: cancelledRes.rows[0].count,
+    totalCostoProduccion, totalGastos, costoDomiciliosExternos,
+    utilidadNeta: totalVentas - totalCostoProduccion - totalGastos,
+    margenBruto: totalVentas ? ((totalVentas - totalCostoProduccion) / totalVentas) * 100 : 0,
+    efectivoEsperado, metodosPago, categoriasVentas, desgloseCostos, desgloseGastos, inventarioSnapshot,
+  };
+}
+
+app.get('/api/pedidos/admin/closures/preview', authenticateToken, async (req, res) => {
+  const { startDate, endDate } = req.query;
+  const invalid = validateClosurePeriod(startDate, endDate);
+  if (invalid) return res.status(400).json({ error: invalid });
+  try { res.json({ status: 'ok', data: await buildClosurePreview(startDate, endDate) }); }
+  catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/pedidos/admin/closures', authenticateToken, async (req, res) => {
+  const { startDate, endDate } = req.body;
+  const invalid = validateClosurePeriod(startDate, endDate);
+  if (invalid) return res.status(400).json({ error: invalid });
+  const notes = String(req.body.notes || '').trim().slice(0, 2000);
+  const client = await pool.connect();
   try {
-    const { startDate, endDate, summary, closedBy } = req.body;
-    const { rows } = await pool.query(
-      `INSERT INTO pedidos_app_closures 
-       (start_date, end_date, total_sales, total_costs, total_expenses, net_profit, summary_json, closed_by) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [startDate, endDate, summary.totalVentas, summary.totalCostoProduccion, summary.totalGastos, summary.utilidadNeta, JSON.stringify(summary), closedBy]
-    );
-    res.json({ status: 'ok', data: rows[0] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    await client.query('BEGIN');
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('distrito-accounting-closure'))");
+    const overlap = await client.query(`SELECT id FROM pedidos_app_closures
+      WHERE status='Cerrado' AND NOT (end_date < $1 OR start_date > $2) LIMIT 1`, [startDate, endDate]);
+    if (overlap.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: `El período se cruza con el cierre #${overlap.rows[0].id}` });
+    }
+    const summary = await buildClosurePreview(startDate, endDate, client);
+    const cashCounted = req.body.cashCounted === '' || req.body.cashCounted == null
+      ? summary.efectivoEsperado : Math.round(Number(req.body.cashCounted));
+    if (!Number.isFinite(cashCounted) || cashCounted < 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'El efectivo contado no es válido' });
+    }
+    summary.efectivoContado = cashCounted;
+    summary.diferenciaEfectivo = cashCounted - summary.efectivoEsperado;
+    const { rows } = await client.query(`INSERT INTO pedidos_app_closures
+      (start_date, end_date, total_sales, total_costs, total_expenses, net_profit,
+       summary_json, closed_by, orders_count, cancelled_orders, cash_expected,
+       cash_counted, cash_difference, notes)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+    [startDate, endDate, summary.totalVentas, summary.totalCostoProduccion, summary.totalGastos,
+      summary.utilidadNeta, JSON.stringify(summary), req.user?.username || req.body.closedBy || 'Administrador',
+      summary.totalPedidos, summary.pedidosCancelados, summary.efectivoEsperado, cashCounted,
+      summary.diferenciaEfectivo, notes]);
+    await client.query('COMMIT');
+    res.status(201).json({ status: 'ok', data: rows[0] });
+  } catch (err) { await client.query('ROLLBACK').catch(() => {}); res.status(500).json({ error: err.message }); }
+  finally { client.release(); }
 });
 
 app.get('/api/pedidos/admin/closures', authenticateToken, async (req, res) => {
@@ -2605,10 +3299,15 @@ app.get('/api/pedidos/admin/closures', authenticateToken, async (req, res) => {
 });
 
 app.put('/api/pedidos/admin/closures/:id/reopen', authenticateToken, async (req, res) => {
+  const reason = String(req.body.reason || '').trim();
+  if (reason.length < 5) return res.status(400).json({ error: 'Indica el motivo de reapertura (mínimo 5 caracteres)' });
   try {
     const { id } = req.params;
-    await pool.query("UPDATE pedidos_app_closures SET status = 'Abierto' WHERE id = $1", [id]);
-    res.json({ status: 'ok' });
+    const { rows } = await pool.query(`UPDATE pedidos_app_closures SET status='Abierto', reopened_at=NOW(),
+      reopened_by=$2, reopen_reason=$3 WHERE id=$1 AND status='Cerrado' RETURNING *`,
+    [id, req.user?.username || 'Administrador', reason.slice(0, 1000)]);
+    if (!rows.length) return res.status(404).json({ error: 'Cierre no encontrado o ya está abierto' });
+    res.json({ status: 'ok', data: rows[0] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2753,7 +3452,9 @@ async function syncDeliveryCapacity(client, userId, roleId, requestedCapacity) {
       throw error;
     }
   }
-  const capacity = normalizeMaxActiveOrders(requestedCapacity, DEFAULT_MAX_ACTIVE_ORDERS);
+  const defaults = await client.query('SELECT default_max_driver_capacity FROM pedidos_app_settings WHERE id=1');
+  const defaultCapacity = normalizeMaxActiveOrders(defaults.rows[0]?.default_max_driver_capacity, DEFAULT_MAX_ACTIVE_ORDERS);
+  const capacity = normalizeMaxActiveOrders(requestedCapacity, defaultCapacity);
   await client.query(`
     INSERT INTO pedidos_app_delivery_profiles (user_id, max_active_orders)
     VALUES ($1, $2)
@@ -2781,7 +3482,7 @@ app.get('/api/pedidos/admin/users', authenticateToken, requirePermission('Usuari
       LEFT JOIN pedidos_app_sessions s ON s.user_id = u.id
       GROUP BY u.id, r.name, profile.max_active_orders
       ORDER BY COALESCE(u.name, u.username), u.username
-    `, [DEFAULT_MAX_ACTIVE_ORDERS, CARRYING_DELIVERY_STATUSES]);
+    `, [DEFAULT_MAX_ACTIVE_ORDERS, COMMITTED_DELIVERY_STATUSES]);
     res.json({ status: 'ok', data: rows });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
@@ -2839,12 +3540,14 @@ app.put('/api/pedidos/admin/users/:id', authenticateToken, requirePermission('Us
     if (status && status !== 'Activo') {
       await client.query("UPDATE pedidos_app_sessions SET status='Cerrada por desactivación', revoked_at=NOW() WHERE user_id=$1 AND status='Activa'", [id]);
     }
+    if (deliveryCapacity !== null) {
+      await deliveryOrderService.appendDomainEvent(client, 'driver_capacity_updated', 'driver', id, {
+        driverId: Number(id), userId: Number(id), capacity: deliveryCapacity,
+      });
+    }
     await client.query('COMMIT');
     const { password: _password, ...auditData } = req.body;
     await logActivity(req.user.id, 'Usuarios', 'Editar', `Usuario editado ID: ${id}`, req.ip, '', '', auditData);
-    if (deliveryCapacity !== null) {
-      deliveryRealtime.publish('driver_capacity_updated', { userId: Number(id), capacity: deliveryCapacity });
-    }
     res.json({ status: 'ok', max_active_orders: deliveryCapacity });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
@@ -3006,6 +3709,7 @@ app.delete('/api/pedidos/admin/permissions/:id', authenticateToken, requirePermi
 const PORT = process.env.PORT || 3001;
 const horariosApi = require('./horarios_api')(app, pool, authenticateToken);
 getHorariosStatus = horariosApi.getHorariosStatus;
+
 deliveryRealtime = require('./delivery_api')(app, {
   pool,
   authenticateToken,
@@ -3016,6 +3720,83 @@ deliveryRealtime = require('./delivery_api')(app, {
   publicVapidKey,
   authorizeTrackingAccess,
   trackingSecret: JWT_SECRET,
+  deliveryOrderService,
+  publishEphemeral: async (eventName, payload) => {
+    const eventId = crypto.randomUUID();
+    await pool.query(`
+      INSERT INTO pedidos_app_domain_events
+        (event_id,aggregate_type,aggregate_id,event_type,payload)
+      VALUES ($1,'realtime',$2,$3,$4::jsonb)
+    `, [eventId, String(payload.deliveryUserId || payload.orderId || 'global'), eventName,
+      JSON.stringify({ ...payload, eventId })]);
+  },
+});
+require('./external_delivery_api')(app, {
+  pool,
+  authenticateToken,
+  requirePermission,
+});
+require('./crm_api')(app, {
+  pool,
+  authenticateToken,
+  requirePermission,
+  whatsappClient,
+});
+
+const deliveryOutbox = createOutboxDispatcher({
+  pool,
+  onEvent: async (event) => {
+    await crmWorker.handleDomainEvent(event);
+    const payload = {
+      ...(event.payload || {}),
+      eventId: event.event_id,
+      occurredAt: event.occurred_at,
+    };
+    if (event.event_type === 'session_revoked') {
+      deliveryRealtime.publish('session_revoked', payload, (connectedClient) => (
+        Number(connectedClient.userId) === Number(payload.userId)
+      ));
+    } else if (event.aggregate_type === 'realtime' && event.event_type === 'delivery_location') {
+      deliveryRealtime.publish('delivery_location', payload, (connectedClient) => {
+        const orderIds = Array.isArray(payload.orderIds) ? payload.orderIds.map(Number) : [Number(payload.orderId)];
+        if (connectedClient.kind === 'tracking') return orderIds.includes(Number(connectedClient.orderId));
+        if (DELIVERY_ROLES.has(connectedClient.role)) return Number(connectedClient.userId) === Number(payload.deliveryUserId);
+        return true;
+      });
+    } else if (event.aggregate_type === 'order') {
+      deliveryRealtime.publish(event.event_type, payload);
+      if (event.event_type === 'order_reserved') deliveryRealtime.publish('order_available', payload);
+      if (event.event_type === 'order_accepted') deliveryRealtime.publish('order_assigned', payload);
+      deliveryRealtime.publish('order_updated', payload);
+    } else if (event.aggregate_type === 'driver') {
+      deliveryRealtime.publish(event.event_type, payload);
+      deliveryRealtime.publish('driver_presence', payload);
+    } else {
+      deliveryRealtime.publish(event.event_type, payload);
+    }
+  },
+});
+deliveryOutbox.start()
+  .then(() => { outboxReady = true; })
+  .catch((error) => {
+    outboxReady = false;
+    console.error(JSON.stringify({ level: 'error', component: 'outbox-start', message: error.message }));
+  });
+crmWorker.start()
+  .then(() => { crmWorkerReady = true; })
+  .catch((error) => {
+    crmWorkerReady = false;
+    console.error(JSON.stringify({ level: 'error', component: 'crm-worker-start', message: error.message }));
+  });
+
+app.use('/api/pedidos', (req, res) => {
+  res.status(404).json({ error: 'Ruta API no encontrada' });
+});
+
+app.use((error, req, res, next) => {
+  if (!req.path.startsWith('/api/pedidos')) return next(error);
+  console.error('Error HTTP no controlado:', error.message);
+  return res.status(error.statusCode || 500).json({ error: 'No fue posible procesar la solicitud' });
 });
 
 if (!process.env.VERCEL) {

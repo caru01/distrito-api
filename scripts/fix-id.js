@@ -1,8 +1,5 @@
-const { Pool } = require('pg');
-const pool = new Pool({
-  connectionString: 'postgresql://neondb_owner:npg_pClfKMJxI0a7@ep-round-lake-at22joot-pooler.c-9.us-east-1.aws.neon.tech/neondb?sslmode=require',
-  ssl: { rejectUnauthorized: false }
-});
+const { createPool } = require('../src/db');
+const pool = createPool();
 async function run() {
   try {
     console.log('Fixing UUID default for pedidos_app_products.id...');

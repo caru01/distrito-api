@@ -57,7 +57,7 @@ function assertTemporaryLinkActive(order) {
   }
 }
 
-async function authorizeTrackingAccess(pool, { orderId, phone, token, secret }) {
+async function authorizeTrackingAccess(pool, { orderId, phone, code, token, secret }) {
   const normalizedId = Number(orderId);
   if (!Number.isInteger(normalizedId) || normalizedId < 1) {
     throw trackingError('Número de pedido inválido.', 400, 'TRACKING_ORDER_INVALID');
@@ -74,6 +74,19 @@ async function authorizeTrackingAccess(pool, { orderId, phone, token, secret }) 
     if (!rows.length) throw trackingError('No encontramos el pedido.', 404, 'TRACKING_ORDER_NOT_FOUND');
     assertTemporaryLinkActive(rows[0]);
     return { order: rows[0], method: 'token' };
+  }
+
+  const shortCode = normalizePhone(code).slice(-4);
+  if (shortCode.length === 4) {
+    const { rows } = await pool.query(`
+      SELECT id, status, delivery_status, delivery_completed_at, delivered_at,
+             completed_at, updated_at
+      FROM pedidos_app_orders
+      WHERE id = $1 AND RIGHT(regexp_replace(customer_phone, '\\D', '', 'g'), 4) = $2
+    `, [normalizedId, shortCode]);
+    if (!rows.length) throw trackingError('El código de seguimiento no es válido.', 404, 'TRACKING_ORDER_NOT_FOUND');
+    assertTemporaryLinkActive(rows[0]);
+    return { order: rows[0], method: 'code' };
   }
 
   const phoneSuffix = normalizePhone(phone).slice(-10);
