@@ -501,7 +501,7 @@ function createCrmWorker({ pool, whatsappClient, instanceId = `crm-${process.pid
     const delaySeconds = Math.min(3600, 30 * (2 ** Math.max(0, job.attempts - 1)));
     const status = finalFailure ? 'FAILED' : 'RETRY';
     await pool.query(`
-      UPDATE pedidos_app_crm_message_jobs SET status=$2,available_at=CASE WHEN $2='RETRY' THEN NOW()+($3*INTERVAL '1 second') ELSE available_at END,
+      UPDATE pedidos_app_crm_message_jobs SET status=$2,available_at=CASE WHEN $2::text='RETRY' THEN NOW()+($3*INTERVAL '1 second') ELSE available_at END,
         locked_at=NULL,locked_by=NULL,last_error_code=$4,last_error_message=$5,updated_at=NOW() WHERE id=$1
     `, [job.id, status, delaySeconds, safeText(error.code || 'WHATSAPP_SEND_FAILED', 80), safeText(error.message, 500)]);
     if (job.message_id) await pool.query(`
