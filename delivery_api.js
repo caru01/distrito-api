@@ -457,11 +457,14 @@ module.exports = function registerDeliveryApi(app, dependencies) {
                (SELECT COUNT(*)::int FROM pedidos_app_orders active_order
                 WHERE active_order.delivery_user_id = u.id
                   AND active_order.delivery_status IN ('Recogido','En camino')) AS on_the_way_orders,
-               CASE WHEN profile.rating_count > 0 THEN ROUND(profile.rating_sum / profile.rating_count, 2) ELSE 0 END AS rating
+               CASE WHEN COALESCE(profile.rating_count, 0) > 0 THEN ROUND(profile.rating_sum / profile.rating_count, 2) ELSE 0 END AS rating
         FROM pedidos_app_users u
-        JOIN pedidos_app_delivery_profiles profile ON profile.user_id = u.id
+        LEFT JOIN pedidos_app_delivery_profiles profile ON profile.user_id = u.id
         WHERE u.id = $1
       `, [req.user.id]);
+      if (!rows.length) {
+        return res.status(404).json({ error: 'Perfil de domiciliario no encontrado' });
+      }
       const settingsResult = await pool.query(`
         SELECT gps_delivery_interval_seconds, gps_free_interval_seconds,
                presence_heartbeat_interval_seconds, presence_timeout_seconds,
@@ -480,6 +483,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
       res.status(500).json({ error: 'No fue posible cargar el perfil' });
     }
   });
+
 
   app.put('/api/pedidos/delivery/profile', authenticateToken, requireDeliveryUser, async (req, res) => {
     const client = await pool.connect();
