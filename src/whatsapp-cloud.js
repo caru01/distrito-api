@@ -112,7 +112,7 @@ function createWhatsAppClient({ env = process.env, fetchImpl = global.fetch } = 
     // Evitamos mandar "to" repetido dentro del contenido, YCloud pide from, to, type.
     const { to: _dropTo, ...restPayload } = normalizedPayload;
     
-    return apiRequest(`whatsapp/messages/sendDirectly`, {
+    return apiRequest(`whatsapp/messages`, {
       method: 'POST',
       body: JSON.stringify({ 
          from: config.phoneNumber, 
