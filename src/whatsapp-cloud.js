@@ -97,8 +97,8 @@ function createWhatsAppClient({ env = process.env, fetchImpl = global.fetch } = 
     try { body = raw ? JSON.parse(raw) : {}; } catch { body = { error: { message: 'Respuesta no JSON del proveedor' } }; }
     if (!response.ok) {
       throw providerError('WHATSAPP_SEND_FAILED', 'YCloud rechazó la operación.', 502, {
-        providerCode: body.code || null,
-        providerMessage: String(body.message || '').slice(0, 300),
+        providerCode: body.error?.code || null,
+        providerMessage: String(body.error?.message || '').slice(0, 300),
       });
     }
     return body;
