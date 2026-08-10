@@ -177,15 +177,71 @@ module.exports = function registerCrmApi(app, {
     return res.status(403).json({ code: 'WHATSAPP_WEBHOOK_VERIFICATION_FAILED', error: 'No fue posible verificar el webhook.' });
   });
 
+  function mapYCloudToMetaPayload(ycloudPayload) {
+    if (ycloudPayload?.type === 'whatsapp.inbound_message.received' && ycloudPayload.whatsappInboundMessage) {
+      const msg = ycloudPayload.whatsappInboundMessage;
+      return {
+        object: 'whatsapp_business_account',
+        entry: [{
+          changes: [{
+            field: 'messages',
+            value: {
+              metadata: { phone_number_id: msg.to },
+              contacts: [{ profile: { name: msg.sender?.name || '' }, wa_id: msg.from }],
+              messages: [{
+                from: msg.from,
+                id: msg.id,
+                timestamp: msg.timestamp,
+                type: msg.type,
+                text: msg.text,
+                image: msg.image,
+                document: msg.document,
+                audio: msg.audio,
+                video: msg.video,
+                interactive: msg.interactive,
+                context: msg.context
+              }]
+            }
+          }]
+        }]
+      };
+    }
+    
+    if (ycloudPayload?.type === 'whatsapp.message.updated' && ycloudPayload.whatsappMessage) {
+      const msg = ycloudPayload.whatsappMessage;
+      return {
+        object: 'whatsapp_business_account',
+        entry: [{
+          changes: [{
+            field: 'messages',
+            value: {
+              statuses: [{
+                id: msg.id,
+                status: msg.status,
+                timestamp: msg.timestamp,
+                errors: msg.errors
+              }]
+            }
+          }]
+        }]
+      };
+    }
+    
+    return null;
+  }
+
   app.post('/api/pedidos/webhooks/whatsapp', requireWebhookHttps, webhookLimiter, async (req, res) => {
     try {
-      const signature = req.headers['x-hub-signature-256'];
-      if (!validateWebhookSignature(req.rawBody, signature, whatsappClient.config.appSecret)) {
-        return res.status(401).json({ code: 'WHATSAPP_WEBHOOK_SIGNATURE_INVALID', error: 'Firma de webhook inválida.' });
+      const signature = req.headers['ycloud-signature'];
+      if (!validateWebhookSignature(req.rawBody, signature, whatsappClient.config.verifyToken)) {
+        return res.status(401).json({ code: 'WHATSAPP_WEBHOOK_SIGNATURE_INVALID', error: 'Firma de webhook de YCloud inválida.' });
       }
       logWebhookPayload(req);
-      if (req.body?.object !== 'whatsapp_business_account') return res.status(200).json({ status: 'ignored' });
-      const registration = await registerWhatsAppWebhook(pool, req.body, req.rawBody);
+      
+      const mappedPayload = mapYCloudToMetaPayload(req.body);
+      if (!mappedPayload) return res.status(200).json({ status: 'ignored' });
+      
+      const registration = await registerWhatsAppWebhook(pool, mappedPayload, req.rawBody);
       const response = res.status(200).json({ status: 'accepted', duplicate: registration.duplicate });
       setImmediate(() => {
         void processStoredWhatsAppWebhook(pool, registration.eventKey)
