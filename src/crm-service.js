@@ -458,8 +458,8 @@ function createCrmWorker({ pool, whatsappClient, instanceId = `crm-${process.pid
   }
 
   async function completeJob(job, response) {
-    const providerMessageId = response.messages?.[0]?.id;
-    if (!providerMessageId) throw crmError('WHATSAPP_SEND_FAILED', 'Meta no devolvió el identificador del mensaje.', 502);
+    const providerMessageId = response.id || response.messages?.[0]?.id;
+    if (!providerMessageId) throw crmError('WHATSAPP_SEND_FAILED', 'El proveedor no devolvió el identificador del mensaje.', 502);
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -501,17 +501,17 @@ function createCrmWorker({ pool, whatsappClient, instanceId = `crm-${process.pid
     const delaySeconds = Math.min(3600, 30 * (2 ** Math.max(0, job.attempts - 1)));
     const status = finalFailure ? 'FAILED' : 'RETRY';
     await pool.query(`
-      UPDATE pedidos_app_crm_message_jobs SET status=$2,available_at=CASE WHEN $2::text='RETRY' THEN NOW()+($3*INTERVAL '1 second') ELSE available_at END,
+      UPDATE pedidos_app_crm_message_jobs SET status=$2::varchar,available_at=CASE WHEN $2::varchar='RETRY' THEN NOW()+($3*INTERVAL '1 second') ELSE available_at END,
         locked_at=NULL,locked_by=NULL,last_error_code=$4,last_error_message=$5,updated_at=NOW() WHERE id=$1
     `, [job.id, status, delaySeconds, safeText(error.code || 'WHATSAPP_SEND_FAILED', 80), safeText(error.message, 500)]);
     if (job.message_id) await pool.query(`
-      UPDATE pedidos_app_crm_messages SET status=$2,error_code=$3,error_message=$4,
-        failed_at=CASE WHEN $2='FAILED' THEN NOW() ELSE failed_at END WHERE id=$1
+      UPDATE pedidos_app_crm_messages SET status=$2::varchar,error_code=$3,error_message=$4,
+        failed_at=CASE WHEN $2::varchar='FAILED' THEN NOW() ELSE failed_at END WHERE id=$1
     `, [job.message_id, finalFailure ? 'FAILED' : 'QUEUED', safeText(error.code, 80), safeText(error.message, 500)]);
     let campaignId = null;
     if (job.campaign_recipient_id) {
       const recipient = await pool.query(`
-        UPDATE pedidos_app_crm_campaign_recipients SET status=$2,failed_at=CASE WHEN $2='FAILED' THEN NOW() ELSE failed_at END,updated_at=NOW()
+        UPDATE pedidos_app_crm_campaign_recipients SET status=$2::varchar,failed_at=CASE WHEN $2::varchar='FAILED' THEN NOW() ELSE failed_at END,updated_at=NOW()
         WHERE id=$1 RETURNING campaign_id
       `, [job.campaign_recipient_id, finalFailure ? 'FAILED' : 'QUEUED']);
       campaignId = recipient.rows[0]?.campaign_id;
