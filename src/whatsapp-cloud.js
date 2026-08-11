@@ -3,20 +3,15 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { whatsappRecipient } = require('./crm/phone');
 
-const unicodeModuleUrl = pathToFileURL(path.resolve(__dirname, '..', '..', 'distrito-shared', 'src', 'unicode.js')).href;
-let unicodeModulePromise;
-
-function normalizePayload(value, normalizeText) {
-  if (typeof value === 'string') return normalizeText(value);
-  if (Array.isArray(value)) return value.map((item) => normalizePayload(item, normalizeText));
+function normalizePayload(value) {
+  if (typeof value === 'string') return value.replace(/[\u200B-\u200D\uFEFF]/g, '');
+  if (Array.isArray(value)) return value.map((item) => normalizePayload(item));
   if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, normalizePayload(item, normalizeText)]));
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, normalizePayload(item)]));
 }
 
 async function normalizeOutboundPayload(payload) {
-  unicodeModulePromise ||= import(unicodeModuleUrl);
-  const { normalizeUnicodeText } = await unicodeModulePromise;
-  return normalizePayload(payload, normalizeUnicodeText);
+  return normalizePayload(payload);
 }
 
 function safeEqual(left, right) {
