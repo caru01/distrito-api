@@ -433,8 +433,8 @@ module.exports = function registerDeliveryApi(app, dependencies) {
         INSERT INTO pedidos_app_delivery_profiles (user_id, availability_status)
         VALUES ($1, 'Desconectado')
         ON CONFLICT (user_id) DO UPDATE
-        SET connected_at = CASE WHEN pedidos_app_delivery_profiles.shift_active THEN NOW() ELSE connected_at END,
-            last_seen_at = CASE WHEN pedidos_app_delivery_profiles.shift_active THEN NOW() ELSE last_seen_at END,
+        SET connected_at = CASE WHEN pedidos_app_delivery_profiles.shift_active THEN NOW() ELSE pedidos_app_delivery_profiles.connected_at END,
+            last_seen_at = CASE WHEN pedidos_app_delivery_profiles.shift_active THEN NOW() ELSE pedidos_app_delivery_profiles.last_seen_at END,
             updated_at = NOW()
       `, [req.user.id]);
       const { rows } = await pool.query(`
