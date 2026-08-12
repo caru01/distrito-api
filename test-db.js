@@ -1,0 +1,1 @@
+require('dotenv').config(); require('./src/db.js').createPool().query("SELECT id, job_type, status, last_error_message, created_at, payload FROM pedidos_app_crm_message_jobs WHERE job_type='TEMPLATE' ORDER BY id DESC LIMIT 5").then(r => console.log(JSON.stringify(r.rows, null, 2))).finally(()=>process.exit(0));

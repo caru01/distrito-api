@@ -134,7 +134,7 @@ function createWhatsAppClient({ env = process.env, fetchImpl = global.fetch } = 
       return Promise.resolve({ success: true });
     },
     listTemplates: () => {
-      return apiRequest(`whatsapp/templates?limit=250`, { method: 'GET' })
+      return apiRequest(`whatsapp/templates?limit=100`, { method: 'GET' })
         .then(res => {
           return { data: res.items || [] };
         });
