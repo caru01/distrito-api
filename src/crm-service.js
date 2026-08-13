@@ -317,7 +317,7 @@ async function processStoredWhatsAppWebhook(pool, eventKey) {
     let processed = 0;
     
     if (eventType === 'YCLOUD_INBOUND_RECEIVED') {
-      const msg = body.whatsappMessage;
+      const msg = body.whatsappInboundMessage || body.whatsappMessage;
       if (msg) {
         const result = await processInboundMessage(client, { metadata: { phone_number_id: msg.to?.replace(/^whatsapp:/, '') } }, msg, body.customerProfile || {});
         if (!result.duplicate) processed += 1;
