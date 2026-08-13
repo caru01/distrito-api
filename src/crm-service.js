@@ -230,7 +230,7 @@ async function processMessageStatus(client, statusEvent) {
 }
 
 function whatsappWebhookEventType(body) {
-  if (body?.type === 'whatsapp.message.updated') return 'YCLOUD_MESSAGE_UPDATED';
+  if (body?.type === 'whatsapp.message.updated' || body?.type === 'whatsapp.smb.message.echoes') return 'YCLOUD_MESSAGE_UPDATED';
   if (body?.type === 'whatsapp.inbound_message.received') return 'YCLOUD_INBOUND_RECEIVED';
 
   let messages = 0;
