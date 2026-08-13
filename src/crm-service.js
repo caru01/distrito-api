@@ -141,14 +141,17 @@ async function ensureConversation(client, { contactId, providerAccountId = null,
 }
 
 async function processInboundMessage(client, value, message, contactProfile) {
-  const phone = message.from || contactProfile?.wa_id;
-  const contact = await ensureContact(client, { phone, name: contactProfile?.profile?.name, source: 'WHATSAPP' });
+  const phone = String(message.from || contactProfile?.wa_id || '').replace(/^whatsapp:/, '');
+  const contactName = contactProfile?.profile?.name || contactProfile?.name || '';
+  const contact = await ensureContact(client, { phone, name: contactName, source: 'WHATSAPP' });
   const conversation = await ensureConversation(client, {
     contactId: contact.id,
-    providerAccountId: value.metadata?.phone_number_id || null,
+    providerAccountId: value?.metadata?.phone_number_id || message.to?.replace(/^whatsapp:/, '') || null,
   });
   const type = ['text','image','audio','video','document','location','interactive'].includes(message.type) ? message.type : 'unknown';
-  const occurredAt = /^\d+$/.test(String(message.timestamp || '')) ? new Date(Number(message.timestamp) * 1000) : new Date();
+  let occurredAt = new Date();
+  if (/^\d+$/.test(String(message.timestamp || ''))) occurredAt = new Date(Number(message.timestamp) * 1000);
+  else if (message.sendAt || message.createdAt) occurredAt = new Date(message.sendAt || message.createdAt);
   const inserted = await client.query(`
     INSERT INTO pedidos_app_crm_messages
       (conversation_id,contact_id,provider_message_id,context_provider_message_id,direction,message_type,
@@ -227,6 +230,9 @@ async function processMessageStatus(client, statusEvent) {
 }
 
 function whatsappWebhookEventType(body) {
+  if (body?.type === 'whatsapp.message.updated') return 'YCLOUD_MESSAGE_UPDATED';
+  if (body?.type === 'whatsapp.inbound_message.received') return 'YCLOUD_INBOUND_RECEIVED';
+
   let messages = 0;
   let statuses = 0;
   for (const entry of body?.entry || []) {
@@ -240,6 +246,49 @@ function whatsappWebhookEventType(body) {
   if (messages) return 'MESSAGES';
   if (statuses) return 'MESSAGE_STATUSES';
   return 'WHATSAPP_EVENT';
+}
+
+async function processYCloudMessageUpdated(client, msg) {
+  const providerMessageId = msg.id;
+  const status = String(msg.status || '').toLowerCase();
+  
+  const current = await client.query(`
+    SELECT message.id,message.status,message.contact_id,message.conversation_id,recipient.id AS recipient_id,recipient.campaign_id
+    FROM pedidos_app_crm_messages message
+    LEFT JOIN pedidos_app_crm_campaign_recipients recipient ON recipient.message_id=message.id OR recipient.provider_message_id=message.provider_message_id
+    WHERE message.provider_message_id=$1 LIMIT 1
+  `, [providerMessageId]);
+
+  if (current.rows.length) {
+    const nextStatus = MESSAGE_STATUS[status];
+    if (!nextStatus) return { ignored: true };
+    const occurredAtTimestamp = Math.floor(new Date(msg.updatedAt || msg.deliverAt || msg.sendAt || Date.now()).getTime() / 1000);
+    return await processMessageStatus(client, { id: providerMessageId, status, timestamp: occurredAtTimestamp });
+  } else {
+    // Si no existe, es un OUTBOUND enviado desde YCloud directamente
+    const toPhone = String(msg.to || '').replace(/^whatsapp:/, '').replace(/^\+/, '');
+    const contact = await ensureContact(client, { phone: toPhone, name: '', source: 'WHATSAPP' });
+    const providerAccountId = String(msg.wabaId || msg.phoneNumberId || msg.from || '').replace(/^whatsapp:/, '');
+    const conversation = await ensureConversation(client, { contactId: contact.id, providerAccountId });
+    
+    const type = ['text','image','audio','video','document','location','interactive','template'].includes(msg.type) ? msg.type : 'unknown';
+    const textBody = msg.text?.body || msg.image?.caption || msg.video?.caption || msg.document?.caption || '';
+    const occurredAt = new Date(msg.sendAt || msg.createdAt || Date.now());
+    const initialStatus = MESSAGE_STATUS[status] || 'SENT';
+    
+    const inserted = await client.query(`
+      INSERT INTO pedidos_app_crm_messages
+        (conversation_id,contact_id,provider_message_id,direction,message_type,text_body,content,status,sent_at,created_at)
+      VALUES ($1,$2,$3,'OUTBOUND',$4,$5,$6::jsonb,$7,$8,$8)
+      ON CONFLICT DO NOTHING RETURNING id
+    `, [conversation.id, contact.id, providerMessageId, type, textBody, JSON.stringify(msg), initialStatus, occurredAt]);
+        
+    if (inserted.rowCount) {
+      await client.query(`UPDATE pedidos_app_crm_conversations SET last_message_at=$2,last_outbound_at=$2,updated_at=NOW() WHERE id=$1`, [conversation.id, occurredAt]);
+      await client.query('SELECT pedidos_app_crm_refresh_contact($1)', [contact.id]);
+    }
+    return { ignored: false, createdOutbound: true };
+  }
 }
 
 async function registerWhatsAppWebhook(pool, body, rawBody) {
@@ -264,19 +313,35 @@ async function processStoredWhatsAppWebhook(pool, eventKey) {
     `, [eventKey]);
     if (!rows.length) { await client.query('COMMIT'); return { duplicate: true, processed: 0 }; }
     const body = rows[0].payload || {};
+    const eventType = rows[0].event_type || whatsappWebhookEventType(body);
     let processed = 0;
-    for (const entry of body.entry || []) {
-      for (const change of entry.changes || []) {
-        if (change.field !== 'messages') continue;
-        const value = change.value || {};
-        const profiles = new Map((value.contacts || []).map((profile) => [profile.wa_id, profile]));
-        for (const message of value.messages || []) {
-          const result = await processInboundMessage(client, value, message, profiles.get(message.from));
-          if (!result.duplicate) processed += 1;
-        }
-        for (const statusEvent of value.statuses || []) {
-          const result = await processMessageStatus(client, statusEvent);
-          if (!result.ignored) processed += 1;
+    
+    if (eventType === 'YCLOUD_INBOUND_RECEIVED') {
+      const msg = body.whatsappMessage;
+      if (msg) {
+        const result = await processInboundMessage(client, { metadata: { phone_number_id: msg.to?.replace(/^whatsapp:/, '') } }, msg, body.customerProfile || {});
+        if (!result.duplicate) processed += 1;
+      }
+    } else if (eventType === 'YCLOUD_MESSAGE_UPDATED') {
+      const msg = body.whatsappMessage;
+      if (msg) {
+        const result = await processYCloudMessageUpdated(client, msg);
+        if (!result.ignored) processed += 1;
+      }
+    } else {
+      for (const entry of body.entry || []) {
+        for (const change of entry.changes || []) {
+          if (change.field !== 'messages') continue;
+          const value = change.value || {};
+          const profiles = new Map((value.contacts || []).map((profile) => [profile.wa_id, profile]));
+          for (const message of value.messages || []) {
+            const result = await processInboundMessage(client, value, message, profiles.get(message.from));
+            if (!result.duplicate) processed += 1;
+          }
+          for (const statusEvent of value.statuses || []) {
+            const result = await processMessageStatus(client, statusEvent);
+            if (!result.ignored) processed += 1;
+          }
         }
       }
     }
