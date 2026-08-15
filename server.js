@@ -1818,7 +1818,10 @@ app.put('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => 
         const currentOrder = currentRows[0];
         const ownDelivery = String(currentOrder.delivery_type || '').toLowerCase() === 'domicilio'
           && !String(currentOrder.delivery_provider_type || 'own').startsWith('external_');
-        if (ownDelivery && ['En camino', 'Entregado'].includes(status)) {
+        
+        const isAdmin = ['Admin', 'Administrador', 'Super Administrador', 'super_admin'].includes(req.user?.role || req.user?.role_name || '');
+
+        if (ownDelivery && ['En camino', 'Entregado'].includes(status) && !isAdmin) {
           await client.query('ROLLBACK');
           return res.status(409).json({
             status: 'error',
