@@ -89,29 +89,102 @@ async function scheduleEventAutomations(client, triggerType, contactId, entityTy
   return rowCount;
 }
 
-async function ensureContact(client, { phone, name = null, source = 'WHATSAPP', email = null, address = null, barrio = null }) {
+async function ensureContact(client, { phone = null, bsuid = null, username = null, name = null, source = 'WHATSAPP', email = null, address = null, barrio = null }) {
   const normalizedPhone = normalizePhoneE164(phone);
-  if (!normalizedPhone) throw crmError('CRM_PHONE_INVALID', 'El teléfono no se puede normalizar a E.164.', 400);
-  const { rows } = await client.query(`
-    INSERT INTO pedidos_app_crm_contacts
-      (normalized_phone,display_name,email,address,barrio,source,first_contact_at,last_contact_at,status)
-    VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW(),'PROSPECTO')
-    ON CONFLICT (normalized_phone) DO UPDATE SET
-      display_name=COALESCE(NULLIF(EXCLUDED.display_name,''),pedidos_app_crm_contacts.display_name),
-      email=COALESCE(NULLIF(EXCLUDED.email,''),pedidos_app_crm_contacts.email),
-      address=COALESCE(NULLIF(EXCLUDED.address,''),pedidos_app_crm_contacts.address),
-      barrio=COALESCE(NULLIF(EXCLUDED.barrio,''),pedidos_app_crm_contacts.barrio),
-      first_contact_at=COALESCE(pedidos_app_crm_contacts.first_contact_at,NOW()),
-      last_contact_at=NOW(),updated_at=NOW()
-    RETURNING *
-  `, [normalizedPhone, safeText(name, 255) || null, safeText(email, 255) || null,
-    safeText(address, 1000) || null, safeText(barrio, 255) || null, safeText(source, 40) || 'OTRO']);
-  const contact = rows[0];
-  await client.query(`
-    INSERT INTO pedidos_app_crm_contact_customers (contact_id,customer_id)
-    SELECT $1,id FROM pedidos_app_customers WHERE phone_e164=$2
-    ON CONFLICT (customer_id) DO UPDATE SET contact_id=EXCLUDED.contact_id
-  `, [contact.id, normalizedPhone]);
+  const safeBsuid = safeText(bsuid, 128) || null;
+  const safeUsername = safeText(username, 128) || null;
+  const safeName = safeText(name, 255) || null;
+  const safeSource = safeText(source, 40) || 'OTRO';
+
+  // Validar: se necesita al menos teléfono O bsuid
+  if (!normalizedPhone && !safeBsuid) {
+    throw crmError('CRM_PHONE_INVALID', 'El teléfono no se puede normalizar a E.164.', 400);
+  }
+
+  let contact = null;
+
+  // ── Resolución por BSUID (prioridad alta) ───────────────────────────────
+  if (safeBsuid) {
+    // 1. Buscar contacto existente por bsuid
+    const byBsuid = await client.query(
+      'SELECT * FROM pedidos_app_crm_contacts WHERE bsuid=$1 LIMIT 1',
+      [safeBsuid]
+    );
+    if (byBsuid.rows.length) {
+      contact = byBsuid.rows[0];
+      // Enriquecer con teléfono si llegó y no tenía
+      await client.query(`
+        UPDATE pedidos_app_crm_contacts SET
+          normalized_phone=COALESCE(normalized_phone,$2),
+          display_name=COALESCE(NULLIF($3,''),display_name),
+          username=COALESCE(NULLIF($4,''),username),
+          marketing_opt_in=TRUE,
+          last_contact_at=NOW(),updated_at=NOW()
+        WHERE id=$1
+        RETURNING *
+      `, [contact.id, normalizedPhone, safeName, safeUsername]);
+    } else if (normalizedPhone) {
+      // 2. Puede que ya exista por teléfono; vincularle el bsuid
+      const byPhone = await client.query(
+        'SELECT * FROM pedidos_app_crm_contacts WHERE normalized_phone=$1 LIMIT 1',
+        [normalizedPhone]
+      );
+      if (byPhone.rows.length) {
+        contact = byPhone.rows[0];
+        await client.query(`
+          UPDATE pedidos_app_crm_contacts SET
+            bsuid=COALESCE(bsuid,$2),
+            display_name=COALESCE(NULLIF($3,''),display_name),
+            username=COALESCE(NULLIF($4,''),username),
+            marketing_opt_in=TRUE,
+            last_contact_at=NOW(),updated_at=NOW()
+          WHERE id=$1
+        `, [contact.id, safeBsuid, safeName, safeUsername]);
+      }
+    }
+
+    if (!contact) {
+      // 3. Nuevo contacto con bsuid (puede que sin teléfono)
+      const inserted = await client.query(`
+        INSERT INTO pedidos_app_crm_contacts
+          (normalized_phone,bsuid,username,display_name,email,address,barrio,source,
+           first_contact_at,last_contact_at,status,marketing_opt_in)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW(),'PROSPECTO',TRUE)
+        RETURNING *
+      `, [normalizedPhone, safeBsuid, safeUsername, safeName,
+          safeText(email, 255) || null, safeText(address, 1000) || null,
+          safeText(barrio, 255) || null, safeSource]);
+      contact = inserted.rows[0];
+    }
+  } else {
+    // ── Resolución solo por teléfono (flujo original intacto) ───────────
+    const { rows } = await client.query(`
+      INSERT INTO pedidos_app_crm_contacts
+        (normalized_phone,display_name,email,address,barrio,source,first_contact_at,last_contact_at,status,marketing_opt_in)
+      VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW(),'PROSPECTO',TRUE)
+      ON CONFLICT (normalized_phone) DO UPDATE SET
+        display_name=COALESCE(NULLIF(EXCLUDED.display_name,''),pedidos_app_crm_contacts.display_name),
+        email=COALESCE(NULLIF(EXCLUDED.email,''),pedidos_app_crm_contacts.email),
+        address=COALESCE(NULLIF(EXCLUDED.address,''),pedidos_app_crm_contacts.address),
+        barrio=COALESCE(NULLIF(EXCLUDED.barrio,''),pedidos_app_crm_contacts.barrio),
+        marketing_opt_in=TRUE,
+        first_contact_at=COALESCE(pedidos_app_crm_contacts.first_contact_at,NOW()),
+        last_contact_at=NOW(),updated_at=NOW()
+      RETURNING *
+    `, [normalizedPhone, safeName, safeText(email, 255) || null,
+        safeText(address, 1000) || null, safeText(barrio, 255) || null, safeSource]);
+    contact = rows[0];
+  }
+
+  // Vincular con pedidos_app_customers si hay teléfono
+  if (normalizedPhone) {
+    await client.query(`
+      INSERT INTO pedidos_app_crm_contact_customers (contact_id,customer_id)
+      SELECT $1,id FROM pedidos_app_customers WHERE phone_e164=$2
+      ON CONFLICT (customer_id) DO UPDATE SET contact_id=EXCLUDED.contact_id
+    `, [contact.id, normalizedPhone]);
+  }
+
   await client.query('SELECT pedidos_app_crm_refresh_contact($1)', [contact.id]);
   return contact;
 }
@@ -141,9 +214,19 @@ async function ensureConversation(client, { contactId, providerAccountId = null,
 }
 
 async function processInboundMessage(client, value, message, contactProfile) {
-  const phone = String(message.from || contactProfile?.wa_id || '').replace(/^whatsapp:/, '');
-  const contactName = contactProfile?.profile?.name || contactProfile?.name || '';
-  const contact = await ensureContact(client, { phone, name: contactName, source: 'WHATSAPP' });
+  // Extraer teléfono — solo si es numérico (los BSUIDs tienen letras: CO.xxxx)
+  const rawFrom = String(message.from || contactProfile?.wa_id || '').replace(/^whatsapp:/, '');
+  const phone = /^\d+$/.test(rawFrom) ? rawFrom : null;
+
+  // Extraer BSUID (Business-Scoped User ID) — llega cuando el número está oculto
+  const bsuid = message.fromUserId || contactProfile?.fromUserId || null;
+
+  // Extraer username (@Ricaurte_blanco) — solo para display, nunca como identificador
+  const username = contactProfile?.username || null;
+
+  const contactName = contactProfile?.profile?.name || contactProfile?.name || username || '';
+
+  const contact = await ensureContact(client, { phone, bsuid, username, name: contactName, source: 'WHATSAPP' });
   const conversation = await ensureConversation(client, {
     contactId: contact.id,
     providerAccountId: value?.metadata?.phone_number_id || message.to?.replace(/^whatsapp:/, '') || null,
@@ -265,9 +348,13 @@ async function processYCloudMessageUpdated(client, msg) {
     const occurredAtTimestamp = Math.floor(new Date(msg.updatedAt || msg.deliverAt || msg.sendAt || Date.now()).getTime() / 1000);
     return await processMessageStatus(client, { id: providerMessageId, status, timestamp: occurredAtTimestamp });
   } else {
-    // Si no existe, es un OUTBOUND enviado desde YCloud directamente
-    const toPhone = String(msg.to || '').replace(/^whatsapp:/, '').replace(/^\+/, '');
-    const contact = await ensureContact(client, { phone: toPhone, name: '', source: 'WHATSAPP' });
+    // Si no existe, es un OUTBOUND enviado desde YCloud directamente (echo)
+    // El destinatario puede tener número oculto → usar toUserId/recipientUserId como bsuid
+    const rawTo = String(msg.to || '').replace(/^whatsapp:/, '').replace(/^\+/, '');
+    const toPhone = /^\d+$/.test(rawTo) ? rawTo : null;
+    const bsuid = msg.toUserId || msg.recipientUserId || null;
+    const username = msg.customerProfile?.username || null;
+    const contact = await ensureContact(client, { phone: toPhone, bsuid, username, name: '', source: 'WHATSAPP' });
     const providerAccountId = String(msg.wabaId || msg.phoneNumberId || msg.from || '').replace(/^whatsapp:/, '');
     const conversation = await ensureConversation(client, { contactId: contact.id, providerAccountId });
     
@@ -399,13 +486,16 @@ async function queueConversationMessage(pool, { conversationId, actorUserId, tex
   try {
     await client.query('BEGIN');
     const conversationResult = await client.query(`
-      SELECT conversation.*,contact.normalized_phone,contact.no_contact,contact.marketing_opt_out
+      SELECT conversation.*,contact.normalized_phone,contact.bsuid,contact.no_contact,contact.marketing_opt_out
       FROM pedidos_app_crm_conversations conversation
       JOIN pedidos_app_crm_contacts contact ON contact.id=conversation.contact_id
       WHERE conversation.id=$1 FOR UPDATE OF conversation
     `, [conversationId]);
     if (!conversationResult.rows.length) throw crmError('CONVERSATION_NOT_FOUND', 'Conversación no encontrada.', 404);
     const conversation = conversationResult.rows[0];
+    // sendTo: usar teléfono si existe, sino BSUID (usuario con número oculto)
+    const sendTo = conversation.normalized_phone || conversation.bsuid;
+    if (!sendTo) throw crmError('CONTACT_NO_SEND_ADDRESS', 'El contacto no tiene teléfono ni identificador de WhatsApp disponible.', 409);
     if (conversation.no_contact || conversation.marketing_opt_out) throw crmError('CONTACT_OPTED_OUT', 'El contacto solicitó no recibir mensajes.', 409);
     let jobType;
     let messageType;
@@ -416,7 +506,7 @@ async function queueConversationMessage(pool, { conversationId, actorUserId, tex
       if (!templateRow || templateRow.status !== 'APPROVED') throw crmError('WHATSAPP_TEMPLATE_INVALID', 'La plantilla debe estar aprobada por Meta.', 409);
       jobType = 'TEMPLATE';
       messageType = 'template';
-      payload = { to: conversation.normalized_phone, name: templateRow.name, language: templateRow.language, components: template.components || [] };
+      payload = { to: sendTo, name: templateRow.name, language: templateRow.language, components: template.components || [] };
     } else {
       const cleanText = safeText(text, 4096);
       if (!cleanText) throw crmError('WHATSAPP_MESSAGE_EMPTY', 'Escribe un mensaje antes de enviarlo.', 400);
@@ -425,7 +515,7 @@ async function queueConversationMessage(pool, { conversationId, actorUserId, tex
       }
       jobType = 'TEXT';
       messageType = 'text';
-      payload = { to: conversation.normalized_phone, body: cleanText };
+      payload = { to: sendTo, body: cleanText };
     }
     const key = safeText(idempotencyKey, 180) || crypto.randomUUID();
     const existing = await client.query('SELECT message_id FROM pedidos_app_crm_message_jobs WHERE job_key=$1', [`manual:${actorUserId}:${key}`]);
@@ -839,4 +929,6 @@ module.exports = {
   registerWhatsAppWebhook,
   queueConversationMessage,
   scheduleEventAutomations,
+  // Funciones internas expuestas solo para pruebas unitarias
+  __test__: { ensureContact, ensureConversation, processInboundMessage, processYCloudMessageUpdated },
 };

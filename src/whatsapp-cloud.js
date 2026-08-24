@@ -100,21 +100,34 @@ function createWhatsAppClient({ env = process.env, fetchImpl = global.fetch } = 
   }
 
   async function send(payload) {
-    const to = whatsappRecipient(payload.to);
-    if (!to) throw providerError('WHATSAPP_RECIPIENT_INVALID', 'El contacto no tiene un teléfono válido.', 400);
+    const rawDest = String(payload.to || '').trim();
+    // Validación apropiada BSUID vs E164
+    // Un número E.164 siempre tiene puros dígitos (y opcional +) y no letras
+    const isE164 = /^\+?\d{5,15}$/.test(rawDest);
+    
+    const toPhone = isE164 ? whatsappRecipient(rawDest) : null;
+    const recipientBsuid = !isE164 && rawDest.length > 5 ? rawDest : null;
+    
+    if (!toPhone && !recipientBsuid) throw providerError('WHATSAPP_RECIPIENT_INVALID', 'El contacto no tiene un identificador válido (teléfono o BSUID).', 400);
     const normalizedPayload = await normalizeOutboundPayload(payload);
     
-    // Evitamos mandar "to" repetido dentro del contenido, YCloud pide from, to, type.
-    const { to: _dropTo, ...restPayload } = normalizedPayload;
+    const { to: _dropTo, recipient: _dropRecipient, ...restPayload } = normalizedPayload;
+    
+    const requestBody = { 
+       from: config.phoneNumber,
+       type: payload.type,
+       ...restPayload 
+    };
+
+    if (toPhone) {
+      requestBody.to = toPhone;
+    } else {
+      requestBody.recipient = recipientBsuid;
+    }
     
     return apiRequest(`whatsapp/messages`, {
       method: 'POST',
-      body: JSON.stringify({ 
-         from: config.phoneNumber, 
-         to, 
-         type: payload.type,
-         ...restPayload 
-      }),
+      body: JSON.stringify(requestBody),
     });
   }
 

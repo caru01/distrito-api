@@ -587,8 +587,8 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
     }
 
     const { customer, cart } = req.body;
-    if (!customer || typeof customer !== 'object' || !customer.name || !customer.phone) {
-      return res.status(400).json({ error: 'Nombre y teléfono del cliente son obligatorios.' });
+    if (!customer || typeof customer !== 'object' || !customer.name || (!customer.phone && !customer.crm_contact_id)) {
+      return res.status(400).json({ error: 'Nombre, teléfono o contacto del cliente son obligatorios.' });
     }
     client = await pool.connect();
     await client.query('BEGIN');
@@ -613,20 +613,18 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
     }
 
     // Format phone to always start with 57
-    let formattedPhone = customer.phone ? customer.phone.replace(/\D/g, '') : '';
-    if (formattedPhone.length === 10) {
+    let formattedPhone = customer.phone ? customer.phone.replace(/\D/g, '') : null;
+    if (formattedPhone && formattedPhone.length === 10) {
       formattedPhone = '57' + formattedPhone;
-    } else if (formattedPhone.length > 10 && !formattedPhone.startsWith('57')) {
+    } else if (formattedPhone && formattedPhone.length > 10 && !formattedPhone.startsWith('57')) {
       formattedPhone = '57' + formattedPhone;
     }
 
-    // Check for admin token to allow status override
-    let finalStatus = 'Nuevo';
-    if (req.body.status) {
-      const authHeader = req.headers['authorization'];
-      if (authHeader) {
+    let finalStatus = req.body.status || 'Nuevo';
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+      const token = req.headers.authorization.split(' ')[1];
+      if (token !== process.env.ADMIN_TOKEN) {
         try {
-          const token = authHeader.split(' ')[1];
           const jwt = require('jsonwebtoken');
           const user = jwt.verify(token, process.env.JWT_SECRET);
           if (user && user.role && !DELIVERY_ROLES.has(user.role) && ORDER_STATUSES.has(req.body.status)) {
@@ -641,9 +639,9 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
       `INSERT INTO pedidos_app_orders 
        (customer_name, customer_phone, address, barrio, delivery_type, payment_method, total, cart_json, source, notes, voucher_reference, created_at,
         delivery_fee, delivery_reference, change_required, delivery_latitude, delivery_longitude,
-        delivery_place_id, delivery_location_adjusted, delivery_apartment, delivery_tower, delivery_floor, status)
+        delivery_place_id, delivery_location_adjusted, delivery_apartment, delivery_tower, delivery_floor, status, crm_contact_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12, NOW()),
-         $15, $13, $14, $16, $17, $18, $19, $20, $21, $22, $23)
+         $15, $13, $14, $16, $17, $18, $19, $20, $21, $22, $23, $24)
        RETURNING id`,
       [
         customer.name,
@@ -670,7 +668,8 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
         isDelivery ? String(customer.apartment || '').trim().slice(0, 50) || null : null,
         isDelivery ? String(customer.tower || '').trim().slice(0, 50) || null : null,
         isDelivery ? String(customer.floor || '').trim().slice(0, 30) || null : null,
-        finalStatus
+        finalStatus,
+        customer.crm_contact_id || null
       ]
     );
 
@@ -1518,20 +1517,30 @@ app.get('/api/pedidos/admin/clientes/buscar', authenticateToken, async (req, res
     const { q } = req.query;
     if (!q || q.length < 1) return res.json({ status: 'ok', clientes: [] });
 
+    // Se busca en CRM contacts para incluir clientes BSUID (username) y clientes normales (phone/name)
     const { rows } = await pool.query(`
-      SELECT customer.name,customer.phone,customer.address,customer.barrio,
-             customer.preferred_delivery_type AS delivery_type,
-             customer.preferred_payment_method AS payment_method,
-             COALESCE(contact.source,'MANUAL') AS source,customer.notes
-      FROM pedidos_app_customers customer
-      LEFT JOIN pedidos_app_crm_contact_customers link ON link.customer_id=customer.id
-      LEFT JOIN pedidos_app_crm_contacts contact ON contact.id=link.contact_id
-      WHERE customer.name ILIKE $1
-         OR customer.phone LIKE $2
-         OR customer.phone_e164 LIKE $3
-      ORDER BY COALESCE(contact.last_purchase_at,customer.updated_at) DESC NULLS LAST
-      LIMIT 10
-    `, [`${q}%`, `${q.replace(/\D/g, '')}%`, `%${q.replace(/\D/g, '')}%`]);
+      SELECT 
+        c.display_name AS name,
+        COALESCE(c.normalized_phone, '') AS phone,
+        c.address,
+        c.barrio,
+        'domicilio' AS delivery_type,
+        'efectivo' AS payment_method,
+        COALESCE(c.source, 'MANUAL') AS source,
+        '' AS notes,
+        c.id AS crm_contact_id,
+        c.username,
+        c.bsuid
+      FROM pedidos_app_crm_contacts c
+      WHERE c.display_name ILIKE $1
+         OR c.normalized_phone LIKE $2
+         OR COALESCE(c.username, '') ILIKE $1
+         OR COALESCE(c.bsuid, '') ILIKE $1
+         OR c.id::text = $3
+      ORDER BY c.last_purchase_at DESC NULLS LAST, c.updated_at DESC
+      LIMIT 15
+    `, [`%${q}%`, `%${q.replace(/\D/g, '')}%`, q]);
+    
     res.json({ status: 'ok', clientes: rows });
   } catch (error) {
     res.status(500).json({ status: 'error', error: error.message });

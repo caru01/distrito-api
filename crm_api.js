@@ -56,7 +56,7 @@ function contactFilters(query = {}) {
 const CONTACT_FILTER_SQL = `
   contact.deleted_at IS NULL
   AND ($1='%%' OR contact.display_name ILIKE $1 OR contact.normalized_phone ILIKE $1
-    OR contact.email ILIKE $1 OR contact.barrio ILIKE $1
+    OR contact.email ILIKE $1 OR contact.barrio ILIKE $1 OR contact.username ILIKE $1
     OR ($2::text IS NOT NULL AND contact.normalized_phone=$2)
     OR ($9::text<>'' AND EXISTS (
       SELECT 1 FROM pedidos_app_orders filter_order
