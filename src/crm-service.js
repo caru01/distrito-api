@@ -52,16 +52,36 @@ function buildCampaignTemplateComponents(configuration = {}, renderedValues = {}
     'contact.name','contact.phone','contact.barrio','contact.orders_count','contact.total_spent',
   ]);
   const components = [];
-  for (const type of ['header','body']) {
-    const sources = Array.isArray(configuration[type]) ? configuration[type] : [];
-    if (!sources.length) continue;
-    const parameters = sources.map((source) => {
+
+  // ── Header media (image / video / document) ──────────────────────────
+  const headerMedia = configuration.header_image || configuration.header_video || configuration.header_document;
+  if (headerMedia) {
+    const url = String(headerMedia).trim();
+    if (url && /^https:\/\/.+/i.test(url)) {
+      const mediaType = configuration.header_image ? 'image'
+        : configuration.header_video ? 'video' : 'document';
+      components.push({ type: 'header', parameters: [{ type: mediaType, [mediaType]: { link: url } }] });
+    }
+  } else if (Array.isArray(configuration.header) && configuration.header.length) {
+    // Header con variables de texto (comportamiento original preservado)
+    const parameters = configuration.header.map((source) => {
       const normalized = String(source || '');
       if (!allowedSources.has(normalized)) throw crmError('WHATSAPP_TEMPLATE_INVALID', `Variable no permitida: ${normalized || '(vacía)'}.`, 400);
       return { type: 'text', text: String(renderedValues[normalized] ?? '').slice(0, 1024) };
     });
-    components.push({ type, parameters });
+    components.push({ type: 'header', parameters });
   }
+
+  // ── Body (sin cambios respecto al original) ──────────────────────────
+  if (Array.isArray(configuration.body) && configuration.body.length) {
+    const parameters = configuration.body.map((source) => {
+      const normalized = String(source || '');
+      if (!allowedSources.has(normalized)) throw crmError('WHATSAPP_TEMPLATE_INVALID', `Variable no permitida: ${normalized || '(vacía)'}.`, 400);
+      return { type: 'text', text: String(renderedValues[normalized] ?? '').slice(0, 1024) };
+    });
+    components.push({ type: 'body', parameters });
+  }
+
   return components;
 }
 
@@ -701,7 +721,7 @@ function createCrmWorker({ pool, whatsappClient, instanceId = `crm-${process.pid
       const { rows } = await client.query(`
         SELECT recipient.*,campaign.variables,campaign.status AS campaign_status,
           template.name AS template_name,template.language AS template_language,
-          contact.normalized_phone,contact.id AS contact_id
+          contact.normalized_phone,contact.bsuid,contact.id AS contact_id
         FROM pedidos_app_crm_campaign_recipients recipient
         JOIN pedidos_app_crm_campaigns campaign ON campaign.id=recipient.campaign_id
         JOIN pedidos_app_crm_whatsapp_templates template ON template.id=campaign.template_id AND template.status='APPROVED'
@@ -729,7 +749,7 @@ function createCrmWorker({ pool, whatsappClient, instanceId = `crm-${process.pid
           VALUES ($1,$2,$3,'TEMPLATE',$4::jsonb,40)
           ON CONFLICT (job_key) DO NOTHING
         `, [`campaign:${recipient.campaign_id}:${recipient.contact_id}`, message.rows[0].id, recipient.id,
-          JSON.stringify({ to: recipient.normalized_phone, name: recipient.template_name, language: recipient.template_language, components })]);
+          JSON.stringify({ to: recipient.normalized_phone || recipient.bsuid, name: recipient.template_name, language: recipient.template_language, components })]);
       }
       await client.query('COMMIT');
       return rows.length;
