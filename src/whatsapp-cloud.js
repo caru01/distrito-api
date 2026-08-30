@@ -43,7 +43,7 @@ function configuration(env = process.env) {
   const values = {
     // Usamos las variables originales de Meta pero mapeadas para YCloud
     apiKey: String(env.WHATSAPP_ACCESS_TOKEN || env.YCLOUD_API_KEY || '').trim(),
-    verifyToken: String(env.WHATSAPP_VERIFY_TOKEN || env.YCLOUD_WEBHOOK_SECRET || '').trim(),
+    verifyToken: String(env.WHATSAPP_VERIFY_TOKEN || env.WHATSAPP_WEBHOOK_VERIFY_TOKEN || env.YCLOUD_WEBHOOK_SECRET || '').trim(),
     phoneNumberId: String(env.WHATSAPP_PHONE_NUMBER_ID || env.YCLOUD_PHONE_NUMBER || '').trim(),
     graphVersion: 'v2.0', // Mock para que no falle el dashboard
   };

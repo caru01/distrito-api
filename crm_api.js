@@ -465,6 +465,10 @@ module.exports = function registerCrmApi(app, {
     try{const segment=await readSegment(pool,req.params.id);const counts=await segmentCount(pool,segment);await pool.query(`UPDATE pedidos_app_crm_segments SET estimated_count=$2,last_evaluated_at=NOW() WHERE id=$1`,[segment.id,counts.total]);res.json({status:'ok',...counts});}catch(error){respondError(res,error);}
   });
 
+  app.delete('/api/pedidos/admin/crm/segments/:id', authenticateToken, requirePermission('CRM','segmentos'), async(req,res)=>{
+    const client=await pool.connect();try{await client.query('BEGIN');const {rowCount}=await client.query(`DELETE FROM pedidos_app_crm_segments WHERE id=$1`,[req.params.id]);if(rowCount===0)throw crmError('SEGMENT_NOT_FOUND','Segmento no encontrado.',404);await audit(client,req,'SEGMENT_DELETED','crm_segment',req.params.id);await client.query('COMMIT');res.json({status:'ok'});}catch(error){await client.query('ROLLBACK').catch(()=>{});if(error.code==='23503')respondError(res,crmError('SEGMENT_IN_USE','No se puede borrar porque está en uso por una campaña.',409));else respondError(res,error);}finally{client.release();}
+  });
+
   app.get('/api/pedidos/admin/crm/templates', authenticateToken, requirePermission('CRM','campanas'), async(req,res)=>{
     try{const {rows}=await pool.query(`SELECT * FROM pedidos_app_crm_whatsapp_templates ORDER BY updated_at DESC`);res.json({status:'ok',templates:rows});}catch(error){respondError(res,error);}
   });
@@ -523,6 +527,10 @@ module.exports = function registerCrmApi(app, {
 
   app.put('/api/pedidos/admin/crm/automations/:id', authenticateToken, requirePermission('CRM','automatizaciones'), async(req,res)=>{
     try{const {rows}=await pool.query(`UPDATE pedidos_app_crm_automations SET name=$2,description=$3,trigger_type=$4,trigger_config=$5::jsonb,conditions=$6::jsonb,wait_minutes=$7,action_type=$8,action_config=$9::jsonb,is_active=$10,updated_by=$11,updated_at=NOW() WHERE id=$1 RETURNING *`,[req.params.id,cleanText(req.body.name,180),cleanText(req.body.description,500)||null,req.body.trigger_type,JSON.stringify(req.body.trigger_config||{}),JSON.stringify(req.body.conditions||{combinator:'AND',rules:[]}),Math.max(0,Math.min(525600,Number(req.body.wait_minutes)||0)),req.body.action_type,JSON.stringify(req.body.action_config||{}),Boolean(req.body.is_active),req.user.id]);if(!rows.length)throw crmError('AUTOMATION_NOT_FOUND','Automatización no encontrada.',404);res.json({status:'ok',automation:rows[0]});}catch(error){respondError(res,error);}
+  });
+
+  app.delete('/api/pedidos/admin/crm/automations/:id', authenticateToken, requirePermission('CRM','automatizaciones'), async(req,res)=>{
+    const client=await pool.connect();try{await client.query('BEGIN');const {rowCount}=await client.query(`DELETE FROM pedidos_app_crm_automations WHERE id=$1`,[req.params.id]);if(rowCount===0)throw crmError('AUTOMATION_NOT_FOUND','Automatización no encontrada.',404);await audit(client,req,'AUTOMATION_DELETED','crm_automation',req.params.id);await client.query('COMMIT');res.json({status:'ok'});}catch(error){await client.query('ROLLBACK').catch(()=>{});respondError(res,error);}finally{client.release();}
   });
 
   app.get('/api/pedidos/admin/crm/reports', authenticateToken, requirePermission('CRM','reportes'), async(req,res)=>{

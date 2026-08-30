@@ -3086,7 +3086,20 @@ function buildReportData(orderRows, purchaseRows) {
       pagos: Object.entries(salesByPayment).sort((a, b) => b[1] - a[1]).map(([name, value]) => ({ name, value: Math.round(value) })),
       estados: Object.entries(ordersByStatus).sort((a, b) => b[1] - a[1]).map(([name, value]) => ({ name, value })),
     },
-    lists: { productos: topProducts, clientes: clientList },
+    lists: { 
+      productos: topProducts, 
+      clientes: clientList,
+      domicilios: Object.entries(
+        externalOrders.reduce((acc, o) => {
+          const provider = String(o.delivery_provider_type || 'Desconocido').replace('external_', '');
+          if (!acc[provider]) acc[provider] = { name: provider, count: 0, cost: 0, revenue: 0 };
+          acc[provider].count += 1;
+          acc[provider].cost += Number(o.external_delivery_cost || 0);
+          acc[provider].revenue += Number(o.delivery_fee || 0);
+          return acc;
+        }, {})
+      ).map(([,v]) => v)
+    },
   };
 }
 
@@ -3155,11 +3168,25 @@ app.get('/api/pedidos/admin/expenses', authenticateToken, async (req, res) => {
 
 app.post('/api/pedidos/admin/expenses', authenticateToken, async (req, res) => {
   try {
-    const { category, description, amount, expense_date } = req.body;
+    const { category, description, amount, subtotal, iva, iva_percentage, expense_date, payment_method, receipt_url, items, provider } = req.body;
     const { rows } = await pool.query(
-      `INSERT INTO pedidos_app_expenses (category, description, amount, expense_date) 
-       VALUES ($1, $2, $3, COALESCE($4, CURRENT_DATE)) RETURNING *`,
-      [category, description, amount, expense_date || null]
+      `INSERT INTO pedidos_app_expenses (category, description, amount, subtotal, iva, iva_percentage, expense_date, payment_method, receipt_url, items, provider) 
+       VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, CURRENT_DATE), COALESCE($8, 'Efectivo'), $9, $10, $11) RETURNING *`,
+      [category, description, amount, subtotal || 0, iva || 0, iva_percentage || 0, expense_date || null, payment_method || 'Efectivo', receipt_url || null, items ? JSON.stringify(items) : '[]', provider || null]
+    );
+    res.json({ status: 'ok', data: rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/pedidos/admin/expenses/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { category, description, amount, subtotal, iva, iva_percentage, expense_date, payment_method, receipt_url, items, provider } = req.body;
+    const { rows } = await pool.query(
+      `UPDATE pedidos_app_expenses SET category = $1, description = $2, amount = $3, subtotal = $4, iva = $5, iva_percentage = $6, expense_date = COALESCE($7, CURRENT_DATE), payment_method = COALESCE($8, 'Efectivo'), receipt_url = $9, items = $10, provider = $11 WHERE id = $12 RETURNING *`,
+      [category, description, amount, subtotal || 0, iva || 0, iva_percentage || 0, expense_date || null, payment_method || 'Efectivo', receipt_url || null, items ? JSON.stringify(items) : '[]', provider || null, id]
     );
     res.json({ status: 'ok', data: rows[0] });
   } catch (err) {
