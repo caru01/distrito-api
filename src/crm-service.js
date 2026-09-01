@@ -426,7 +426,7 @@ async function processStoredWhatsAppWebhook(pool, eventKey) {
     if (eventType === 'YCLOUD_INBOUND_RECEIVED') {
       const msg = body.whatsappInboundMessage || body.whatsappMessage;
       if (msg) {
-        const result = await processInboundMessage(client, { metadata: { phone_number_id: msg.to?.replace(/^whatsapp:/, '') } }, msg, body.customerProfile || {});
+        const result = await processInboundMessage(client, { metadata: { phone_number_id: msg.to?.replace(/^whatsapp:/, '') } }, msg, msg.customerProfile || {});
         if (!result.duplicate) processed += 1;
       }
     } else if (eventType === 'YCLOUD_MESSAGE_UPDATED') {
