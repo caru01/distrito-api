@@ -707,9 +707,7 @@ app.get('/api/pedidos/rastrear/:id', trackingLimiter, async (req, res) => {
   try {
     if (!process.env.DATABASE_URL) return res.status(503).json({ error: 'Base de datos no configurada' });
     const id = parseInt(req.params.id, 10);
-    const code = (req.query.c || '').replace(/\D/g, '').slice(-4);
     if (!id || id <= 0) return res.status(400).json({ error: 'ID de pedido inválido' });
-    if (!code || code.length < 4) return res.status(400).json({ error: 'Código de verificación requerido' });
 
     const { rows } = await pool.query(`
       SELECT order_data.id, order_data.customer_name, order_data.customer_phone,
@@ -721,7 +719,7 @@ app.get('/api/pedidos/rastrear/:id', trackingLimiter, async (req, res) => {
              order_data.picked_up_at, order_data.on_the_way_at,
              order_data.delivery_duration_seconds, order_data.delivery_user_id,
              order_data.delivery_provider_type, order_data.external_delivery_company_id,
-             order_data.external_eta_minutes, company.name AS external_company_name,
+              order_data.external_eta_minutes, company.name AS external_company_name,
              CASE WHEN order_data.delivery_status = 'En camino'
                        AND profile.last_location_at >= COALESCE(order_data.picked_up_at,order_data.on_the_way_at)
                   THEN profile.current_latitude ELSE NULL END AS driver_latitude,
@@ -747,10 +745,30 @@ app.get('/api/pedidos/rastrear/:id', trackingLimiter, async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: 'Pedido no encontrado' });
     const order = rows[0];
 
-    // Verificar los últimos 4 dígitos del teléfono
-    const phoneDigits = (order.customer_phone || '').replace(/\D/g, '').slice(-4);
-    if (phoneDigits !== code) {
-      return res.status(403).json({ error: 'Código de verificación incorrecto' });
+    const tokenParam = String(req.query.token || '').trim();
+    if (tokenParam) {
+      try {
+        const payload = verifyTrackingToken(tokenParam, JWT_SECRET);
+        if (Number(payload.orderId) !== id) {
+          return res.status(403).json({ error: 'Token de seguimiento no corresponde al pedido' });
+        }
+      } catch (e) {
+        return res.status(403).json({ error: 'Token de seguimiento inválido o caducado' });
+      }
+    } else {
+      const code = (req.query.c || '').replace(/\D/g, '').slice(-4);
+      if (!code || code.length < 4) return res.status(400).json({ error: 'Código de verificación requerido' });
+      const phoneDigits = (order.customer_phone || '').replace(/\D/g, '').slice(-4);
+      if (phoneDigits) {
+        if (phoneDigits !== code) {
+          return res.status(403).json({ error: 'Código de verificación incorrecto' });
+        }
+      } else {
+        const orderCode = String(order.id).padStart(4, '0').slice(-4);
+        if (orderCode !== code) {
+          return res.status(403).json({ error: 'Código de verificación incorrecto' });
+        }
+      }
     }
 
     // Si el pedido ya finalizó, indicarlo pero no bloquear (el cliente puede ver que fue entregado)
@@ -1729,6 +1747,9 @@ app.get('/api/pedidos/admin/orders', authenticateToken, async (req, res) => {
              external_delivery_cost, external_delivery_notes, external_eta_minutes,
              external_assigned_at, external_handed_off_at, external_delivery_confirmed_at,
              external_delivery_confirmed_by_name, external_delivery_confirmation_notes,
+              crm_contact_id,
+              (SELECT bsuid FROM pedidos_app_crm_contacts WHERE id = pedidos_app_orders.crm_contact_id) AS crm_bsuid,
+              (SELECT username FROM pedidos_app_crm_contacts WHERE id = pedidos_app_orders.crm_contact_id) AS crm_username,
              (SELECT name FROM pedidos_app_delivery_companies company
               WHERE company.id = external_delivery_company_id) AS external_company_name,
              (delivery_fee - external_delivery_cost) AS logistics_margin
@@ -1760,6 +1781,43 @@ app.post('/api/pedidos/admin/orders/:id/tracking-token', authenticateToken, asyn
   }
 });
 
+
+app.post('/api/pedidos/admin/orders/:id/notify-whatsapp', authenticateToken, async (req, res) => {
+  try {
+    const orderId = Number(req.params.id);
+    if (!Number.isInteger(orderId) || orderId < 1) return res.status(400).json({ error: 'Pedido inválido' });
+    
+    const { rows } = await pool.query(`
+      SELECT o.*, c.normalized_phone, c.bsuid, c.display_name AS crm_name
+      FROM pedidos_app_orders o
+      LEFT JOIN pedidos_app_crm_contacts c ON c.id = o.crm_contact_id
+      WHERE o.id = $1
+    `, [orderId]);
+    
+    if (!rows.length) return res.status(404).json({ error: 'Pedido no encontrado' });
+    const order = rows[0];
+
+    const sendTo = order.customer_phone || order.normalized_phone || order.bsuid;
+    if (!sendTo) {
+      return res.status(400).json({ error: 'El pedido no tiene teléfono ni BSUID para notificar por WhatsApp.' });
+    }
+
+    const messageText = String(req.body.message || req.body.body || '').trim();
+    if (!messageText) {
+      return res.status(400).json({ error: 'El cuerpo del mensaje no puede estar vacío.' });
+    }
+
+    const isE164 = /^\+?\d{5,15}$/.test(String(sendTo).trim());
+
+    await whatsappClient.sendText({ to: sendTo, body: messageText });
+    await pool.query('UPDATE pedidos_app_orders SET tracking_sent_at = NOW() WHERE id = $1', [order.id]);
+
+    res.json({ status: 'ok', sent_to: sendTo, is_bsuid: !isE164 });
+  } catch (error) {
+    console.error('Error notificando por WhatsApp:', error);
+    res.status(500).json({ error: error.message || 'Error enviando notificación' });
+  }
+});
 app.post('/api/pedidos/admin/orders/:id/tracking-sent', authenticateToken, async (req, res) => {
   try {
     const orderId = Number(req.params.id);
