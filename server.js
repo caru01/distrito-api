@@ -1539,6 +1539,7 @@ app.get('/api/pedidos/admin/clientes/buscar', authenticateToken, async (req, res
     const termNoAt = term.startsWith('@') ? term.slice(1) : term;
     const digits = term.replace(/\D/g, '');
     const phonePattern = digits.length > 0 ? `%${digits}%` : null;
+    const exactPhone10 = digits.length >= 10 ? digits.slice(-10) : null;
 
     const { rows } = await pool.query(`
       SELECT
@@ -1554,14 +1555,28 @@ app.get('/api/pedidos/admin/clientes/buscar', authenticateToken, async (req, res
         c.username,
         c.bsuid
       FROM pedidos_app_crm_contacts c
-      WHERE c.display_name ILIKE $1
+      WHERE c.display_name ILIKE ('%' || $1 || '%')
          OR ($2::text IS NOT NULL AND c.normalized_phone LIKE $2)
-         OR COALESCE(c.username, '') ILIKE $3
-         OR COALESCE(c.bsuid, '') ILIKE $3
-         OR c.id::text = $4
-      ORDER BY c.last_purchase_at DESC NULLS LAST, c.updated_at DESC
-      LIMIT 15
-    `, [`%${term}%`, phonePattern, `%${termNoAt}%`, term]);
+         OR COALESCE(c.username, '') ILIKE ('%' || $3 || '%')
+         OR COALESCE(c.bsuid, '') ILIKE ('%' || $1 || '%')
+         OR c.id::text = $1
+      ORDER BY
+        CASE
+          WHEN c.id::text = $1 THEN 1
+          WHEN LOWER(COALESCE(c.username, '')) = LOWER($3) THEN 2
+          WHEN LOWER(COALESCE(c.bsuid, '')) = LOWER($1) THEN 3
+          WHEN $4::text IS NOT NULL AND RIGHT(c.normalized_phone, 10) = $4 THEN 4
+          WHEN LOWER(c.display_name) = LOWER($1) THEN 5
+          WHEN LOWER(c.display_name) LIKE LOWER($1) || '%' THEN 6
+          WHEN LOWER(COALESCE(c.username, '')) LIKE LOWER($3) || '%' THEN 7
+          WHEN c.display_name ILIKE ('%' || $1 || '%') THEN 8
+          WHEN $2::text IS NOT NULL AND c.normalized_phone LIKE $2 THEN 9
+          ELSE 10
+        END ASC,
+        c.last_purchase_at DESC NULLS LAST,
+        c.updated_at DESC
+      LIMIT 25
+    `, [term, phonePattern, termNoAt, exactPhone10]);
 
     res.json({ status: 'ok', clientes: rows });
   } catch (error) {
