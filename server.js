@@ -2049,6 +2049,7 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
     const isDelivery = String(customer.deliveryType || '').toLowerCase() === 'domicilio';
     const settingsResult = await client.query('SELECT COALESCE(delivery_cost, 0)::integer AS delivery_cost FROM pedidos_app_settings WHERE id = 1');
     const deliveryFee = isDelivery ? Math.max(0, Number(settingsResult.rows[0]?.delivery_cost || 0)) : 0;
+    const orderTotal = normalized.total + deliveryFee;
     const targetCrmContactId = (customer && customer.crm_contact_id !== undefined)
       ? (customer.crm_contact_id ? Number(customer.crm_contact_id) : null)
       : (req.body.crm_contact_id !== undefined ? (req.body.crm_contact_id ? Number(req.body.crm_contact_id) : null) : currentOrder.crm_contact_id);
