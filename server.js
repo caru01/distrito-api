@@ -1535,9 +1535,10 @@ app.get('/api/pedidos/admin/clientes/buscar', authenticateToken, async (req, res
     const { q } = req.query;
     if (!q || q.length < 1) return res.json({ status: 'ok', clientes: [] });
 
-    // Normalizar búsqueda: trim y quitar @ inicial si existe
     const term = q.trim();
     const termNoAt = term.startsWith('@') ? term.slice(1) : term;
+    const digits = term.replace(/\D/g, '');
+    const phonePattern = digits.length > 0 ? `%${digits}%` : null;
 
     const { rows } = await pool.query(`
       SELECT
@@ -1554,13 +1555,13 @@ app.get('/api/pedidos/admin/clientes/buscar', authenticateToken, async (req, res
         c.bsuid
       FROM pedidos_app_crm_contacts c
       WHERE c.display_name ILIKE $1
-         OR c.normalized_phone LIKE $2
+         OR ($2::text IS NOT NULL AND c.normalized_phone LIKE $2)
          OR COALESCE(c.username, '') ILIKE $3
          OR COALESCE(c.bsuid, '') ILIKE $3
          OR c.id::text = $4
       ORDER BY c.last_purchase_at DESC NULLS LAST, c.updated_at DESC
       LIMIT 15
-    `, [`%${term}%`, `%${term.replace(/\D/g, '')}%`, `%${termNoAt}%`, term]);
+    `, [`%${term}%`, phonePattern, `%${termNoAt}%`, term]);
 
     res.json({ status: 'ok', clientes: rows });
   } catch (error) {
