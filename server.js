@@ -2049,7 +2049,10 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
     const isDelivery = String(customer.deliveryType || '').toLowerCase() === 'domicilio';
     const settingsResult = await client.query('SELECT COALESCE(delivery_cost, 0)::integer AS delivery_cost FROM pedidos_app_settings WHERE id = 1');
     const deliveryFee = isDelivery ? Math.max(0, Number(settingsResult.rows[0]?.delivery_cost || 0)) : 0;
-    const orderTotal = normalized.total + deliveryFee;
+    const targetCrmContactId = (customer && customer.crm_contact_id !== undefined)
+      ? (customer.crm_contact_id ? Number(customer.crm_contact_id) : null)
+      : (req.body.crm_contact_id !== undefined ? (req.body.crm_contact_id ? Number(req.body.crm_contact_id) : null) : currentOrder.crm_contact_id);
+
     const { rows } = await client.query(
       `UPDATE pedidos_app_orders 
        SET cart_json = $1, total = $2, customer_name = $3, customer_phone = $4, address = $5,
@@ -2059,7 +2062,8 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
            delivery_reference = $14, delivery_latitude = $15, delivery_longitude = $16,
            delivery_place_id = $17, delivery_location_adjusted = $18,
            delivery_apartment = $19, delivery_tower = $20, delivery_floor = $21,
-           delivery_fee = $22
+           delivery_fee = $22,
+           crm_contact_id = $23
        WHERE id = $11 RETURNING *`,
       [
         cartStr, orderTotal, customer.name, formattedPhone, customer.address,
@@ -2075,6 +2079,7 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
         isDelivery ? String(customer.tower || '').trim().slice(0, 50) || null : null,
         isDelivery ? String(customer.floor || '').trim().slice(0, 30) || null : null,
         deliveryFee,
+        targetCrmContactId,
       ]
     );
     if (currentOrder.status !== 'Cancelado') await reserveProductStock(client, normalized, id, req.user?.username);
