@@ -1535,9 +1535,12 @@ app.get('/api/pedidos/admin/clientes/buscar', authenticateToken, async (req, res
     const { q } = req.query;
     if (!q || q.length < 1) return res.json({ status: 'ok', clientes: [] });
 
-    // Se busca en CRM contacts para incluir clientes BSUID (username) y clientes normales (phone/name)
+    // Normalizar búsqueda: trim y quitar @ inicial si existe
+    const term = q.trim();
+    const termNoAt = term.startsWith('@') ? term.slice(1) : term;
+
     const { rows } = await pool.query(`
-      SELECT 
+      SELECT
         c.display_name AS name,
         COALESCE(c.normalized_phone, '') AS phone,
         c.address,
@@ -1552,15 +1555,16 @@ app.get('/api/pedidos/admin/clientes/buscar', authenticateToken, async (req, res
       FROM pedidos_app_crm_contacts c
       WHERE c.display_name ILIKE $1
          OR c.normalized_phone LIKE $2
-         OR COALESCE(c.username, '') ILIKE $1
-         OR COALESCE(c.bsuid, '') ILIKE $1
-         OR c.id::text = $3
+         OR COALESCE(c.username, '') ILIKE $3
+         OR COALESCE(c.bsuid, '') ILIKE $3
+         OR c.id::text = $4
       ORDER BY c.last_purchase_at DESC NULLS LAST, c.updated_at DESC
       LIMIT 15
-    `, [`%${q}%`, `%${q.replace(/\D/g, '')}%`, q]);
-    
+    `, [`%${term}%`, `%${term.replace(/\D/g, '')}%`, `%${termNoAt}%`, term]);
+
     res.json({ status: 'ok', clientes: rows });
   } catch (error) {
+    console.error('Error buscando clientes:', error);
     res.status(500).json({ status: 'error', error: error.message });
   }
 });
