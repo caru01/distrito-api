@@ -574,6 +574,99 @@ function parseColombiaTimestamp(value) {
   return parsed.toISOString();
 }
 
+const ALLOWED_PAYMENT_METHODS = new Set(['efectivo', 'transferencia', 'compartido']);
+
+function validateOrderPayment({ paymentMethod, cashAmount, cashSplit, transferSplit, orderTotal }) {
+  if (paymentMethod === undefined || paymentMethod === null || String(paymentMethod).trim() === '') {
+    return {
+      isValid: false,
+      error: 'El método de pago es obligatorio. Valores permitidos: efectivo, transferencia, compartido.'
+    };
+  }
+
+  const method = String(paymentMethod).trim().toLowerCase();
+  if (!ALLOWED_PAYMENT_METHODS.has(method)) {
+    return {
+      isValid: false,
+      error: `Método de pago no válido: '${paymentMethod}'. Valores permitidos: efectivo, transferencia, compartido.`
+    };
+  }
+
+  if (method === 'efectivo') {
+    const cash = Number(cashAmount);
+    if (Number.isFinite(cash) && cash > 0 && cash < orderTotal) {
+      return {
+        isValid: false,
+        error: `El efectivo indicado no cubre el total de $${orderTotal.toLocaleString('es-CO')}.`
+      };
+    }
+  }
+
+  if (method === 'compartido') {
+    if (cashSplit === undefined || cashSplit === null || String(cashSplit).trim() === '') {
+      return {
+        isValid: false,
+        error: 'Para pago compartido, el monto en efectivo (cash_split) es obligatorio.'
+      };
+    }
+    if (transferSplit === undefined || transferSplit === null || String(transferSplit).trim() === '') {
+      return {
+        isValid: false,
+        error: 'Para pago compartido, el monto en transferencia (transfer_split) es obligatorio.'
+      };
+    }
+
+    const cStr = String(cashSplit).trim();
+    const tStr = String(transferSplit).trim();
+
+    const cNum = Number(cStr);
+    const tNum = Number(tStr);
+
+    if (!Number.isFinite(cNum) || isNaN(cNum) || !/^-?\d+(\.\d+)?$/.test(cStr)) {
+      return {
+        isValid: false,
+        error: 'El monto en efectivo de pago compartido debe ser un número válido.'
+      };
+    }
+    if (!Number.isFinite(tNum) || isNaN(tNum) || !/^-?\d+(\.\d+)?$/.test(tStr)) {
+      return {
+        isValid: false,
+        error: 'El monto en transferencia de pago compartido debe ser un número válido.'
+      };
+    }
+
+    if (cNum < 0 || tNum < 0) {
+      return {
+        isValid: false,
+        error: 'Los montos de pago compartido no pueden ser negativos.'
+      };
+    }
+
+    if (!Number.isInteger(cNum) || !/^\d+$/.test(cStr)) {
+      return {
+        isValid: false,
+        error: 'El monto en efectivo de pago compartido debe ser un número entero sin decimales.'
+      };
+    }
+    if (!Number.isInteger(tNum) || !/^\d+$/.test(tStr)) {
+      return {
+        isValid: false,
+        error: 'El monto en transferencia de pago compartido debe ser un número entero sin decimales.'
+      };
+    }
+
+    const splitSum = cNum + tNum;
+    if (splitSum !== orderTotal) {
+      return {
+        isValid: false,
+        error: `La suma del pago compartido ($${splitSum.toLocaleString('es-CO')}) no coincide con el total del pedido ($${orderTotal.toLocaleString('es-CO')}).`
+      };
+    }
+  }
+
+  return { isValid: true, method };
+}
+
 app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
   let client;
   try {
@@ -597,11 +690,31 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
     const settingsResult = await client.query('SELECT COALESCE(delivery_cost, 0)::integer AS delivery_cost FROM pedidos_app_settings WHERE id = 1');
     const deliveryFee = isDelivery ? Math.max(0, Number(settingsResult.rows[0]?.delivery_cost || 0)) : 0;
     const orderTotal = normalized.total + deliveryFee;
-    const cashAmount = Number(customer.cashAmount);
-    if (String(customer.paymentMethod || '').toLowerCase() === 'efectivo'
-        && Number.isFinite(cashAmount) && cashAmount > 0 && cashAmount < orderTotal) {
+
+    const rawPaymentMethod = customer.paymentMethod || customer.payment_method || req.body.payment_method;
+    let resolvedCashSplit = customer.cash_split !== undefined ? customer.cash_split : (customer.cashSplit !== undefined ? customer.cashSplit : req.body.cash_split);
+    let resolvedTransferSplit = customer.transfer_split !== undefined ? customer.transfer_split : (customer.transferSplit !== undefined ? customer.transferSplit : req.body.transfer_split);
+
+    if ((resolvedCashSplit === undefined || resolvedTransferSplit === undefined) && typeof (customer.notes || req.body.notes) === 'string') {
+      const notesStr = customer.notes || req.body.notes;
+      const match = notesStr.match(/Pago Compartido:\s*\$([0-9.,]+)\s*efectivo,\s*\$([0-9.,]+)\s*transferencia/i);
+      if (match) {
+        if (resolvedCashSplit === undefined) resolvedCashSplit = match[1].replace(/\./g, '').replace(/,/g, '');
+        if (resolvedTransferSplit === undefined) resolvedTransferSplit = match[2].replace(/\./g, '').replace(/,/g, '');
+      }
+    }
+
+    const paymentCheck = validateOrderPayment({
+      paymentMethod: rawPaymentMethod,
+      cashAmount: customer.cashAmount !== undefined ? customer.cashAmount : req.body.cashAmount,
+      cashSplit: resolvedCashSplit,
+      transferSplit: resolvedTransferSplit,
+      orderTotal
+    });
+
+    if (!paymentCheck.isValid) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: `El efectivo indicado no cubre el total de $${orderTotal.toLocaleString('es-CO')}.` });
+      return res.status(400).json({ status: 'error', error: paymentCheck.error });
     }
 
     let customDateStr = req.body.created_at || (customer && customer.created_at);
@@ -649,7 +762,7 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
         customer.address || '',
         customer.barrio || '',
         customer.deliveryType,
-        customer.paymentMethod,
+        paymentCheck.method,
         orderTotal,
         JSON.stringify(normalized.cart),
         req.body.source || customer.source || 'Web',
@@ -657,7 +770,7 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
         customer.voucher_reference || '',
         customDate,
         customer.reference || customer.deliveryReference || '',
-        customer.paymentMethod === 'efectivo' && Number(customer.cashAmount) >= orderTotal
+        paymentCheck.method === 'efectivo' && Number(customer.cashAmount) >= orderTotal
           ? Math.round(Number(customer.cashAmount) - orderTotal)
           : null,
         deliveryFee,
@@ -2065,6 +2178,33 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
     const settingsResult = await client.query('SELECT COALESCE(delivery_cost, 0)::integer AS delivery_cost FROM pedidos_app_settings WHERE id = 1');
     const deliveryFee = isDelivery ? Math.max(0, Number(settingsResult.rows[0]?.delivery_cost || 0)) : 0;
     const orderTotal = normalized.total + deliveryFee;
+
+    const rawPaymentMethod = customer.paymentMethod || customer.payment_method || req.body.payment_method || currentOrder.payment_method;
+    let resolvedCashSplit = customer.cash_split !== undefined ? customer.cash_split : (customer.cashSplit !== undefined ? customer.cashSplit : req.body.cash_split);
+    let resolvedTransferSplit = customer.transfer_split !== undefined ? customer.transfer_split : (customer.transferSplit !== undefined ? customer.transferSplit : req.body.transfer_split);
+
+    if ((resolvedCashSplit === undefined || resolvedTransferSplit === undefined) && typeof (customer.notes || req.body.notes) === 'string') {
+      const notesStr = customer.notes || req.body.notes;
+      const match = notesStr.match(/Pago Compartido:\s*\$([0-9.,]+)\s*efectivo,\s*\$([0-9.,]+)\s*transferencia/i);
+      if (match) {
+        if (resolvedCashSplit === undefined) resolvedCashSplit = match[1].replace(/\./g, '').replace(/,/g, '');
+        if (resolvedTransferSplit === undefined) resolvedTransferSplit = match[2].replace(/\./g, '').replace(/,/g, '');
+      }
+    }
+
+    const paymentCheck = validateOrderPayment({
+      paymentMethod: rawPaymentMethod,
+      cashAmount: customer.cashAmount !== undefined ? customer.cashAmount : req.body.cashAmount,
+      cashSplit: resolvedCashSplit,
+      transferSplit: resolvedTransferSplit,
+      orderTotal
+    });
+
+    if (!paymentCheck.isValid) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ status: 'error', error: paymentCheck.error });
+    }
+
     const targetCrmContactId = (customer && customer.crm_contact_id !== undefined)
       ? (customer.crm_contact_id ? Number(customer.crm_contact_id) : null)
       : (req.body.crm_contact_id !== undefined ? (req.body.crm_contact_id ? Number(req.body.crm_contact_id) : null) : currentOrder.crm_contact_id);
@@ -2083,7 +2223,7 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
        WHERE id = $11 RETURNING *`,
       [
         cartStr, orderTotal, customer.name, formattedPhone, customer.address,
-        customer.deliveryType, customer.paymentMethod, customer.barrio || '',
+        customer.deliveryType, paymentCheck.method, customer.barrio || '',
         req.body.source || customer.source || 'Web', customDate, id, customer.notes || '',
         customer.voucher_reference || '',
         isDelivery ? String(customer.reference || customer.deliveryReference || '').trim().slice(0, 500) || null : null,
