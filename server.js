@@ -349,12 +349,30 @@ async function normalizeOrderCart(client, rawCart, { activeOnly = true } = {}) {
 
   const ids = [...new Set(rawCart.map((item) => String(item.id || item.product_id || '')).filter(Boolean))];
   const { rows } = await client.query(
-    `SELECT id, title, price, category, stock, track_stock
+    `SELECT id, title, price, category, stock, track_stock, average_cost
      FROM pedidos_app_products
      WHERE id::text = ANY($1::text[]) AND ($2::boolean = FALSE OR status = 'Activo')`,
     [ids, activeOnly]
   );
   const products = new Map(rows.map((product) => [String(product.id), product]));
+
+  // Check combo components for any product in the cart
+  const { rows: comboRows } = await client.query(
+    `SELECT cc.combo_product_id, cc.component_product_id, cc.quantity AS component_qty,
+            p.title AS component_title, p.track_stock AS component_track_stock,
+            p.average_cost AS component_average_cost, p.stock AS component_stock
+     FROM pedidos_app_combo_components cc
+     JOIN pedidos_app_products p ON p.id = cc.component_product_id
+     WHERE cc.combo_product_id::text = ANY($1::text[])`,
+    [ids]
+  );
+
+  const comboMap = new Map();
+  for (const row of comboRows) {
+    const key = String(row.combo_product_id);
+    if (!comboMap.has(key)) comboMap.set(key, []);
+    comboMap.get(key).push(row);
+  }
 
   const cart = rawCart.map((item) => {
     const id = String(item.id || item.product_id || '');
@@ -375,62 +393,329 @@ async function normalizeOrderCart(client, rawCart, { activeOnly = true } = {}) {
     };
   });
 
+  // Build physical deductions and cost snapshot targets
+  const expandedDeductions = [];
+  for (const item of cart) {
+    const product = products.get(String(item.id));
+    const combos = comboMap.get(String(item.id));
+
+    if (combos && combos.length > 0) {
+      // It's a combo: expand components
+      for (const comp of combos) {
+        if (comp.component_track_stock) {
+          expandedDeductions.push({
+            parent_product_id: String(item.id),
+            parent_title: item.title,
+            controlled_product_id: String(comp.component_product_id),
+            controlled_title: comp.component_title,
+            quantity: item.quantity * Number(comp.component_qty),
+            current_average_cost: Number(comp.component_average_cost) || 0,
+            is_combo: true,
+          });
+        }
+      }
+    } else {
+      // Individual product
+      if (product && product.track_stock) {
+        expandedDeductions.push({
+          parent_product_id: String(product.id),
+          parent_title: product.title,
+          controlled_product_id: String(product.id),
+          controlled_title: product.title,
+          quantity: item.quantity,
+          current_average_cost: Number(product.average_cost) || 0,
+          is_combo: false,
+        });
+      }
+    }
+  }
+
   return {
     cart,
-    inventory: rows
-      .filter((product) => product.track_stock)
-      .map((product) => ({
-        id: product.id,
-        title: product.title,
-        stock: Number(product.stock) || 0,
-        quantity: cart.find((item) => String(item.id) === String(product.id))?.quantity || 0,
-      })),
+    expandedDeductions,
     total: cart.reduce((sum, item) => sum + item.price * item.quantity, 0),
   };
 }
 
 async function reserveProductStock(client, normalized, orderId, createdBy = 'Sistema') {
-  for (const item of normalized.inventory || []) {
-    const { rows } = await client.query(`
-      UPDATE pedidos_app_products
-      SET stock = COALESCE(stock, 0) - $1, updated_at = NOW()
-      WHERE id = $2 AND track_stock = TRUE AND COALESCE(stock, 0) >= $1
-      RETURNING stock
-    `, [item.quantity, item.id]);
-    if (!rows.length) {
-      const error = new Error(`No hay existencias suficientes de ${item.title}.`);
-      error.statusCode = 409;
-      error.code = 'INSUFFICIENT_STOCK';
-      throw error;
-    }
-    await client.query(`
-      INSERT INTO pedidos_app_product_stock_movements
+  let orderTotalCogs = 0;
+
+  for (const item of normalized.expandedDeductions || []) {
+    // 1. Deduct stock from the controlled product (allows negative stock)
+    const { rows } = await client.query(
+      `UPDATE pedidos_app_products
+       SET stock = COALESCE(stock, 0) - $1, updated_at = NOW()
+       WHERE id = $2
+       RETURNING stock`,
+      [item.quantity, item.controlled_product_id]
+    );
+
+    const newStock = rows.length ? rows[0].stock : 0;
+
+    // 2. Insert stock movement
+    await client.query(
+      `INSERT INTO pedidos_app_product_stock_movements
         (product_id, order_id, movement_type, quantity, balance_after, reason, created_by)
-      VALUES ($1,$2,'Pedido',-$3,$4,$5,$6)
-    `, [item.id, orderId, item.quantity, rows[0].stock, `Reserva del pedido #${orderId}`, createdBy]);
+       VALUES ($1, $2, 'VENTA', -$3, $4, $5, $6)`,
+      [
+        item.controlled_product_id,
+        orderId,
+        item.quantity,
+        newStock,
+        `Venta pedido #${orderId} (${item.controlled_title} x${item.quantity})`,
+        createdBy,
+      ]
+    );
+
+    // 3. Freeze historical cost snapshot
+    const unitCost = item.current_average_cost;
+    const totalCost = item.quantity * unitCost;
+    orderTotalCogs += totalCost;
+
+    await client.query(
+      `INSERT INTO pedidos_app_order_item_costs
+        (order_id, product_id, component_product_id, quantity, unit_cost, total_cost)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        orderId,
+        item.parent_product_id,
+        item.is_combo ? item.controlled_product_id : null,
+        item.quantity,
+        unitCost,
+        totalCost,
+      ]
+    );
   }
+
+  // 4. Update total_cogs on the order
+  await client.query(
+    `UPDATE pedidos_app_orders
+     SET total_cogs = $1
+     WHERE id = $2`,
+    [orderTotalCogs, orderId]
+  );
+
+  return orderTotalCogs;
 }
 
 async function releaseProductStock(client, order, createdBy = 'Sistema') {
-  const { rows: movements } = await client.query(`
-    SELECT product_id, -SUM(quantity)::int AS quantity
-    FROM pedidos_app_product_stock_movements
-    WHERE order_id = $1
-    GROUP BY product_id
-    HAVING SUM(quantity) < 0
-  `, [order.id]);
+  // Prevent double cancellation / double return
+  if (order.status === 'Cancelado') return;
+
+  const { rows: movements } = await client.query(
+    `SELECT product_id, -SUM(quantity)::int AS quantity
+     FROM pedidos_app_product_stock_movements
+     WHERE order_id = $1
+     GROUP BY product_id
+     HAVING SUM(quantity) < 0`,
+    [order.id]
+  );
+
   for (const movement of movements) {
-    const { rows } = await client.query(`
-      UPDATE pedidos_app_products SET stock = COALESCE(stock, 0) + $1, updated_at = NOW()
-      WHERE id = $2 RETURNING stock
-    `, [movement.quantity, movement.product_id]);
+    const { rows } = await client.query(
+      `UPDATE pedidos_app_products
+       SET stock = COALESCE(stock, 0) + $1, updated_at = NOW()
+       WHERE id = $2
+       RETURNING stock`,
+      [movement.quantity, movement.product_id]
+    );
     if (!rows.length) continue;
-    await client.query(`
-      INSERT INTO pedidos_app_product_stock_movements
+
+    await client.query(
+      `INSERT INTO pedidos_app_product_stock_movements
         (product_id, order_id, movement_type, quantity, balance_after, reason, created_by)
-      VALUES ($1,$2,'Cancelación',$3,$4,$5,$6)
-    `, [movement.product_id, order.id, movement.quantity, rows[0].stock, `Devolución del pedido #${order.id}`, createdBy]);
+       VALUES ($1, $2, 'CANCELACION', $3, $4, $5, $6)`,
+      [
+        movement.product_id,
+        order.id,
+        movement.quantity,
+        rows[0].stock,
+        `Devolución por cancelación del pedido #${order.id}`,
+        createdBy,
+      ]
+    );
   }
+}
+
+async function applyOrderEditInventoryDelta(client, currentOrder, normalizedNew, orderId, updatedBy = 'Sistema') {
+  // 1. Fetch current cost records for this order
+  const { rows: oldCosts } = await client.query(
+    `SELECT id, product_id, component_product_id, quantity, unit_cost, total_cost
+     FROM pedidos_app_order_item_costs
+     WHERE order_id = $1
+     ORDER BY id ASC`,
+    [orderId]
+  );
+
+  // Group old physical usage by controlled_product_id
+  const oldPhysicalTotals = new Map();
+  if (oldCosts.length > 0) {
+    for (const row of oldCosts) {
+      const controlledId = String(row.component_product_id || row.product_id);
+      oldPhysicalTotals.set(controlledId, (oldPhysicalTotals.get(controlledId) || 0) + Number(row.quantity));
+    }
+  } else {
+    // If ancient order with no order_item_costs, read past movements
+    const { rows: pastMovements } = await client.query(
+      `SELECT product_id, -SUM(quantity)::int AS qty
+       FROM pedidos_app_product_stock_movements
+       WHERE order_id = $1 AND movement_type IN ('VENTA', 'Pedido')
+       GROUP BY product_id
+       HAVING SUM(quantity) < 0`,
+      [orderId]
+    );
+    for (const m of pastMovements) {
+      oldPhysicalTotals.set(String(m.product_id), Number(m.qty));
+    }
+  }
+
+  // Group new target physical usage by controlled_product_id
+  const newPhysicalTotals = new Map();
+  for (const item of normalizedNew.expandedDeductions || []) {
+    const controlledId = String(item.controlled_product_id);
+    newPhysicalTotals.set(controlledId, (newPhysicalTotals.get(controlledId) || 0) + Number(item.quantity));
+  }
+
+  // 2. Compute Physical Stock Delta for all involved products
+  const allControlledIds = new Set([...oldPhysicalTotals.keys(), ...newPhysicalTotals.keys()]);
+
+  for (const controlledId of allControlledIds) {
+    const oldQty = oldPhysicalTotals.get(controlledId) || 0;
+    const newQty = newPhysicalTotals.get(controlledId) || 0;
+    const delta = newQty - oldQty;
+
+    if (delta > 0) {
+      // Deduct delta stock
+      const { rows } = await client.query(
+        `UPDATE pedidos_app_products
+         SET stock = COALESCE(stock, 0) - $1, updated_at = NOW()
+         WHERE id = $2
+         RETURNING stock, title`,
+        [delta, controlledId]
+      );
+      const newStock = rows.length ? rows[0].stock : 0;
+      const title = rows.length ? rows[0].title : 'Insumo';
+
+      await client.query(
+        `INSERT INTO pedidos_app_product_stock_movements
+          (product_id, order_id, movement_type, quantity, balance_after, reason, created_by)
+         VALUES ($1, $2, 'AJUSTE_EDICION', -$3, $4, $5, $6)`,
+        [
+          controlledId,
+          orderId,
+          delta,
+          newStock,
+          `Ajuste edición pedido #${orderId} (+${delta} ${title})`,
+          updatedBy,
+        ]
+      );
+    } else if (delta < 0) {
+      // Return delta stock
+      const toReturn = Math.abs(delta);
+      const { rows } = await client.query(
+        `UPDATE pedidos_app_products
+         SET stock = COALESCE(stock, 0) + $1, updated_at = NOW()
+         WHERE id = $2
+         RETURNING stock, title`,
+        [toReturn, controlledId]
+      );
+      const newStock = rows.length ? rows[0].stock : 0;
+      const title = rows.length ? rows[0].title : 'Insumo';
+
+      await client.query(
+        `INSERT INTO pedidos_app_product_stock_movements
+          (product_id, order_id, movement_type, quantity, balance_after, reason, created_by)
+         VALUES ($1, $2, 'DEVOLUCION_EDICION', $3, $4, $5, $6)`,
+        [
+          controlledId,
+          orderId,
+          toReturn,
+          newStock,
+          `Devolución edición pedido #${orderId} (-${toReturn} ${title})`,
+          updatedBy,
+        ]
+      );
+    }
+  }
+
+  // 3. Reconcile pedidos_app_order_item_costs Preserving Historical Unit Costs
+  const oldCostsByControlled = new Map();
+  for (const row of oldCosts) {
+    const controlledId = String(row.component_product_id || row.product_id);
+    if (!oldCostsByControlled.has(controlledId)) oldCostsByControlled.set(controlledId, []);
+    oldCostsByControlled.get(controlledId).push({ ...row });
+  }
+
+  // Clear existing cost records to re-insert clean, reconciled rows
+  await client.query(`DELETE FROM pedidos_app_order_item_costs WHERE order_id = $1`, [orderId]);
+
+  let newOrderTotalCogs = 0;
+
+  for (const item of normalizedNew.expandedDeductions || []) {
+    const controlledId = String(item.controlled_product_id);
+    let neededQty = item.quantity;
+    const availableOld = oldCostsByControlled.get(controlledId) || [];
+
+    // Fulfill from available historical cost units first
+    while (neededQty > 0 && availableOld.length > 0) {
+      const oldRow = availableOld[0];
+      const takeQty = Math.min(neededQty, Number(oldRow.quantity));
+      const unitCost = Number(oldRow.unit_cost);
+      const lineTotal = takeQty * unitCost;
+      newOrderTotalCogs += lineTotal;
+
+      await client.query(
+        `INSERT INTO pedidos_app_order_item_costs
+          (order_id, product_id, component_product_id, quantity, unit_cost, total_cost)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          orderId,
+          item.parent_product_id,
+          item.is_combo ? item.controlled_product_id : null,
+          takeQty,
+          unitCost,
+          lineTotal,
+        ]
+      );
+
+      neededQty -= takeQty;
+      oldRow.quantity -= takeQty;
+      if (oldRow.quantity <= 0) {
+        availableOld.shift();
+      }
+    }
+
+    // Fulfill any additional units at current average cost
+    if (neededQty > 0) {
+      const unitCost = item.current_average_cost;
+      const lineTotal = neededQty * unitCost;
+      newOrderTotalCogs += lineTotal;
+
+      await client.query(
+        `INSERT INTO pedidos_app_order_item_costs
+          (order_id, product_id, component_product_id, quantity, unit_cost, total_cost)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          orderId,
+          item.parent_product_id,
+          item.is_combo ? item.controlled_product_id : null,
+          neededQty,
+          unitCost,
+          lineTotal,
+        ]
+      );
+    }
+  }
+
+  // 4. Update order total_cogs
+  await client.query(
+    `UPDATE pedidos_app_orders
+     SET total_cogs = $1
+     WHERE id = $2`,
+    [newOrderTotalCogs, orderId]
+  );
+
+  return newOrderTotalCogs;
 }
 
 const deliveryOrderService = createDeliveryOrderService({ pool, releaseProductStock });
@@ -2052,6 +2337,7 @@ app.put('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => 
           await releaseProductStock(client, currentOrder, req.user?.username);
         } else if (currentOrder.status === 'Cancelado' && status !== 'Cancelado') {
           const normalized = await normalizeOrderCart(client, currentOrder.cart_json, { activeOnly: false });
+          // Note: When uncancelling, we use current costs, unless we implement complex historical snapshotting for canceled orders too.
           await reserveProductStock(client, normalized, currentOrder.id, req.user?.username);
         }
 
@@ -2154,7 +2440,6 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
       return res.status(404).json({ error: 'Pedido no encontrado' });
     }
     const currentOrder = currentRows[0];
-    if (currentOrder.status !== 'Cancelado') await releaseProductStock(client, currentOrder, req.user?.username);
     const normalized = await normalizeOrderCart(client, cart, { activeOnly: false });
     const cartStr = JSON.stringify(normalized.cart);
     const customDateStr = (customer && customer.created_at) || req.body.created_at;
@@ -2165,7 +2450,6 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
       return res.status(403).json({ error: 'El período contable para esta fecha ya está cerrado.' });
     }
 
-    // Format phone to always start with 57
     let formattedPhone = customer.phone ? customer.phone.replace(/\D/g, '') : '';
     if (formattedPhone.length === 10) {
       formattedPhone = '57' + formattedPhone;
@@ -2238,7 +2522,9 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
         targetCrmContactId,
       ]
     );
-    if (currentOrder.status !== 'Cancelado') await reserveProductStock(client, normalized, id, req.user?.username);
+    if (currentOrder.status !== 'Cancelado') {
+      await applyOrderEditInventoryDelta(client, currentOrder, normalized, id, req.user?.username);
+    }
     await client.query('COMMIT');
     res.json({ status: 'ok', order: rows[0] });
   } catch (error) {
@@ -2396,7 +2682,7 @@ app.get('/api/pedidos/admin/product-stock', authenticateToken, requirePermission
   try {
     const { rows } = await pool.query(`
       SELECT id, title, category, status, stock, barcode, track_stock, low_stock_threshold,
-             inventory_unit, inventory_unit_cost, updated_at
+             inventory_unit, inventory_unit_cost, average_cost, updated_at
       FROM pedidos_app_products
       ORDER BY (track_stock AND COALESCE(stock, 0) <= low_stock_threshold) DESC, title
     `);
@@ -2442,7 +2728,7 @@ app.post('/api/pedidos/admin/product-stock/:id/movements', authenticateToken, re
 
 app.patch('/api/pedidos/admin/product-stock/:id', authenticateToken, requirePermission('Inventario', 'editar'), async (req, res) => {
   try {
-    const { barcode, track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost } = req.body;
+    const { barcode, track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost, average_cost } = req.body;
     const threshold = Number(low_stock_threshold);
     const unitCost = Number(inventory_unit_cost);
     if (!Number.isInteger(threshold) || threshold < 0 || !Number.isFinite(unitCost) || unitCost < 0) {
@@ -2451,9 +2737,10 @@ app.patch('/api/pedidos/admin/product-stock/:id', authenticateToken, requirePerm
     const { rows } = await pool.query(`
       UPDATE pedidos_app_products
       SET barcode=$1, track_stock=$2, low_stock_threshold=$3,
-          inventory_unit=$4, inventory_unit_cost=$5, updated_at=NOW()
-      WHERE id::text=$6 RETURNING id, stock
-    `, [String(barcode || '').trim() || null, Boolean(track_stock), threshold, String(inventory_unit || 'unidad').slice(0, 30), Math.round(unitCost), req.params.id]);
+          inventory_unit=$4, inventory_unit_cost=$5,
+          average_cost=COALESCE($7, average_cost), updated_at=NOW()
+      WHERE id::text=$6 RETURNING id, stock, average_cost
+    `, [String(barcode || '').trim() || null, Boolean(track_stock), threshold, String(inventory_unit || 'unidad').slice(0, 30), Math.round(unitCost), req.params.id, Number.isFinite(Number(average_cost)) ? Number(average_cost) : null]);
     if (!rows.length) return res.status(404).json({ error: 'Producto no encontrado' });
     res.json({ status: 'ok', data: rows[0] });
   } catch (error) {
@@ -3226,7 +3513,7 @@ function reportPercentageChange(current, previous) {
   return Math.round(((currentValue - previousValue) / Math.abs(previousValue)) * 1000) / 10;
 }
 
-function buildReportData(orderRows, purchaseRows) {
+function buildReportData(orderRows, purchaseRows, orderCostsRows = []) {
   const completedStatuses = new Set(['Completado', 'Entregado']);
   const completedOrders = orderRows.filter((order) => completedStatuses.has(order.status));
   const customers = new Set();
@@ -3279,8 +3566,49 @@ function buildReportData(orderRows, purchaseRows) {
   const externalOrders = completedOrders.filter((order) => String(order.delivery_provider_type || '').startsWith('external_'));
   const externalDeliveryCost = externalOrders.reduce((sum, order) => sum + Number(order.external_delivery_cost || 0), 0);
   const externalDeliveryRevenue = externalOrders.reduce((sum, order) => sum + Number(order.delivery_fee || 0), 0);
-  const grossProfit = totalSales - totalPurchases - externalDeliveryCost;
+  const totalCogs = completedOrders.reduce((sum, order) => sum + Number(order.total_cogs || 0), 0);
+  const grossProfit = totalSales - totalCogs - externalDeliveryCost;
   const cancelled = orderRows.filter((order) => order.status === 'Cancelado').length;
+  // Group COGS by order_id and product_id
+  const cogsByProduct = {};
+  for (const cost of orderCostsRows) {
+    const key = String(cost.product_title || cost.product_id);
+    if (!cogsByProduct[key]) cogsByProduct[key] = { cogs: 0, components: [] };
+    cogsByProduct[key].cogs += Number(cost.total_cost || 0);
+    if (cost.component_title) {
+      cogsByProduct[key].components.push({
+        title: cost.component_title,
+        qty: Number(cost.quantity),
+        unit_cost: Number(cost.unit_cost),
+        total_cost: Number(cost.total_cost)
+      });
+    }
+  }
+
+  // Build profitability list for all sold products/combos
+  const profitabilityList = Object.values(salesByProduct).map((item) => {
+    const cogsData = cogsByProduct[item.name] || { cogs: 0 };
+    const cogs = Math.round(cogsData.cogs);
+    const profit = Math.round(item.total - cogs);
+    const margin = item.total > 0 ? Math.round((profit / item.total) * 1000) / 10 : 0;
+    const isCombo = item.category === 'Combos' || item.name.toLowerCase().includes('combo');
+    return {
+      name: item.name,
+      category: item.category,
+      is_combo: isCombo,
+      quantity: item.quantity,
+      revenue: Math.round(item.total),
+      cogs,
+      profit,
+      margin,
+    };
+  });
+
+  const mostProfitableProduct = [...profitabilityList].filter(p => !p.is_combo).sort((a, b) => b.profit - a.profit)[0] || null;
+  const leastProfitableProduct = [...profitabilityList].filter(p => !p.is_combo).sort((a, b) => a.profit - b.profit)[0] || null;
+  const mostProfitableCombo = [...profitabilityList].filter(p => p.is_combo).sort((a, b) => b.profit - a.profit)[0] || null;
+  const leastProfitableCombo = [...profitabilityList].filter(p => p.is_combo).sort((a, b) => a.profit - b.profit)[0] || null;
+
   const topProducts = Object.values(salesByProduct).sort((a, b) => b.total - a.total).slice(0, 10);
   const clientList = Object.values(topCustomers).map((customer) => {
     const favoriteProduct = Object.entries(customer.products).sort((a, b) => b[1] - a[1])[0]?.[0] || 'Ninguno';
@@ -3296,12 +3624,17 @@ function buildReportData(orderRows, purchaseRows) {
       clientesAtendidos: customers.size,
       ticketPromedio: completedOrders.length ? Math.round(totalSales / completedOrders.length) : 0,
       utilidadBruta: Math.round(grossProfit),
+      costoMercanciaVendida: Math.round(totalCogs),
       totalCompras: Math.round(totalPurchases),
       domiciliosExternos: externalOrders.length,
       costoDomiciliosExternos: Math.round(externalDeliveryCost),
       ingresoDomiciliosExternos: Math.round(externalDeliveryRevenue),
       margenLogisticoExterno: Math.round(externalDeliveryRevenue - externalDeliveryCost),
       margenUtilidad: totalSales ? Math.round((grossProfit / totalSales) * 1000) / 10 : 0,
+      productoMasRentable: mostProfitableProduct?.name || '—',
+      productoMenosRentable: leastProfitableProduct?.name || '—',
+      comboMasRentable: mostProfitableCombo?.name || '—',
+      comboMenosRentable: leastProfitableCombo?.name || '—',
       tasaFinalizacion: orderRows.length ? Math.round((completedOrders.length / orderRows.length) * 1000) / 10 : 0,
     },
     charts: {
@@ -3311,7 +3644,8 @@ function buildReportData(orderRows, purchaseRows) {
       estados: Object.entries(ordersByStatus).sort((a, b) => b[1] - a[1]).map(([name, value]) => ({ name, value })),
     },
     lists: { 
-      productos: topProducts, 
+      productos: topProducts,
+      rentabilidad: profitabilityList.sort((a, b) => b.profit - a.profit), 
       clientes: clientList,
       domicilios: Object.entries(
         externalOrders.reduce((acc, o) => {
@@ -3341,7 +3675,7 @@ app.get('/api/pedidos/admin/reports', authenticateToken, async (req, res) => {
     const previousFrom = shiftIsoDate(previousTo, -(days - 1));
     const orderSql = `
       SELECT id, customer_name, customer_phone, payment_method, total, cart_json, status,
-             delivery_fee, delivery_provider_type, external_delivery_cost,
+             delivery_fee, delivery_provider_type, external_delivery_cost, COALESCE(total_cogs, 0) as total_cogs,
              created_at, TO_CHAR(created_at, 'YYYY-MM-DD') AS report_date
       FROM pedidos_app_orders
       WHERE created_at >= $1::date AND created_at < ($2::date + INTERVAL '1 day')
@@ -3362,8 +3696,34 @@ app.get('/api/pedidos/admin/reports', authenticateToken, async (req, res) => {
         FROM pedidos_app_products WHERE status = 'Activo'`),
     ]);
 
-    const current = buildReportData(ordersResult.rows, purchasesResult.rows);
-    const previous = buildReportData(previousOrdersResult.rows, previousPurchasesResult.rows);
+    const orderIds = ordersResult.rows.filter(o => ['Completado', 'Entregado'].includes(o.status)).map(o => o.id);
+    let orderCostsRows = [];
+    if (orderIds.length > 0) {
+      const costsRes = await pool.query(`
+        SELECT c.*, p.title AS product_title, p_comp.title AS component_title
+        FROM pedidos_app_order_item_costs c
+        JOIN pedidos_app_products p ON p.id = c.product_id
+        LEFT JOIN pedidos_app_products p_comp ON p_comp.id = c.component_product_id
+        WHERE c.order_id = ANY($1::int[])
+      `, [orderIds]);
+      orderCostsRows = costsRes.rows;
+    }
+
+    const prevOrderIds = previousOrdersResult.rows.filter(o => ['Completado', 'Entregado'].includes(o.status)).map(o => o.id);
+    let prevOrderCostsRows = [];
+    if (prevOrderIds.length > 0) {
+      const prevCostsRes = await pool.query(`
+        SELECT c.*, p.title AS product_title, p_comp.title AS component_title
+        FROM pedidos_app_order_item_costs c
+        JOIN pedidos_app_products p ON p.id = c.product_id
+        LEFT JOIN pedidos_app_products p_comp ON p_comp.id = c.component_product_id
+        WHERE c.order_id = ANY($1::int[])
+      `, [prevOrderIds]);
+      prevOrderCostsRows = prevCostsRes.rows;
+    }
+
+    const current = buildReportData(ordersResult.rows, purchasesResult.rows, orderCostsRows);
+    const previous = buildReportData(previousOrdersResult.rows, previousPurchasesResult.rows, prevOrderCostsRows);
     const trendKeys = ['totalVentas', 'pedidosRealizados', 'clientesAtendidos', 'ticketPromedio', 'utilidadBruta'];
     const trends = Object.fromEntries(trendKeys.map((key) => [key, reportPercentageChange(current.kpis[key], previous.kpis[key])]));
 
@@ -4051,6 +4411,318 @@ crmWorker.start()
     crmWorkerReady = false;
     console.error(JSON.stringify({ level: 'error', component: 'crm-worker-start', message: error.message }));
   });
+
+
+// =========================================================================
+// NUEVOS ENDPOINTS: COMBOS E INVENTARIO / COMPRAS
+// =========================================================================
+
+// --- COMBOS ---
+app.get('/api/pedidos/admin/combos', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        cc.combo_product_id,
+        p_combo.title AS combo_title,
+        p_combo.price AS combo_price,
+        p_combo.track_stock AS combo_track_stock,
+        JSON_AGG(
+          JSON_BUILD_OBJECT(
+            'id', cc.id,
+            'component_product_id', cc.component_product_id,
+            'component_title', p_comp.title,
+            'quantity', cc.quantity,
+            'track_stock', p_comp.track_stock,
+            'average_cost', p_comp.average_cost,
+            'stock', p_comp.stock
+          ) ORDER BY cc.id ASC
+        ) AS components
+      FROM pedidos_app_combo_components cc
+      JOIN pedidos_app_products p_combo ON p_combo.id = cc.combo_product_id
+      JOIN pedidos_app_products p_comp ON p_comp.id = cc.component_product_id
+      GROUP BY cc.combo_product_id, p_combo.title, p_combo.price, p_combo.track_stock
+      ORDER BY p_combo.title ASC
+    `);
+    res.json({ status: 'ok', combos: rows });
+  } catch (error) {
+    console.error('Error fetching combos:', error);
+    res.status(500).json({ status: 'error', error: 'Error al consultar combos' });
+  }
+});
+
+app.get('/api/pedidos/admin/combos/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await pool.query(`
+      SELECT 
+        cc.id,
+        cc.combo_product_id,
+        cc.component_product_id,
+        cc.quantity,
+        p.title AS component_title,
+        p.track_stock,
+        p.stock,
+        p.average_cost
+      FROM pedidos_app_combo_components cc
+      JOIN pedidos_app_products p ON p.id = cc.component_product_id
+      WHERE cc.combo_product_id::text = $1
+      ORDER BY cc.id ASC
+    `, [id]);
+    res.json({ status: 'ok', components: rows });
+  } catch (error) {
+    console.error('Error fetching combo components:', error);
+    res.status(500).json({ status: 'error', error: 'Error al consultar componentes del combo' });
+  }
+});
+
+app.post('/api/pedidos/admin/combos', authenticateToken, async (req, res) => {
+  const { combo_product_id, components } = req.body;
+
+  if (!combo_product_id) {
+    return res.status(400).json({ status: 'error', error: 'El producto combo es obligatorio.' });
+  }
+  if (!Array.isArray(components) || components.length === 0) {
+    return res.status(400).json({ status: 'error', error: 'Debes incluir al menos un componente en el combo.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Validar existencia del combo padre
+    const { rows: comboExists } = await client.query(
+      'SELECT id, title FROM pedidos_app_products WHERE id::text = $1',
+      [combo_product_id]
+    );
+    if (!comboExists.length) {
+      throw new Error('El producto combo seleccionado no existe.');
+    }
+
+    // 2. Validar que el combo no sea componente de otro combo (profundidad = 1)
+    const { rows: isChildOfAnother } = await client.query(
+      'SELECT 1 FROM pedidos_app_combo_components WHERE component_product_id::text = $1',
+      [combo_product_id]
+    );
+    if (isChildOfAnother.length > 0) {
+      throw new Error('Este producto ya es componente de otro combo y no puede convertirse en combo (no se permite anidación).');
+    }
+
+    const seenComponents = new Set();
+
+    for (const comp of components) {
+      const compId = String(comp.component_product_id || comp.id || '');
+      const qty = Number(comp.quantity || comp.qty || 0);
+
+      // Regla: cantidad > 0 y entero
+      if (!Number.isInteger(qty) || qty <= 0) {
+        throw new Error('Cada componente debe tener una cantidad entera mayor a cero.');
+      }
+
+      // Regla: no componente de sí mismo
+      if (compId === String(combo_product_id)) {
+        throw new Error('Un producto no puede ser componente de sí mismo.');
+      }
+
+      // Regla: no duplicados
+      if (seenComponents.has(compId)) {
+        throw new Error('No se permiten componentes duplicados en el mismo combo.');
+      }
+      seenComponents.add(compId);
+
+      // Regla: producto existente
+      const { rows: compExists } = await client.query(
+        'SELECT id, title FROM pedidos_app_products WHERE id::text = $1',
+        [compId]
+      );
+      if (!compExists.length) {
+        throw new Error(`El componente con ID ${compId} no existe.`);
+      }
+
+      // Regla: el componente no puede ser un combo a su vez (no anidación circular ni multinivel)
+      const { rows: compIsCombo } = await client.query(
+        'SELECT 1 FROM pedidos_app_combo_components WHERE combo_product_id::text = $1',
+        [compId]
+      );
+      if (compIsCombo.length > 0) {
+        throw new Error(`El producto "${compExists[0].title}" ya es un combo. No se permite anidar combos dentro de combos.`);
+      }
+    }
+
+    // Limpiar componentes anteriores
+    await client.query('DELETE FROM pedidos_app_combo_components WHERE combo_product_id::text = $1', [combo_product_id]);
+
+    // Insertar nuevos componentes
+    for (const comp of components) {
+      const compId = String(comp.component_product_id || comp.id || '');
+      const qty = Number(comp.quantity || comp.qty || 0);
+
+      await client.query(
+        `INSERT INTO pedidos_app_combo_components (combo_product_id, component_product_id, quantity)
+         VALUES ($1, $2, $3)`,
+        [combo_product_id, compId, qty]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ status: 'ok', message: 'Combo configurado correctamente.' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ status: 'error', error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete('/api/pedidos/admin/combos/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM pedidos_app_combo_components WHERE combo_product_id::text = $1', [id]);
+    res.json({ status: 'ok', message: 'Configuración de combo eliminada.' });
+  } catch (error) {
+    console.error('Error deleting combo:', error);
+    res.status(500).json({ status: 'error', error: 'Error al eliminar configuración del combo' });
+  }
+});
+
+// --- COMPRAS DE INVENTARIO (NUEVO SISTEMA PRODUCTOS) ---
+app.get('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        p.id,
+        p.product_id,
+        pr.title AS product_title,
+        p.quantity,
+        p.unit_cost,
+        p.total_cost,
+        p.supplier,
+        p.purchase_date,
+        p.notes,
+        p.created_by,
+        p.created_at
+      FROM pedidos_app_inventory_purchases p
+      JOIN pedidos_app_products pr ON pr.id = p.product_id
+      ORDER BY p.purchase_date DESC, p.id DESC
+      LIMIT 200
+    `);
+    res.json({ status: 'ok', purchases: rows });
+  } catch (error) {
+    console.error('Error fetching inventory purchases:', error);
+    res.status(500).json({ status: 'error', error: 'Error al consultar compras' });
+  }
+});
+
+app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req, res) => {
+  const { product_id, quantity, unit_cost, total_cost, supplier, purchase_date, notes } = req.body;
+
+  const qty = Number(quantity);
+  if (!product_id || !Number.isInteger(qty) || qty <= 0) {
+    return res.status(400).json({ status: 'error', error: 'La cantidad debe ser un número entero mayor a cero.' });
+  }
+
+  let finalUnitCost = Number(unit_cost);
+  let finalTotalCost = Number(total_cost);
+
+  if (Number.isFinite(finalTotalCost) && finalTotalCost > 0 && (!finalUnitCost || finalUnitCost <= 0)) {
+    finalUnitCost = Math.round((finalTotalCost / qty) * 100) / 100;
+  } else if (Number.isFinite(finalUnitCost) && finalUnitCost >= 0 && (!finalTotalCost || finalTotalCost <= 0)) {
+    finalTotalCost = Math.round(qty * finalUnitCost * 100) / 100;
+  }
+
+  if (!Number.isFinite(finalUnitCost) || finalUnitCost < 0 || !Number.isFinite(finalTotalCost) || finalTotalCost < 0) {
+    return res.status(400).json({ status: 'error', error: 'El costo unitario y total deben ser valores numéricos válidos mayores o iguales a cero.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Obtener producto con bloqueo FOR UPDATE
+    const { rows: pRows } = await client.query(
+      'SELECT id, title, stock, track_stock, average_cost FROM pedidos_app_products WHERE id::text = $1 FOR UPDATE',
+      [product_id]
+    );
+    if (!pRows.length) {
+      throw new Error('El producto no existe.');
+    }
+    const product = pRows[0];
+
+    const currentStock = Number(product.stock) || 0;
+    const currentAvgCost = Number(product.average_cost) || 0;
+
+    // 2. Regla Documentada de Costo Promedio Ponderado:
+    // Si stock actual <= 0: la existencia anterior está agotada o en déficit; el nuevo costo promedio es el precio de la nueva compra.
+    // Si stock actual > 0: fórmula estándar ponderada: ((stock * costo) + compra_total) / (stock + cantidad)
+    let newAvgCost = finalUnitCost;
+    if (currentStock > 0) {
+      newAvgCost = Math.round((((currentStock * currentAvgCost) + finalTotalCost) / (currentStock + qty)) * 100) / 100;
+    }
+
+    const newStock = currentStock + qty;
+
+    // 3. Insertar compra
+    const { rows: purchaseRows } = await client.query(
+      `INSERT INTO pedidos_app_inventory_purchases 
+        (product_id, quantity, unit_cost, total_cost, supplier, purchase_date, notes, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [
+        product.id,
+        qty,
+        finalUnitCost,
+        finalTotalCost,
+        String(supplier || 'Proveedor General').trim().slice(0, 255),
+        purchase_date ? new Date(purchase_date) : new Date(),
+        notes ? String(notes).trim().slice(0, 500) : null,
+        req.user?.username || 'Sistema',
+      ]
+    );
+    const purchase = purchaseRows[0];
+
+    // 4. Actualizar producto (stock y average_cost)
+    await client.query(
+      `UPDATE pedidos_app_products
+       SET stock = $1, average_cost = $2, updated_at = NOW()
+       WHERE id = $3`,
+      [newStock, newAvgCost, product.id]
+    );
+
+    // 5. Registrar movimiento de inventario
+    await client.query(
+      `INSERT INTO pedidos_app_product_stock_movements
+        (product_id, movement_type, quantity, balance_after, reason, purchase_id, created_by)
+       VALUES ($1, 'COMPRA', $2, $3, $4, $5, $6)`,
+      [
+        product.id,
+        qty,
+        newStock,
+        `Compra a proveedor ${supplier || 'General'} (+${qty} ${product.title})`,
+        purchase.id,
+        req.user?.username || 'Sistema',
+      ]
+    );
+
+    await client.query('COMMIT');
+    res.json({
+      status: 'ok',
+      purchase,
+      product: {
+        id: product.id,
+        title: product.title,
+        previous_stock: currentStock,
+        new_stock: newStock,
+        previous_average_cost: currentAvgCost,
+        new_average_cost: newAvgCost,
+      },
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ status: 'error', error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 
 app.use('/api/pedidos', (req, res) => {
   res.status(404).json({ error: 'Ruta API no encontrada' });
