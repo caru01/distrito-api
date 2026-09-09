@@ -3861,10 +3861,17 @@ app.post('/api/pedidos/admin/expenses', authenticateToken, async (req, res) => {
 app.put('/api/pedidos/admin/expenses/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
+    
+    // BLOQUEO DE SEGURIDAD
+    const checkLinked = await pool.query('SELECT id FROM pedidos_app_inventory_purchases WHERE expense_id = $1 LIMIT 1', [id]);
+    if (checkLinked.rows.length > 0) {
+      return res.status(400).json({ error: 'No se puede editar este gasto porque contiene insumos de inventario vinculados. Realice el ajuste en el Kardex.' });
+    }
+
     const { category, description, amount, subtotal, iva, iva_percentage, expense_date, payment_method, receipt_url, items, provider } = req.body;
     const { rows } = await pool.query(
       `UPDATE pedidos_app_expenses SET category = $1, description = $2, amount = $3, subtotal = $4, iva = $5, iva_percentage = $6, expense_date = COALESCE($7, CURRENT_DATE), payment_method = COALESCE($8, 'Efectivo'), receipt_url = $9, items = $10, provider = $11 WHERE id = $12 RETURNING *`,
-      [category, description, amount, subtotal || 0, iva || 0, iva_percentage || 0, expense_date || null, payment_method || 'Efectivo', receipt_url || null, items ? JSON.stringify(items) : '[]', provider || null, id]
+      [category, description, amount, subtotal || 0, iva || 0, iva_percentage || 0, expense_date || null, payment_method || 'Efectivo', receipt_url || null, items ? (typeof items === 'string' ? items : JSON.stringify(items)) : '[]', provider || null, id]
     );
     res.json({ status: 'ok', data: rows[0] });
   } catch (err) {
@@ -3875,6 +3882,13 @@ app.put('/api/pedidos/admin/expenses/:id', authenticateToken, async (req, res) =
 app.delete('/api/pedidos/admin/expenses/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
+    
+    // BLOQUEO DE SEGURIDAD
+    const checkLinked = await pool.query('SELECT id FROM pedidos_app_inventory_purchases WHERE expense_id = $1 LIMIT 1', [id]);
+    if (checkLinked.rows.length > 0) {
+      return res.status(400).json({ error: 'No se puede eliminar este gasto porque contiene insumos de inventario vinculados. Realice el ajuste en el Kardex.' });
+    }
+
     await pool.query('DELETE FROM pedidos_app_expenses WHERE id = $1', [id]);
     res.json({ status: 'ok' });
   } catch (err) {

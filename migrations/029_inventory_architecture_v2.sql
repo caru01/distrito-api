@@ -65,7 +65,9 @@ SELECT
 FROM pedidos_app_products p
 JOIN pedidos_app_inventory_purchases pur ON pur.product_id = p.id
 WHERE pur.inventory_id IS NULL
-ON CONFLICT (name) DO NOTHING;
+AND NOT EXISTS (
+    SELECT 1 FROM pedidos_app_inventory i WHERE i.name = 'INSUMO LEGACY: ' || p.title
+);
 
 -- Link legacy purchases
 UPDATE pedidos_app_inventory_purchases pur
