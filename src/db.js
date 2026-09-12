@@ -45,7 +45,7 @@ function createPool(overrides = {}) {
 
   validateDatabaseEnvironment(connectionString);
 
-  return new Pool({
+  const pool = new Pool({
     connectionString: normalizedConnectionString(connectionString),
     ssl: { rejectUnauthorized: false },
     max: Number(process.env.DB_POOL_MAX || 10),
@@ -53,6 +53,12 @@ function createPool(overrides = {}) {
     connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS || 10000),
     ...overrides,
   });
+
+  pool.on('error', (err) => {
+    console.error('⚠️ [Neon DB Pool Error]:', err?.message || err);
+  });
+
+  return pool;
 }
 
 module.exports = { createPool, getDatabaseUrl };

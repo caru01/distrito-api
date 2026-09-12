@@ -690,7 +690,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
         SELECT shift_active, last_seen_at, tracking_device_id,
                (SELECT COUNT(*)::int FROM pedidos_app_orders committed
                 WHERE committed.delivery_user_id=$1
-                  AND COALESCE(committed.delivery_provider_type,'own')='own'
+                  AND (COALESCE(committed.delivery_provider_type,'own')='own' OR committed.delivery_user_id=$1)
                   AND committed.delivery_status IN ('Pendiente','Aceptado','Recogido','En camino')) AS committed_orders
         FROM pedidos_app_delivery_profiles WHERE user_id=$1
       `, [req.user.id]);
@@ -930,6 +930,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
     const [drivers, orders, settings] = await Promise.all([
       pool.query(`
         SELECT u.id, u.username, TRIM(CONCAT(u.name, ' ', u.last_name)) AS name, u.phone, u.photo_url,
+               u.external_company_id, comp.name AS external_company_name,
                profile.vehicle_name, profile.vehicle_type, profile.plate,
                profile.max_active_orders,
                profile.current_latitude, profile.current_longitude, profile.current_accuracy,
@@ -963,18 +964,19 @@ module.exports = function registerDeliveryApi(app, dependencies) {
                  ), '[]'::json)
                  FROM pedidos_app_orders o
                   WHERE o.delivery_user_id = u.id
-                    AND COALESCE(o.delivery_provider_type,'own')='own'
+                    AND (COALESCE(o.delivery_provider_type,'own')='own' OR o.delivery_user_id = u.id)
                     AND o.delivery_status IN ('Pendiente','Aceptado','Recogido','En camino')
                ) AS active_orders
         FROM pedidos_app_users u
         JOIN pedidos_app_roles role ON role.id = u.role_id AND role.name IN ('Domiciliario', 'Repartidor')
         LEFT JOIN pedidos_app_delivery_profiles profile ON profile.user_id = u.id
+        LEFT JOIN pedidos_app_delivery_companies comp ON comp.id = u.external_company_id
         LEFT JOIN pedidos_app_settings settings ON settings.id=1
         LEFT JOIN LATERAL (
           SELECT id, delivery_status, customer_name, address, delivery_latitude, delivery_longitude,
                  COUNT(*) OVER ()::int AS active_order_count
           FROM pedidos_app_orders
-          WHERE delivery_user_id = u.id AND COALESCE(delivery_provider_type,'own')='own'
+          WHERE delivery_user_id = u.id AND (COALESCE(delivery_provider_type,'own')='own' OR delivery_user_id = u.id)
             AND delivery_status IN ('Pendiente','Aceptado','Recogido','En camino')
           ORDER BY created_at ASC LIMIT 1
         ) active_order ON TRUE

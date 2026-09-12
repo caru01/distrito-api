@@ -164,7 +164,6 @@ class DeliveryOrderService {
       SELECT COUNT(*)::int AS count
       FROM pedidos_app_orders
       WHERE delivery_user_id=$1
-        AND COALESCE(delivery_provider_type, 'own')='own'
         AND delivery_status=ANY($2::text[])
     `, [userId, COMMITTED_DELIVERY_STATUSES]);
     return Number(rows[0]?.count || 0);
@@ -179,7 +178,6 @@ class DeliveryOrderService {
             WHEN EXISTS (
               SELECT 1 FROM pedidos_app_orders order_data
               WHERE order_data.delivery_user_id=profile.user_id
-                AND COALESCE(order_data.delivery_provider_type, 'own')='own'
                 AND order_data.delivery_status=ANY($2::text[])
             ) THEN 'Ocupado' ELSE 'Libre' END,
           tracking_mode = CASE
@@ -217,7 +215,7 @@ class DeliveryOrderService {
             ) THEN 'DELIVERY' ELSE 'FREE' END,
             availability_status=CASE WHEN EXISTS (
               SELECT 1 FROM pedidos_app_orders
-              WHERE delivery_user_id=$2 AND COALESCE(delivery_provider_type,'own')='own'
+              WHERE delivery_user_id=$2
                 AND delivery_status=ANY($3::text[])
             ) THEN 'Ocupado' ELSE 'Libre' END,
             updated_at=NOW()
@@ -327,7 +325,7 @@ class DeliveryOrderService {
       if (!order || String(order.delivery_type || '').toLowerCase() !== 'domicilio') {
         throw domainError('ORDER_NOT_FOUND', 'Pedido de domicilio no encontrado.', 404);
       }
-      if (String(order.delivery_provider_type || '').startsWith('external_')) {
+      if (String(order.delivery_provider_type || '').startsWith('external_') && Number(order.delivery_user_id) !== Number(driverId)) {
         throw domainError('ORDER_ASSIGNED_EXTERNAL', 'El pedido pertenece a un operador logístico externo.', 409);
       }
       if (order.status !== 'Listo' || order.delivery_status !== 'Pendiente'
@@ -343,7 +341,9 @@ class DeliveryOrderService {
       }
       const { rows } = await client.query(`
         UPDATE pedidos_app_orders
-        SET delivery_user_id=$1, delivery_provider_type='own', delivery_status='Aceptado',
+        SET delivery_user_id=$1,
+            delivery_provider_type=COALESCE(delivery_provider_type, 'own'),
+            delivery_status='Aceptado',
             status='Listo', delivery_accepted_at=COALESCE(delivery_accepted_at,NOW()),
             accepted_by_device_id=$2, version=version+1, updated_at=NOW()
         WHERE id=$3 AND status='Listo' AND delivery_status='Pendiente'
@@ -354,8 +354,8 @@ class DeliveryOrderService {
       await client.query(`
         INSERT INTO pedidos_app_delivery_events
           (order_id,event_type,provider_type,delivery_user_id,actor_user_id,actor_name,notes,metadata)
-        VALUES ($1,'accepted_own','own',$2,$2,$3,'Pedido aceptado; pendiente de iniciar entrega',$4::jsonb)
-      `, [orderId, driverId, actor.username || null, JSON.stringify({ deviceId: operationalDevice })]);
+        VALUES ($1,'accepted_own',COALESCE($5,'own'),$2,$2,$3,'Pedido aceptado; pendiente de iniciar entrega',$4::jsonb)
+      `, [orderId, driverId, actor.username || null, JSON.stringify({ deviceId: operationalDevice }), order.delivery_provider_type || null]);
       await this.recomputeDriver(client, driverId);
       await this.audit(client, {
         actor, action: 'Aceptar pedido', details: `Pedido #${orderId} aceptado`,
@@ -389,6 +389,7 @@ class DeliveryOrderService {
         UPDATE pedidos_app_orders
         SET delivery_status='En camino', status='En camino',
             picked_up_at=COALESCE(picked_up_at,NOW()), on_the_way_at=COALESCE(on_the_way_at,NOW()),
+            external_handed_off_at=CASE WHEN external_delivery_company_id IS NOT NULL THEN COALESCE(external_handed_off_at,NOW()) ELSE external_handed_off_at END,
             version=version+1, updated_at=NOW()
         WHERE id=$1 AND delivery_user_id=$2 AND delivery_status IN ('Aceptado','Recogido')
         RETURNING *
@@ -396,8 +397,8 @@ class DeliveryOrderService {
       await client.query(`
         INSERT INTO pedidos_app_delivery_events
           (order_id,event_type,provider_type,delivery_user_id,actor_user_id,actor_name,notes,metadata)
-        VALUES ($1,'delivery_started','own',$2,$2,$3,'Pedido recogido e inicio de entrega',$4::jsonb)
-      `, [orderId, driverId, actor.username || null, JSON.stringify({ deviceId: operationalDevice })]);
+        VALUES ($1,'delivery_started',COALESCE($5,'own'),$2,$2,$3,'Pedido recogido e inicio de entrega',$4::jsonb)
+      `, [orderId, driverId, actor.username || null, JSON.stringify({ deviceId: operationalDevice }), current.delivery_provider_type || null]);
       await this.recomputeDriver(client, driverId);
       await this.audit(client, {
         actor, action: 'Iniciar entrega', details: `Pedido #${orderId} recogido y en camino`,
@@ -429,34 +430,65 @@ class DeliveryOrderService {
       if (committed + (addsCommitment ? 1 : 0) > capacity) {
         throw domainError('DRIVER_AT_CAPACITY', `El domiciliario alcanzó su capacidad de ${capacity} pedido(s).`, 409, { capacity, committed });
       }
+
+      const { rows: driverUserRows } = await client.query('SELECT external_company_id, external_driver_id FROM pedidos_app_users WHERE id=$1', [driverId]);
+      const extCompanyId = driverUserRows[0]?.external_company_id || null;
+      const extDriverId = driverUserRows[0]?.external_driver_id || null;
+
+      let extDriverName = null;
+      let extDriverPhone = null;
+      let extVehicleId = null;
+      let extDeliveryCost = 0;
+
+      if (extCompanyId && extDriverId) {
+        const { rows: dRows } = await client.query('SELECT name, phone, vehicle_plate FROM pedidos_app_delivery_company_drivers WHERE id=$1', [extDriverId]);
+        if (dRows.length) {
+          extDriverName = dRows[0].name;
+          extDriverPhone = dRows[0].phone;
+          extVehicleId = dRows[0].vehicle_plate;
+        }
+        const { rows: cRows } = await client.query('SELECT default_fee FROM pedidos_app_delivery_companies WHERE id=$1', [extCompanyId]);
+        if (cRows.length && cRows[0].default_fee) {
+          extDeliveryCost = Number(cRows[0].default_fee);
+        }
+      }
+
       const previousUserId = current.delivery_user_id;
       const { rows } = await client.query(`
         UPDATE pedidos_app_orders
-        SET delivery_user_id=$1, delivery_provider_type='own', delivery_status='Pendiente',
-            external_delivery_company_id=NULL, external_driver_name=NULL, external_driver_phone=NULL,
-            external_vehicle_id=NULL, external_delivery_cost=0, external_delivery_notes=NULL,
-            external_eta_minutes=NULL, external_provider_reference=NULL, external_assigned_at=NULL,
+        SET delivery_user_id=$1,
+            delivery_provider_type=CASE WHEN $3::int IS NOT NULL THEN 'external_manual' ELSE 'own' END,
+            delivery_status='Pendiente',
+            external_delivery_company_id=$3,
+            external_driver_id=$4,
+            external_driver_name=$5,
+            external_driver_phone=$6,
+            external_vehicle_id=$7,
+            external_delivery_cost=$8,
+            external_assigned_at=CASE WHEN $3::int IS NOT NULL THEN NOW() ELSE NULL END,
+            external_delivery_notes=NULL,
+            external_eta_minutes=NULL, external_provider_reference=NULL,
             external_handed_off_at=NULL, delivery_accepted_at=NULL, accepted_by_device_id=NULL,
             version=version+1, updated_at=NOW()
         WHERE id=$2 AND status='Listo' AND delivery_status='Pendiente'
         RETURNING *
-      `, [driverId, orderId]);
+      `, [driverId, orderId, extCompanyId, extDriverId, extDriverName, extDriverPhone, extVehicleId, extDeliveryCost]);
       if (!rows.length) throw domainError('ORDER_ALREADY_TAKEN', 'El pedido ya no está disponible para asignación.', 409);
       await client.query(`
         INSERT INTO pedidos_app_delivery_events
-          (order_id,event_type,provider_type,delivery_user_id,actor_user_id,actor_name,notes,metadata)
-        VALUES ($1,$2,'own',$3,$4,$5,'Reserva de capacidad desde el ERP',$6::jsonb)
-      `, [orderId, previousUserId && Number(previousUserId) !== Number(driverId) ? 'reassigned' : 'assigned_own',
-        driverId, actor.id, actor.username || null, JSON.stringify({ previousDeliveryUserId: previousUserId || null })]);
+          (order_id,event_type,provider_type,delivery_user_id,company_id,actor_user_id,actor_name,notes,metadata)
+        VALUES ($1,$2,CASE WHEN $7::int IS NOT NULL THEN 'external_manual' ELSE 'own' END,$3,$7,$4,$5,'Reserva de capacidad desde el ERP',$6::jsonb)
+      `, [orderId, previousUserId && Number(previousUserId) !== Number(driverId) ? 'reassigned' : (extCompanyId ? 'assigned_external' : 'assigned_own'),
+        driverId, actor.id, actor.username || null, JSON.stringify({ previousDeliveryUserId: previousUserId || null, externalCompanyId: extCompanyId }), extCompanyId]);
       await this.recomputeDriver(client, driverId);
       if (previousUserId && Number(previousUserId) !== Number(driverId)) await this.recomputeDriver(client, previousUserId);
       await this.audit(client, {
-        actor, action: 'Reservar pedido', details: `Pedido #${orderId} reservado al domiciliario #${driverId}`,
-        requestData: { orderId, driverId, previousUserId: previousUserId || null },
+        actor, action: 'Reservar pedido', details: `Pedido #${orderId} reservado al domiciliario #${driverId}${extCompanyId ? ` (Empresa #${extCompanyId})` : ''}`,
+        requestData: { orderId, driverId, previousUserId: previousUserId || null, externalCompanyId: extCompanyId },
       });
       const event = await this.appendDomainEvent(client, 'order_reserved', 'order', orderId, {
         orderId, deliveryUserId: driverId, previousDeliveryUserId: previousUserId || null,
-        orderStatus: 'Listo', deliveryStatus: 'Pendiente',
+        orderStatus: 'Listo', deliveryStatus: 'Pendiente', externalCompanyId: extCompanyId,
       });
       return { status: 'ok', order: rows[0], events: [event] };
     });
@@ -553,6 +585,7 @@ class DeliveryOrderService {
             delivery_rating=$2, delivery_evidence=$3,
             delivery_distance_km=$4,
             delivery_duration_seconds=GREATEST(0,EXTRACT(EPOCH FROM (NOW()-created_at))::integer),
+            external_delivery_confirmed_at=CASE WHEN external_delivery_company_id IS NOT NULL THEN COALESCE(external_delivery_confirmed_at,NOW()) ELSE external_delivery_confirmed_at END,
             version=version+1, updated_at=NOW()
         WHERE id=$5 AND delivery_user_id=$6 AND delivery_status='En camino'
         RETURNING *
@@ -562,11 +595,11 @@ class DeliveryOrderService {
       await client.query(`
         INSERT INTO pedidos_app_delivery_events
           (order_id,event_type,provider_type,delivery_user_id,actor_user_id,actor_name,notes,metadata)
-        VALUES ($1,'delivered','own',$2,$2,$3,'Entrega propia finalizada',$4::jsonb)
+        VALUES ($1,'delivered',COALESCE($5,'own'),$2,$2,$3,'Entrega finalizada',$4::jsonb)
       `, [orderId, driverId, actor.username || null, JSON.stringify({
         deviceId: operationalDevice, arrival, geofenceOverrideId: override?.id || null,
         evidenceSha256: evidence?.sha256 || null,
-      })]);
+      }), current.delivery_provider_type || null]);
       await client.query(`
         UPDATE pedidos_app_delivery_profiles
         SET rating_sum=rating_sum+COALESCE($1,0),
