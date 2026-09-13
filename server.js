@@ -90,7 +90,7 @@ const allowedOrigins = [
   'https://distrito-web.vercel.app', // Vercel (fallback)
   'https://distrito-admin.vercel.app',
   /\.vercel\.app$/,                  // Previews de Vercel
-  /^http:\/\/localhost/,             // Desarrollo local
+  /^https?:\/\/localhost/,           // Desarrollo local web y Capacitor Android
 ];
 app.use(cors({
   origin: (origin, callback) => {
@@ -796,12 +796,12 @@ app.get('/api/pedidos/init', async (req, res) => {
     const { rows: products } = await pool.query(`
       SELECT id, title, description, price, category, status, is_active, is_featured,
              stock, track_stock, low_stock_threshold, inventory_unit, barcode,
-             rating_sum, rating_count, created_at, updated_at, image IS NOT NULL AS has_image
+             rating_sum, rating_count, created_at, updated_at, sort_order, image IS NOT NULL AS has_image
       FROM pedidos_app_products
       WHERE status = 'Activo'
-      ORDER BY id DESC
+      ORDER BY sort_order ASC, created_at DESC, id DESC
     `);
-    const { rows: categories } = await pool.query("SELECT * FROM pedidos_app_categories WHERE status = 'Activa' ORDER BY id ASC");
+    const { rows: categories } = await pool.query("SELECT * FROM pedidos_app_categories WHERE status = 'Activa' ORDER BY sort_order ASC, id ASC");
 
     // Asumimos que settings es solo una fila
     let settingsRow = { whatsapp_number: '', nequi_number: '', bancolombia_number: '' };
@@ -1891,11 +1891,11 @@ app.get('/api/pedidos/admin/categories', authenticateToken, async (req, res) => 
 
     // Obtener categorías y contar productos relacionados
     const { rows } = await pool.query(`
-      SELECT c.id, c.name, c.description, c.image, c.status, COUNT(p.id) as products
+      SELECT c.id, c.name, c.description, c.image, c.status, c.sort_order, COUNT(p.id) as products
       FROM pedidos_app_categories c
       LEFT JOIN pedidos_app_products p ON c.name = p.category
       GROUP BY c.id
-      ORDER BY c.id ASC
+      ORDER BY c.sort_order ASC, c.id ASC
     `);
 
     res.json({ status: 'ok', categories: rows });
@@ -1905,12 +1905,44 @@ app.get('/api/pedidos/admin/categories', authenticateToken, async (req, res) => 
   }
 });
 
+// Reordenar categorías
+app.put('/api/pedidos/admin/categories/reorder', authenticateToken, async (req, res) => {
+  try {
+    const { orderedIds } = req.body;
+    if (!Array.isArray(orderedIds) || orderedIds.length === 0) {
+      return res.status(400).json({ error: 'orderedIds debe ser un array con IDs de categorías' });
+    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (let i = 0; i < orderedIds.length; i++) {
+        await client.query(
+          'UPDATE pedidos_app_categories SET sort_order = $1 WHERE id = $2',
+          [i + 1, orderedIds[i]]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      client.release();
+    }
+    res.json({ status: 'ok', message: 'Categorías reordenadas exitosamente' });
+  } catch (error) {
+    console.error('Error reordering categories:', error);
+    res.status(500).json({ status: 'error', error: error.message });
+  }
+});
+
 // Crear categoría
 app.post('/api/pedidos/admin/categories', authenticateToken, async (req, res) => {
   try {
     const { name, description, image, status } = req.body;
     const { rows } = await pool.query(
-      'INSERT INTO pedidos_app_categories (name, description, image, status) VALUES ($1, $2, $3, $4) RETURNING *',
+      `INSERT INTO pedidos_app_categories (name, description, image, status, sort_order)
+       VALUES ($1, $2, $3, $4, COALESCE((SELECT MAX(sort_order) FROM pedidos_app_categories), 0) + 1)
+       RETURNING *`,
       [name, description, image, status || 'Activa']
     );
     res.json({ status: 'ok', category: rows[0] });
@@ -2586,12 +2618,42 @@ app.get('/api/pedidos/admin/products', authenticateToken, async (req, res) => {
     const { rows } = await pool.query(`
       SELECT id, title, description, price, category, status, is_active, is_featured,
              stock, barcode, track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost,
-             rating_sum, rating_count, created_at, updated_at, image IS NOT NULL AS has_image
-      FROM pedidos_app_products ORDER BY id DESC
+             rating_sum, rating_count, created_at, updated_at, sort_order, image IS NOT NULL AS has_image
+      FROM pedidos_app_products ORDER BY sort_order ASC, id DESC
     `);
     res.json({ status: 'ok', products: rows.map((product) => productForResponse(req, product)) });
   } catch (error) {
     console.error('Error fetching products:', error);
+    res.status(500).json({ status: 'error', error: error.message });
+  }
+});
+
+// Reordenar productos
+app.put('/api/pedidos/admin/products/reorder', authenticateToken, async (req, res) => {
+  try {
+    const { orderedIds } = req.body;
+    if (!Array.isArray(orderedIds) || orderedIds.length === 0) {
+      return res.status(400).json({ error: 'orderedIds debe ser un array con IDs de productos' });
+    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (let i = 0; i < orderedIds.length; i++) {
+        await client.query(
+          'UPDATE pedidos_app_products SET sort_order = $1 WHERE id::text = $2',
+          [i + 1, String(orderedIds[i])]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK');
+      throw txErr;
+    } finally {
+      client.release();
+    }
+    res.json({ status: 'ok', message: 'Productos reordenados exitosamente' });
+  } catch (error) {
+    console.error('Error reordering products:', error);
     res.status(500).json({ status: 'error', error: error.message });
   }
 });
@@ -2607,8 +2669,9 @@ app.post('/api/pedidos/admin/products', authenticateToken, async (req, res) => {
     const { rows } = await pool.query(
       `INSERT INTO pedidos_app_products
        (title, description, price, category, image, status, is_featured, stock, barcode,
-        track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+        track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost, sort_order)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+               COALESCE((SELECT MAX(sort_order) FROM pedidos_app_products WHERE category = $4), 0) + 1) RETURNING *`,
       [title.trim(), description, Number(price), category, image, status || 'Activo', Boolean(is_featured),
         Number(stock) || 0, barcode?.trim() || null, Boolean(track_stock), Number(low_stock_threshold) || 5,
         inventory_unit || 'unidad', Number(inventory_unit_cost) || 0]
