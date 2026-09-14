@@ -130,12 +130,21 @@ function formatAvailableOrder(row) {
   return {
     id: order.id,
     customerName: order.customerName,
+    customerPhone: order.customerPhone,
+    phoneLink: order.phoneLink,
+    whatsappLink: order.whatsappLink,
     address: order.address,
     barrio: order.barrio,
+    reference: order.reference,
+    apartment: order.apartment,
+    tower: order.tower,
+    floor: order.floor,
+    notes: order.notes,
     deliveryType: order.deliveryType,
     paymentMethod: order.paymentMethod,
     total: order.total,
     deliveryFee: order.deliveryFee,
+    changeRequired: order.changeRequired,
     orderStatus: order.orderStatus,
     deliveryStatus: order.deliveryStatus,
     deliveryUserId: order.deliveryUserId,
@@ -145,6 +154,7 @@ function formatAvailableOrder(row) {
     destinationLongitude: order.destinationLongitude,
     store: order.store,
     googleMapsUrl: order.googleMapsUrl,
+    items: order.items || [],
     restricted: true,
   };
 }
@@ -721,7 +731,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
       WHERE order_data.delivery_user_id = $1
         AND order_data.delivery_status = ANY($2::text[])
       ORDER BY order_data.created_at ASC
-    `, [req.user.id, ['Aceptado', 'Recogido', 'En camino']]);
+    `, [req.user.id, ['Aceptado', 'Recogido', 'En camino', 'Asignado externo', 'Entregado al operador externo']]);
     res.json({ status: 'ok', capacity: req.deliveryUser.max_active_orders, orders: rows.map(formatOrder) });
   });
 

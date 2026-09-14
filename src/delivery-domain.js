@@ -2,13 +2,15 @@ const OWN_DELIVERY_TRANSITIONS = Object.freeze({
   Pendiente: new Set(['Aceptado', 'Cancelado']),
   Aceptado: new Set(['En camino', 'Cancelado']),
   Recogido: new Set(['En camino', 'Cancelado']),
+  'Asignado externo': new Set(['En camino', 'Cancelado']),
+  'Entregado al operador externo': new Set(['En camino', 'Cancelado']),
   'En camino': new Set(['Entregado', 'Cancelado']),
   Entregado: new Set(),
   Cancelado: new Set(),
 });
 
-const COMMITTED_DELIVERY_STATUSES = Object.freeze(['Pendiente', 'Aceptado', 'Recogido', 'En camino']);
-const ACTIVE_DELIVERY_STATUSES = Object.freeze(['Aceptado', 'Recogido', 'En camino']);
+const COMMITTED_DELIVERY_STATUSES = Object.freeze(['Pendiente', 'Aceptado', 'Recogido', 'Asignado externo', 'Entregado al operador externo', 'En camino']);
+const ACTIVE_DELIVERY_STATUSES = Object.freeze(['Aceptado', 'Recogido', 'Asignado externo', 'Entregado al operador externo', 'En camino']);
 const ON_THE_WAY_DELIVERY_STATUSES = Object.freeze(['Recogido', 'En camino']);
 
 function domainError(code, message, statusCode = 409, details = {}) {

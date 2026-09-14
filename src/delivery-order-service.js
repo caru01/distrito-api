@@ -381,7 +381,7 @@ class DeliveryOrderService {
       if (!current || Number(current.delivery_user_id) !== Number(driverId)) {
         throw domainError('ORDER_NOT_ASSIGNED', 'El pedido no está asignado a este domiciliario.', 409);
       }
-      if (!['Aceptado', 'Recogido'].includes(current.delivery_status)) {
+      if (!['Aceptado', 'Recogido', 'Asignado externo', 'Entregado al operador externo'].includes(current.delivery_status)) {
         throw domainError('INVALID_ORDER_STATE', 'El pedido debe estar aceptado antes de iniciar la entrega.', 409);
       }
       assertOwnDeliveryTransition(current.delivery_status, 'En camino');
@@ -391,7 +391,7 @@ class DeliveryOrderService {
             picked_up_at=COALESCE(picked_up_at,NOW()), on_the_way_at=COALESCE(on_the_way_at,NOW()),
             external_handed_off_at=CASE WHEN external_delivery_company_id IS NOT NULL THEN COALESCE(external_handed_off_at,NOW()) ELSE external_handed_off_at END,
             version=version+1, updated_at=NOW()
-        WHERE id=$1 AND delivery_user_id=$2 AND delivery_status IN ('Aceptado','Recogido')
+        WHERE id=$1 AND delivery_user_id=$2 AND delivery_status IN ('Aceptado','Recogido','Asignado externo','Entregado al operador externo')
         RETURNING *
       `, [orderId, driverId]);
       await client.query(`
