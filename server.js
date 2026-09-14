@@ -4929,6 +4929,68 @@ app.delete('/api/pedidos/admin/recipes/:id', authenticateToken, async (req, res)
   }
 });
 
+// Copiar / Duplicar receta técnica de un producto a otro
+app.post('/api/pedidos/admin/recipes/copy', authenticateToken, async (req, res) => {
+  const { source_product_id, target_product_id, mode } = req.body;
+  if (!source_product_id || !target_product_id) {
+    return res.status(400).json({ status: 'error', error: 'Debes indicar el producto origen y el producto destino.' });
+  }
+  if (String(source_product_id) === String(target_product_id)) {
+    return res.status(400).json({ status: 'error', error: 'El producto destino no puede ser el mismo producto origen.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Obtener la receta origen
+    const { rows: sourceItems } = await client.query(
+      `SELECT inventory_id, quantity, is_controlled 
+       FROM pedidos_app_product_recipes 
+       WHERE product_id::text = $1`,
+      [source_product_id]
+    );
+
+    if (!sourceItems.length) {
+      throw new Error('El producto origen no tiene una receta técnica configurada.');
+    }
+
+    // 2. Si el modo es 'replace' (por defecto), eliminar la receta actual del producto destino
+    const copyMode = mode || 'replace';
+    if (copyMode === 'replace') {
+      await client.query('DELETE FROM pedidos_app_product_recipes WHERE product_id::text = $1', [target_product_id]);
+    }
+
+    // 3. Insertar los insumos clonados
+    for (const item of sourceItems) {
+      await client.query(
+        `INSERT INTO pedidos_app_product_recipes (product_id, inventory_id, quantity, is_controlled)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (product_id, inventory_id) DO UPDATE SET quantity = $3, is_controlled = $4, updated_at = NOW()`,
+        [target_product_id, item.inventory_id, item.quantity, item.is_controlled]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    const { rows: updatedRows } = await pool.query(
+      `SELECT pr.*, inv.name AS inventory_title, inv.unit AS inventory_unit, COALESCE(inv.average_cost, 0) AS inventory_average_cost 
+       FROM pedidos_app_product_recipes pr
+       JOIN pedidos_app_inventory inv ON pr.inventory_id = inv.id
+       WHERE pr.product_id::text = $1`,
+      [target_product_id]
+    );
+
+    res.json({ status: 'ok', copied_count: sourceItems.length, recipes: updatedRows });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ status: 'error', error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+
 // --- RENTABILIDAD Y COSTOS ---
 app.get('/api/pedidos/admin/profitability', authenticateToken, async (req, res) => {
   try {
