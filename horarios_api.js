@@ -83,18 +83,21 @@ module.exports = function(app, pool, authenticateToken) {
         }
       }
 
+      const weekRes = await pool.query('SELECT * FROM pedidos_app_horarios ORDER BY id ASC');
+
       return {
         status: 'ok',
         isOpen: Boolean(activeSchedule),
         statusText: activeSchedule ? 'Abierto y recibiendo pedidos' : 'Cerrado (fuera del horario de pedidos)',
         currentSchedule: activeSchedule || todaySchedule,
+        horarios: weekRes.rows || [],
         config: { ...config, timezone },
         localNow: `${local.date}T${local.time}:00`,
         timezone,
       };
     } catch(err) {
       console.error('Error in getHorariosStatus:', err);
-      return { status: 'error', isOpen: false, statusText: 'Horario no disponible', currentSchedule: null, config: { timezone: DEFAULT_TIMEZONE }, timezone: DEFAULT_TIMEZONE };
+      return { status: 'error', isOpen: false, statusText: 'Horario no disponible', currentSchedule: null, horarios: [], config: { timezone: DEFAULT_TIMEZONE }, timezone: DEFAULT_TIMEZONE };
     }
   };
 
