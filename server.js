@@ -397,6 +397,21 @@ async function normalizeOrderCart(client, rawCart, { activeOnly = true } = {}) {
     recipeMap.get(key).push(row);
   }
 
+  // Fetch active modifier recipes
+  let modifierRows = [];
+  try {
+    const { rows: mods } = await client.query(
+      `SELECT mr.modifier_name, mr.inventory_id, mr.quantity AS modifier_qty, 
+              inv.name AS inventory_title, inv.track_stock, inv.average_cost
+       FROM pedidos_app_modifier_recipes mr
+       JOIN pedidos_app_inventory inv ON inv.id = mr.inventory_id
+       WHERE mr.is_controlled = true`
+    );
+    modifierRows = mods;
+  } catch (err) {
+    // Graceful fallback if table does not exist
+  }
+
   const cart = rawCart.map((item) => {
     const id = String(item.id || item.product_id || '');
     const product = products.get(id);
@@ -413,6 +428,7 @@ async function normalizeOrderCart(client, rawCart, { activeOnly = true } = {}) {
       category: product.category || 'General',
       quantity,
       notes: String(item.notes || item.observations || item.observaciones || '').trim().slice(0, 500),
+      modifiers: Array.isArray(item.modifiers) ? item.modifiers : (Array.isArray(item.adiciones) ? item.adiciones : []),
     };
   });
 
@@ -456,6 +472,29 @@ async function normalizeOrderCart(client, rawCart, { activeOnly = true } = {}) {
               quantity: item.quantity * Number(recipe.recipe_qty),
               current_average_cost: Number(recipe.average_cost) || 0,
               is_combo: false,
+            });
+          }
+        }
+      }
+    }
+
+    // Deduct modifiers / adiciones if present
+    if (modifierRows.length > 0 && Array.isArray(item.modifiers) && item.modifiers.length > 0) {
+      for (const mod of item.modifiers) {
+        const modName = (typeof mod === 'string' ? mod : (mod.name || mod.title || '')).toLowerCase().trim();
+        const matches = modifierRows.filter(m => m.modifier_name.toLowerCase().trim() === modName);
+        for (const m of matches) {
+          if (m.track_stock) {
+            expandedDeductions.push({
+              parent_product_id: String(item.id),
+              parent_title: `${item.title} (+${m.modifier_name})`,
+              component_product_id: null,
+              inventory_id: String(m.inventory_id),
+              inventory_title: m.inventory_title,
+              quantity: item.quantity * Number(m.modifier_qty),
+              current_average_cost: Number(m.average_cost) || 0,
+              is_combo: false,
+              is_modifier: true,
             });
           }
         }
@@ -1882,6 +1921,147 @@ app.get('/api/pedidos/admin/dashboard', authenticateToken, async (req, res) => {
   }
 });
 
+// Helper: calcula las fechas de inicio y fin del período en hora Bogotá
+function getBogotaPeriodDates(period) {
+  const bogotaNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Bogota' }));
+  const year = bogotaNow.getFullYear();
+  const month = bogotaNow.getMonth();
+  const day = bogotaNow.getDate();
+  const dayOfWeek = bogotaNow.getDay(); // 0=Sun, 1=Mon...
+
+  let startDate, endDate, label;
+
+  const fmt = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  endDate = fmt(bogotaNow);
+
+  if (period === 'weekly') {
+    const daysFromMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+    const monday = new Date(bogotaNow);
+    monday.setDate(day - daysFromMonday);
+    startDate = fmt(monday);
+    label = 'Esta semana';
+  } else if (period === 'monthly') {
+    startDate = `${year}-${String(month+1).padStart(2,'0')}-01`;
+    label = 'Este mes';
+  } else { // 15d default
+    const start = new Date(bogotaNow);
+    start.setDate(day - 14);
+    startDate = fmt(start);
+    label = 'Últimos 15 días';
+  }
+
+  return { startDate, endDate, label };
+}
+
+// GET /api/pedidos/admin/dashboard/profitability?period=15d|weekly|monthly
+app.get('/api/pedidos/admin/dashboard/profitability', authenticateToken, async (req, res) => {
+  try {
+    const period = ['15d', 'weekly', 'monthly'].includes(req.query.period) ? req.query.period : '15d';
+    const { startDate, endDate, label } = getBogotaPeriodDates(period);
+
+    const { rows } = await pool.query(`
+      WITH period_orders AS (
+        SELECT
+          id,
+          status,
+          total,
+          delivery_fee,
+          external_delivery_cost,
+          total_cogs,
+          jsonb_array_length(CASE WHEN jsonb_typeof(cart_json) = 'array' THEN cart_json ELSE '[]'::jsonb END) AS items_in_order
+        FROM pedidos_app_orders
+        WHERE (created_at AT TIME ZONE 'America/Bogota')::date BETWEEN $1::date AND $2::date
+      ),
+      completed_orders AS (
+        SELECT * FROM period_orders WHERE status IN ('Entregado', 'Completado')
+      ),
+      order_costs AS (
+        SELECT 
+          c.order_id,
+          COUNT(DISTINCT c.product_id) AS costed_products_in_order
+        FROM pedidos_app_order_item_costs c
+        WHERE c.order_id IN (SELECT id FROM completed_orders)
+        GROUP BY c.order_id
+      )
+      SELECT
+        (SELECT COUNT(*) FROM completed_orders) AS completed_count,
+        (SELECT COUNT(*) FROM period_orders WHERE status = 'Cancelado') AS cancelled_count,
+        (SELECT COALESCE(SUM(total), 0) FROM completed_orders) AS net_sales,
+        (SELECT COALESCE(SUM(delivery_fee), 0) FROM completed_orders) AS delivery_fee_total,
+        (SELECT COALESCE(SUM(external_delivery_cost), 0) FROM completed_orders) AS delivery_cost_total,
+        (SELECT COALESCE(SUM(total_cogs::numeric), 0) FROM completed_orders WHERE total_cogs IS NOT NULL AND total_cogs::numeric > 0) AS total_cogs,
+        (SELECT COUNT(*) FROM completed_orders WHERE total_cogs IS NOT NULL AND total_cogs::numeric > 0) AS cogs_covered_orders,
+        (SELECT COUNT(*) FROM completed_orders WHERE total_cogs IS NULL OR total_cogs::numeric = 0) AS cogs_missing_orders,
+        (SELECT COALESCE(SUM(items_in_order), 0) FROM completed_orders) AS total_items_count,
+        (SELECT COALESCE(SUM(costed_products_in_order), 0) FROM order_costs) AS costed_products_count,
+        (SELECT COALESCE(SUM(amount), 0) FROM pedidos_app_expenses WHERE expense_date BETWEEN $1::date AND $2::date) AS expenses,
+        (SELECT COUNT(*)::int FROM pedidos_app_expenses WHERE expense_date BETWEEN $1::date AND $2::date) AS expenses_count
+    `, [startDate, endDate]);
+
+    const row = rows[0];
+    const completedCount       = parseInt(row.completed_count, 10);
+    const cancelledCount       = parseInt(row.cancelled_count, 10);
+    const netSales             = parseInt(row.net_sales, 10);
+    const deliveryFeeTotal     = parseInt(row.delivery_fee_total, 10);
+    const deliveryCostTotal    = parseInt(row.delivery_cost_total, 10);
+    const totalCogs            = parseFloat(row.total_cogs);
+    const cogsCoveredOrders    = parseInt(row.cogs_covered_orders, 10);
+    const cogsMissingOrders    = parseInt(row.cogs_missing_orders, 10);
+    const totalItemsCount      = parseInt(row.total_items_count, 10);
+    const costedProductsCount  = parseInt(row.costed_products_count, 10);
+    const expenses             = parseFloat(row.expenses);
+    const expensesCount        = parseInt(row.expenses_count, 10);
+
+    const productSales         = netSales - deliveryFeeTotal;
+    const deliveryNetMargin    = deliveryFeeTotal - deliveryCostTotal;
+    const productGrossProfit   = productSales - totalCogs;
+    const productGrossMarginPct= productSales > 0 ? Math.round((productGrossProfit / productSales) * 1000) / 10 : null;
+    const grossProfit          = netSales - totalCogs - deliveryCostTotal;
+    const grossMarginPct       = netSales > 0 ? Math.round((grossProfit / netSales) * 1000) / 10 : null;
+    const cogsCoveragePct      = completedCount > 0 ? Math.round((cogsCoveredOrders / completedCount) * 100) : 0;
+    const cogsIsPartial        = cogsCoveredOrders < completedCount;
+    const hasExpenses          = expensesCount > 0;
+    const profitAfterExpenses  = grossProfit - expenses;
+    const profitAfterExpensesIsEstimated = true;
+
+    res.json({
+      status: 'ok',
+      profitability: {
+        period,
+        periodLabel: label,
+        periodStart: startDate,
+        periodEnd: endDate,
+        completedCount,
+        cancelledCount,
+        netSales,
+        productSales,
+        deliveryFeeTotal,
+        deliveryCostTotal,
+        deliveryNetMargin,
+        totalItemsCount,
+        costedProductsCount,
+        totalCogs,
+        cogsCoveredOrders,
+        cogsMissingOrders,
+        cogsCoveragePct,
+        cogsIsPartial,
+        productGrossProfit,
+        productGrossMarginPct,
+        grossProfit,
+        grossMarginPct,
+        expenses,
+        expensesCount,
+        hasExpenses,
+        profitAfterExpenses,
+        profitAfterExpensesIsEstimated,
+      },
+    });
+  } catch (error) {
+    console.error('Error calculando rentabilidad:', error);
+    res.status(500).json({ status: 'error', error: 'No fue posible calcular la rentabilidad.' });
+  }
+});
+
 // Obtener todas las categorías para el panel admin
 app.get('/api/pedidos/admin/categories', authenticateToken, async (req, res) => {
   try {
@@ -2200,6 +2380,37 @@ app.post('/api/pedidos/admin/customers/:id/contact', authenticateToken, async (r
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+// ================= ESTADÍSTICAS LIGERAS =================
+app.get('/api/pedidos/admin/stats/live', authenticateToken, async (req, res) => {
+  try {
+    if (!dbUrl) return res.json({ status: 'ok', stats: { inKitchen: 0, preparing: 0, ready: 0, todaySales: 0 } });
+    
+    // Obtener stats de hoy usando zona horaria de Colombia
+    const { rows } = await pool.query(`
+      SELECT status, total
+      FROM pedidos_app_orders 
+      WHERE DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Bogota') = DATE(NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Bogota')
+    `);
+    
+    let inKitchen = 0;
+    let preparing = 0;
+    let ready = 0;
+    let todaySales = 0;
+    
+    for (const order of rows) {
+      if (order.status === 'Nuevo') inKitchen++;
+      else if (order.status === 'En preparación') preparing++;
+      else if (order.status === 'Listo') ready++;
+      else if (order.status === 'Entregado' || order.status === 'Completado') todaySales += Number(order.total || 0);
+    }
+    
+    res.json({ status: 'ok', stats: { inKitchen, preparing, ready, todaySales } });
+  } catch (error) {
+    console.error('Error fetching live stats:', error);
+    res.status(500).json({ error: 'Error al cargar estadísticas' });
+  }
+});
+
 app.get('/api/pedidos/admin/orders', authenticateToken, async (req, res) => {
   try {
     if (!dbUrl) return res.json({ status: 'ok', orders: [] });
@@ -2219,6 +2430,7 @@ app.get('/api/pedidos/admin/orders', authenticateToken, async (req, res) => {
              external_delivery_cost, external_delivery_notes, external_eta_minutes,
              external_assigned_at, external_handed_off_at, external_delivery_confirmed_at,
              external_delivery_confirmed_by_name, external_delivery_confirmation_notes,
+             external_provider_reference,
               crm_contact_id,
               (SELECT bsuid FROM pedidos_app_crm_contacts WHERE id = pedidos_app_orders.crm_contact_id) AS crm_bsuid,
               (SELECT username FROM pedidos_app_crm_contacts WHERE id = pedidos_app_orders.crm_contact_id) AS crm_username,
@@ -3036,6 +3248,9 @@ app.get('/api/pedidos/admin/inventory', authenticateToken, async (req, res) => {
         COALESCE(i.unit_cost, i.average_cost, 0) AS unit_cost,
         i.category,
         i.status,
+        COALESCE(i.is_prepared, false) AS is_prepared,
+        i.purchase_unit,
+        COALESCE(i.conversion_factor, 1) AS conversion_factor,
         i.created_at,
         i.updated_at
       FROM pedidos_app_inventory i
@@ -3050,7 +3265,7 @@ app.get('/api/pedidos/admin/inventory', authenticateToken, async (req, res) => {
 app.post('/api/pedidos/admin/inventory', authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
-    const { name, unit, min_stock, track_stock, sku, category, status } = req.body;
+    const { name, unit, min_stock, track_stock, sku, category, status, is_prepared, purchase_unit, conversion_factor } = req.body;
     if (!name?.trim()) return res.status(400).json({ status: 'error', error: 'El nombre del insumo es requerido' });
     
     await client.query('BEGIN');
@@ -3066,11 +3281,11 @@ app.post('/api/pedidos/admin/inventory', authenticateToken, async (req, res) => 
 
     const finalSku = sku?.trim() ? sku.trim() : await generateIngredientSku(client, category);
     
-    // Regla de arquitectura: stock inicial = 0, costo inicial = 0 (el stock solo entra por Compras)
+    // Regla de arquitectura: stock inicial = 0, costo inicial = 0 (el stock solo entra por Compras o Producción)
     const { rows } = await client.query(
       `INSERT INTO pedidos_app_inventory
-       (name, unit, min_stock, track_stock, sku, average_cost, unit_cost, stock, category, status)
-       VALUES ($1, $2, $3, $4, $5, 0, 0, 0, $6, $7) RETURNING *`,
+       (name, unit, min_stock, track_stock, sku, average_cost, unit_cost, stock, category, status, is_prepared, purchase_unit, conversion_factor)
+       VALUES ($1, $2, $3, $4, $5, 0, 0, 0, $6, $7, $8, $9, $10) RETURNING *`,
       [
         name.trim(),
         unit || 'unidad',
@@ -3078,7 +3293,10 @@ app.post('/api/pedidos/admin/inventory', authenticateToken, async (req, res) => 
         track_stock !== false,
         finalSku,
         category || 'General',
-        status || 'Activo'
+        status || 'Activo',
+        Boolean(is_prepared),
+        purchase_unit?.trim() || null,
+        Number(conversion_factor) > 0 ? Number(conversion_factor) : 1
       ]
     );
 
@@ -3096,7 +3314,7 @@ app.put('/api/pedidos/admin/inventory/:id', authenticateToken, async (req, res) 
   const client = await pool.connect();
   try {
     const { id } = req.params;
-    const { name, unit, min_stock, track_stock, sku, category, status } = req.body;
+    const { name, unit, min_stock, track_stock, sku, category, status, is_prepared, purchase_unit, conversion_factor } = req.body;
 
     await client.query('BEGIN');
     const { rows: current } = await client.query('SELECT id, name FROM pedidos_app_inventory WHERE id = $1 FOR UPDATE', [id]);
@@ -3123,8 +3341,11 @@ app.put('/api/pedidos/admin/inventory/:id', authenticateToken, async (req, res) 
            sku = COALESCE($5, sku),
            category = COALESCE($6, category),
            status = COALESCE($7, status),
+           is_prepared = COALESCE($8, is_prepared),
+           purchase_unit = COALESCE($9, purchase_unit),
+           conversion_factor = COALESCE($10, conversion_factor),
            updated_at = NOW()
-       WHERE id = $8 RETURNING *`,
+       WHERE id = $11 RETURNING *`,
       [
         name ? name.trim() : null,
         unit || null,
@@ -3133,6 +3354,9 @@ app.put('/api/pedidos/admin/inventory/:id', authenticateToken, async (req, res) 
         sku ? sku.trim() : null,
         category || null,
         status || null,
+        typeof is_prepared === 'boolean' ? is_prepared : null,
+        purchase_unit !== undefined ? (purchase_unit?.trim() || null) : null,
+        conversion_factor !== undefined ? Number(conversion_factor) : null,
         id
       ]
     );
@@ -4664,6 +4888,15 @@ require('./crm_api')(app, {
   requirePermission,
   whatsappClient,
 });
+require('./inventory_advanced_api')(app, {
+  pool,
+  authenticateToken,
+});
+require('./rappi_api')(app, {
+  pool,
+  authenticateToken,
+  deliveryOrderService,
+});
 
 const deliveryOutbox = createOutboxDispatcher({
   pool,
@@ -5125,7 +5358,10 @@ app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const { rows: invRows } = await client.query('SELECT id, name, unit, stock, track_stock, average_cost FROM pedidos_app_inventory WHERE id::text = $1 FOR UPDATE', [inventory_id]);
+    const { rows: invRows } = await client.query(
+      'SELECT id, name, unit, stock, track_stock, average_cost, purchase_unit, conversion_factor FROM pedidos_app_inventory WHERE id::text = $1 FOR UPDATE',
+      [inventory_id]
+    );
     if (!invRows.length) throw new Error('El insumo no existe.');
     
     const inv = invRows[0];
@@ -5134,7 +5370,9 @@ app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req
 
     // Reglas de conversión de unidades
     let conversionMultiplier = 1;
-    if (['gramos', 'g'].includes(baseUnit)) {
+    if (inv.conversion_factor && Number(inv.conversion_factor) > 1 && (pUnit === (inv.purchase_unit || '').toLowerCase().trim() || ['caja', 'paca', 'paquete', 'bolsa'].includes(pUnit))) {
+      conversionMultiplier = Number(inv.conversion_factor);
+    } else if (['gramos', 'g'].includes(baseUnit)) {
       if (['kg', 'kilogramos', 'kilos', 'kilo'].includes(pUnit)) conversionMultiplier = 1000;
       else if (['lb', 'libras', 'libra'].includes(pUnit)) conversionMultiplier = 500;
       else if (['gramos', 'g'].includes(pUnit)) conversionMultiplier = 1;
@@ -5173,6 +5411,16 @@ app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req
     }
     const newStock = currentStock + convertedQty;
 
+    // Buscar supplier_id si existe
+    let supplierId = null;
+    if (supplier && supplier.trim()) {
+      const { rows: supMatch } = await client.query(
+        'SELECT id FROM pedidos_app_suppliers WHERE LOWER(TRIM(name)) = LOWER(TRIM($1)) LIMIT 1',
+        [supplier.trim()]
+      );
+      if (supMatch.length > 0) supplierId = supMatch[0].id;
+    }
+
     const normalizedSupplier = await getCanonicalSupplierName(client, supplier);
 
     const purchaseNotes = [
@@ -5182,9 +5430,9 @@ app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req
 
     const { rows: purchaseRows } = await client.query(
       `INSERT INTO pedidos_app_inventory_purchases 
-        (inventory_id, quantity, unit_cost, total_cost, supplier, purchase_date, notes, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [inv.id, convertedQty, finalUnitCostBase, finalTotalCost, normalizedSupplier, purchase_date ? new Date(purchase_date) : new Date(), purchaseNotes, req.user?.username || 'Sistema']
+        (inventory_id, quantity, unit_cost, total_cost, supplier, supplier_id, purchase_date, notes, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+      [inv.id, convertedQty, finalUnitCostBase, finalTotalCost, normalizedSupplier, supplierId, purchase_date ? new Date(purchase_date) : new Date(), purchaseNotes, req.user?.username || 'Sistema']
     );
 
     await client.query('UPDATE pedidos_app_inventory SET stock = $1, average_cost = $2, unit_cost = $3, updated_at = NOW() WHERE id = $4', [newStock, newAvgCost, finalUnitCostBase, inv.id]);
@@ -5192,9 +5440,9 @@ app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req
     const movementReason = `Compra ${normalizedSupplier}: ${rawQty} ${pUnit} (${conversionMultiplier !== 1 ? '+' + convertedQty + ' ' + baseUnit : '+' + convertedQty})`;
 
     await client.query(
-      `INSERT INTO pedidos_app_product_stock_movements (inventory_id, movement_type, quantity, balance_after, reason, purchase_id, created_by)
-       VALUES ($1, 'COMPRA', $2, $3, $4, $5, $6)`,
-      [inv.id, convertedQty, newStock, movementReason, purchaseRows[0].id, req.user?.username || 'Sistema']
+      `INSERT INTO pedidos_app_product_stock_movements (inventory_id, movement_type, quantity, balance_after, unit_cost, total_cost, reason, purchase_id, created_by)
+       VALUES ($1, 'COMPRA', $2, $3, $4, $5, $6, $7, $8)`,
+      [inv.id, convertedQty, newStock, finalUnitCostBase, finalTotalCost, movementReason, purchaseRows[0].id, req.user?.username || 'Sistema']
     );
 
     await client.query('COMMIT');

@@ -514,7 +514,7 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
   app.get('/api/pedidos/admin/delivery-companies/:id/orders', ...canView, async (req, res) => {
     try {
       const companyId = Number(req.params.id);
-      const { status, driverId, limit = 50 } = req.query;
+      const { status, driverId, limit = 50, lastDate, lastId } = req.query;
 
       let filterSql = 'WHERE o.external_delivery_company_id = $1';
       const params = [companyId];
@@ -526,6 +526,11 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
       if (driverId) {
         params.push(Number(driverId));
         filterSql += ` AND (o.external_driver_id = $${params.length} OR o.delivery_user_id = (SELECT user_id FROM pedidos_app_delivery_company_drivers WHERE id = $${params.length}))`;
+      }
+
+      if (lastDate && lastId) {
+        params.push(lastDate, Number(lastId));
+        filterSql += ` AND (o.created_at, o.id) < ($${params.length - 1}::timestamp, $${params.length}::int)`;
       }
 
       params.push(Math.min(100, Math.max(1, Number(limit) || 50)));
@@ -545,7 +550,7 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
         FROM pedidos_app_orders o
         LEFT JOIN pedidos_app_delivery_company_drivers d ON d.id = o.external_driver_id
         ${filterSql}
-        ORDER BY o.created_at DESC
+        ORDER BY o.created_at DESC, o.id DESC
         LIMIT $${params.length}
       `, params);
 

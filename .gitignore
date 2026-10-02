@@ -25,3 +25,6 @@ run_migration.js
 scratch_audit.js
 simulate_header.js
 update_campaign.js
+cursor_test.js
+explain.js
+perf_test*.js

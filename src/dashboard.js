@@ -44,7 +44,17 @@ const DASHBOARD_QUERY = `
         'cancelled', COUNT(*) FILTER (WHERE status = 'Cancelado')::int,
         'active', COUNT(*) FILTER (WHERE status IN ('Nuevo', 'En preparación', 'Listo', 'Asignado externo', 'Entregado al operador externo', 'En camino', 'Pendiente Pago'))::int,
         'revenue', COALESCE(SUM(total) FILTER (WHERE status IN ('Entregado', 'Completado')), 0),
-        'averageTicket', COALESCE(ROUND(AVG(total) FILTER (WHERE status IN ('Entregado', 'Completado'))), 0)
+        'averageTicket', COALESCE(ROUND(AVG(total) FILTER (WHERE status IN ('Entregado', 'Completado'))), 0),
+        'revenueByMethod', COALESCE(
+          (SELECT jsonb_object_agg(COALESCE(NULLIF(normalized_method, ''), 'Sin definir'), sub_total)
+           FROM (
+             SELECT LOWER(TRIM(payment_method)) AS normalized_method, SUM(total) as sub_total
+             FROM today_orders
+             WHERE status IN ('Entregado', 'Completado')
+             GROUP BY LOWER(TRIM(payment_method))
+           ) method_totals
+          ), '{}'::jsonb
+        )
       )
       FROM today_orders
     ) AS orders,
@@ -102,7 +112,7 @@ function emptyDashboard() {
     orders: {
       today: 0, new: 0, preparing: 0, ready: 0, onTheWay: 0,
       pendingPayment: 0, completed: 0, cancelled: 0, active: 0,
-      revenue: 0, averageTicket: 0,
+      revenue: 0, averageTicket: 0, revenueByMethod: {}
     },
     products: { total: 0, active: 0, inactive: 0, featured: 0 },
     inventory: { total: 0, critical: 0, outOfStock: 0 },
