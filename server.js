@@ -397,19 +397,22 @@ async function normalizeOrderCart(client, rawCart, { activeOnly = true } = {}) {
     recipeMap.get(key).push(row);
   }
 
-  // Fetch active modifier recipes
+  // Fetch active modifier recipes safely without aborting active transactions
   let modifierRows = [];
   try {
-    const { rows: mods } = await client.query(
-      `SELECT mr.modifier_name, mr.inventory_id, mr.quantity AS modifier_qty, 
-              inv.name AS inventory_title, inv.track_stock, inv.average_cost
-       FROM pedidos_app_modifier_recipes mr
-       JOIN pedidos_app_inventory inv ON inv.id = mr.inventory_id
-       WHERE mr.is_controlled = true`
-    );
-    modifierRows = mods;
+    const { rows: tableCheck } = await client.query("SELECT to_regclass('pedidos_app_modifier_recipes') AS exists");
+    if (tableCheck[0]?.exists) {
+      const { rows: mods } = await client.query(
+        `SELECT mr.modifier_name, mr.inventory_id, mr.quantity AS modifier_qty, 
+                inv.name AS inventory_title, inv.track_stock, inv.average_cost
+         FROM pedidos_app_modifier_recipes mr
+         JOIN pedidos_app_inventory inv ON inv.id = mr.inventory_id
+         WHERE mr.is_controlled = true`
+      );
+      modifierRows = mods;
+    }
   } catch (err) {
-    // Graceful fallback if table does not exist
+    // Graceful fallback if table does not exist or query fails
   }
 
   const cart = rawCart.map((item) => {
@@ -1030,7 +1033,6 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Nombre, teléfono o contacto del cliente son obligatorios.' });
     }
     client = await pool.connect();
-    await client.query('BEGIN');
     const normalized = await normalizeOrderCart(client, cart);
     const isDelivery = String(customer.deliveryType || '').toLowerCase() === 'domicilio';
     const settingsResult = await client.query('SELECT COALESCE(delivery_cost, 0)::integer AS delivery_cost FROM pedidos_app_settings WHERE id = 1');
@@ -1059,7 +1061,6 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
     });
 
     if (!paymentCheck.isValid) {
-      await client.query('ROLLBACK');
       return res.status(400).json({ status: 'error', error: paymentCheck.error });
     }
 
@@ -1067,7 +1068,6 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
     const customDate = parseColombiaTimestamp(customDateStr);
 
     if (customDate && await isDateClosed(customDate)) {
-      await client.query('ROLLBACK');
       return res.status(403).json({ error: 'El período contable para esta fecha ya está cerrado.' });
     }
 
@@ -1094,12 +1094,13 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
     }
 
     const deliveryLocation = normalizeDeliveryLocation(customer);
+    await client.query('BEGIN');
     const { rows } = await client.query(
       `INSERT INTO pedidos_app_orders 
        (customer_name, customer_phone, address, barrio, delivery_type, payment_method, total, cart_json, source, notes, voucher_reference, created_at,
         delivery_fee, delivery_reference, change_required, delivery_latitude, delivery_longitude,
         delivery_place_id, delivery_location_adjusted, delivery_apartment, delivery_tower, delivery_floor, status, crm_contact_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12, NOW()),
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12::timestamptz, NOW()),
          $15, $13, $14, $16, $17, $18, $19, $20, $21, $22, $23, $24)
        RETURNING id`,
       [
