@@ -17,9 +17,10 @@ async function migrate() {
     await client.query(`
       CREATE TABLE IF NOT EXISTS pedidos_app_schema_migrations (
         name TEXT PRIMARY KEY,
-        checksum TEXT NOT NULL,
+        checksum TEXT,
         applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
+      );
+      ALTER TABLE pedidos_app_schema_migrations ADD COLUMN IF NOT EXISTS checksum TEXT;
     `);
 
     const files = fs.readdirSync(migrationsDirectory)
@@ -37,8 +38,11 @@ async function migrate() {
         );
 
         if (rows.length) {
-          if (rows[0].checksum !== currentChecksum) {
+          if (rows[0].checksum && rows[0].checksum !== currentChecksum) {
             throw new Error(`La migración aplicada ${file} fue modificada.`);
+          }
+          if (!rows[0].checksum) {
+            await client.query('UPDATE pedidos_app_schema_migrations SET checksum = $1 WHERE name = $2', [currentChecksum, file]);
           }
           console.log(`↷ ${file} ya aplicada`);
           continue;

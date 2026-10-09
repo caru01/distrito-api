@@ -2390,7 +2390,7 @@ app.get('/api/pedidos/admin/stats/live', authenticateToken, async (req, res) => 
     const { rows } = await pool.query(`
       SELECT status, total
       FROM pedidos_app_orders 
-      WHERE DATE(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Bogota') = DATE(NOW() AT TIME ZONE 'UTC' AT TIME ZONE 'America/Bogota')
+      WHERE DATE(created_at AT TIME ZONE 'America/Bogota') = DATE(NOW() AT TIME ZONE 'America/Bogota')
     `);
     
     let inKitchen = 0;
