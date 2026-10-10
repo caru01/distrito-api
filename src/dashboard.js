@@ -1,16 +1,20 @@
-const DASHBOARD_QUERY = `
+function buildDashboardQuery(hasDateFilter = false) {
+  const dateClause = hasDateFilter
+    ? `(orders.created_at AT TIME ZONE context.timezone)::date BETWEEN $1::date AND $2::date`
+    : `(orders.created_at AT TIME ZONE context.timezone)::date = (NOW() AT TIME ZONE context.timezone)::date`;
+
+  return `
   WITH context AS (
     SELECT COALESCE(
       (SELECT timezone FROM pedidos_app_settings WHERE id = 1),
       'America/Bogota'
     ) AS timezone
   ),
-  today_orders AS (
+  period_orders AS (
     SELECT orders.*
     FROM pedidos_app_orders orders
     CROSS JOIN context
-    WHERE (orders.created_at AT TIME ZONE context.timezone)::date =
-          (NOW() AT TIME ZONE context.timezone)::date
+    WHERE ${dateClause}
   ),
   inventory_stock AS (
     SELECT id, low_stock_threshold AS min_stock, COALESCE(stock, 0) AS stock
@@ -24,7 +28,7 @@ const DASHBOARD_QUERY = `
              COALESCE((item ->> 'price')::numeric, 0) *
              COALESCE((item ->> 'quantity')::numeric, (item ->> 'qty')::numeric, 1)
            ) AS total
-    FROM today_orders orders
+    FROM period_orders orders
     CROSS JOIN LATERAL jsonb_array_elements(COALESCE(orders.cart_json, '[]'::jsonb)) item
     WHERE orders.status <> 'Cancelado' AND NULLIF(item ->> 'title', '') IS NOT NULL
     GROUP BY item ->> 'title'
@@ -43,20 +47,23 @@ const DASHBOARD_QUERY = `
         'completed', COUNT(*) FILTER (WHERE status IN ('Entregado', 'Completado'))::int,
         'cancelled', COUNT(*) FILTER (WHERE status = 'Cancelado')::int,
         'active', COUNT(*) FILTER (WHERE status IN ('Nuevo', 'En preparación', 'Listo', 'Asignado externo', 'Entregado al operador externo', 'En camino', 'Pendiente Pago'))::int,
-        'revenue', COALESCE(SUM(total) FILTER (WHERE status IN ('Entregado', 'Completado')), 0),
-        'averageTicket', COALESCE(ROUND(AVG(total) FILTER (WHERE status IN ('Entregado', 'Completado'))), 0),
+        'revenue', COALESCE(SUM(total - COALESCE(delivery_fee, 0)) FILTER (WHERE status IN ('Entregado', 'Completado')), 0),
+        'totalRevenue', COALESCE(SUM(total) FILTER (WHERE status IN ('Entregado', 'Completado')), 0),
+        'deliveryRevenue', COALESCE(SUM(COALESCE(delivery_fee, 0)) FILTER (WHERE status IN ('Entregado', 'Completado')), 0),
+        'deliveryOrdersCount', COUNT(*) FILTER (WHERE status IN ('Entregado', 'Completado') AND delivery_type = 'domicilio')::int,
+        'averageTicket', COALESCE(ROUND(AVG(total - COALESCE(delivery_fee, 0)) FILTER (WHERE status IN ('Entregado', 'Completado'))), 0),
         'revenueByMethod', COALESCE(
           (SELECT jsonb_object_agg(COALESCE(NULLIF(normalized_method, ''), 'Sin definir'), sub_total)
            FROM (
              SELECT LOWER(TRIM(payment_method)) AS normalized_method, SUM(total) as sub_total
-             FROM today_orders
+             FROM period_orders
              WHERE status IN ('Entregado', 'Completado')
              GROUP BY LOWER(TRIM(payment_method))
            ) method_totals
           ), '{}'::jsonb
         )
       )
-      FROM today_orders
+      FROM period_orders
     ) AS orders,
     (
       SELECT jsonb_build_object(
@@ -105,14 +112,18 @@ const DASHBOARD_QUERY = `
       FROM pedidos_app_settings
       WHERE id = 1
     ) AS settings
-`;
+  `;
+}
+
+const DASHBOARD_QUERY = buildDashboardQuery(false);
 
 function emptyDashboard() {
   return {
     orders: {
       today: 0, new: 0, preparing: 0, ready: 0, onTheWay: 0,
       pendingPayment: 0, completed: 0, cancelled: 0, active: 0,
-      revenue: 0, averageTicket: 0, revenueByMethod: {}
+      revenue: 0, totalRevenue: 0, deliveryRevenue: 0, deliveryOrdersCount: 0,
+      averageTicket: 0, revenueByMethod: {}
     },
     products: { total: 0, active: 0, inactive: 0, featured: 0 },
     inventory: { total: 0, critical: 0, outOfStock: 0 },
@@ -123,9 +134,14 @@ function emptyDashboard() {
   };
 }
 
-async function getDashboardSnapshot(pool, getScheduleStatus) {
+async function getDashboardSnapshot(pool, getScheduleStatus, dateOptions = {}) {
+  const { startDate, endDate } = dateOptions;
+  const hasDateFilter = Boolean(startDate && endDate);
+  const query = hasDateFilter ? buildDashboardQuery(true) : DASHBOARD_QUERY;
+  const params = hasDateFilter ? [startDate, endDate] : [];
+
   const [databaseResult, schedule] = await Promise.all([
-    pool.query(DASHBOARD_QUERY),
+    pool.query(query, params),
     getScheduleStatus(),
   ]);
   const row = databaseResult.rows[0] || {};
@@ -140,6 +156,7 @@ async function getDashboardSnapshot(pool, getScheduleStatus) {
     settings: row.settings || fallback.settings,
     schedule: schedule || fallback.schedule,
     generatedAt: new Date().toISOString(),
+    filter: hasDateFilter ? { startDate, endDate } : null,
   };
 }
 

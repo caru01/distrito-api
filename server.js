@@ -1914,7 +1914,26 @@ app.use('/api/pedidos/admin', authenticateToken, requireAdministrativeUser);
 
 app.get('/api/pedidos/admin/dashboard', authenticateToken, async (req, res) => {
   try {
-    const dashboard = await getDashboardSnapshot(pool, getHorariosStatus);
+    const { startDate, endDate, date } = req.query;
+    let filterStart = null;
+    let filterEnd = null;
+
+    if (startDate && endDate) {
+      filterStart = String(startDate).slice(0, 10);
+      filterEnd = String(endDate).slice(0, 10);
+    } else if (date) {
+      filterStart = String(date).slice(0, 10);
+      filterEnd = String(date).slice(0, 10);
+    } else if (startDate) {
+      filterStart = String(startDate).slice(0, 10);
+      filterEnd = String(startDate).slice(0, 10);
+    } else if (endDate) {
+      filterStart = String(endDate).slice(0, 10);
+      filterEnd = String(endDate).slice(0, 10);
+    }
+
+    const dateOptions = (filterStart && filterEnd) ? { startDate: filterStart, endDate: filterEnd } : {};
+    const dashboard = await getDashboardSnapshot(pool, getHorariosStatus, dateOptions);
     res.json({ status: 'ok', dashboard });
   } catch (error) {
     console.error('Error fetching dashboard:', error);
@@ -5337,7 +5356,7 @@ app.get('/api/pedidos/admin/inventory-suppliers', authenticateToken, async (req,
 app.get('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT p.*, inv.name AS inventory_title, inv.unit AS inventory_unit
+      SELECT p.*, to_char(p.purchase_date, 'YYYY-MM-DD') AS purchase_date, inv.name AS inventory_title, inv.unit AS inventory_unit
       FROM pedidos_app_inventory_purchases p
       JOIN pedidos_app_inventory inv ON inv.id = p.inventory_id
       ORDER BY p.purchase_date DESC, p.id DESC
@@ -5433,7 +5452,17 @@ app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req
       `INSERT INTO pedidos_app_inventory_purchases 
         (inventory_id, quantity, unit_cost, total_cost, supplier, supplier_id, purchase_date, notes, created_by)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-      [inv.id, convertedQty, finalUnitCostBase, finalTotalCost, normalizedSupplier, supplierId, purchase_date ? new Date(purchase_date) : new Date(), purchaseNotes, req.user?.username || 'Sistema']
+      [
+        inv.id,
+        convertedQty,
+        finalUnitCostBase,
+        finalTotalCost,
+        normalizedSupplier,
+        supplierId,
+        purchase_date ? String(purchase_date).slice(0, 10) : new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Bogota' }).format(new Date()),
+        purchaseNotes,
+        req.user?.username || 'Sistema'
+      ]
     );
 
     await client.query('UPDATE pedidos_app_inventory SET stock = $1, average_cost = $2, unit_cost = $3, updated_at = NOW() WHERE id = $4', [newStock, newAvgCost, finalUnitCostBase, inv.id]);
@@ -5567,7 +5596,7 @@ app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, async (
         unit_cost: newUnitCostBase,
         total_cost: newFinalTotalCost,
         supplier: normalizedSupplier,
-        purchase_date: purchase_date ? new Date(purchase_date) : originalPurchase.purchase_date,
+        purchase_date: purchase_date ? String(purchase_date).slice(0, 10) : originalPurchase.purchase_date,
         notes: notes?.trim(),
       },
       delta: {
@@ -5599,7 +5628,7 @@ app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, async (
         newUnitCostBase,
         newFinalTotalCost,
         normalizedSupplier,
-        purchase_date ? new Date(purchase_date) : null,
+        purchase_date ? String(purchase_date).slice(0, 10) : null,
         updatedNotes,
         JSON.stringify([historyEntry]),
         id
