@@ -5355,13 +5355,48 @@ app.get('/api/pedidos/admin/inventory-suppliers', authenticateToken, async (req,
 
 app.get('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req, res) => {
   try {
-    const { rows } = await pool.query(`
+    const { supplier, inventory_id, date_from, date_to, search, limit = 250 } = req.query;
+    const conditions = [];
+    const params = [];
+
+    if (supplier && supplier !== 'ALL') {
+      params.push(supplier.trim());
+      conditions.push(`p.supplier ILIKE $${params.length}`);
+    }
+
+    if (inventory_id) {
+      params.push(inventory_id);
+      conditions.push(`p.inventory_id = $${params.length}`);
+    }
+
+    if (date_from) {
+      params.push(date_from);
+      conditions.push(`p.purchase_date >= $${params.length}::date`);
+    }
+
+    if (date_to) {
+      params.push(date_to);
+      conditions.push(`p.purchase_date <= $${params.length}::date`);
+    }
+
+    if (search && search.trim()) {
+      params.push(`%${search.trim()}%`);
+      conditions.push(`(inv.name ILIKE $${params.length} OR p.supplier ILIKE $${params.length} OR p.notes ILIKE $${params.length} OR p.id::text ILIKE $${params.length})`);
+    }
+
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    params.push(Math.min(1000, Number(limit) || 250));
+
+    const query = `
       SELECT p.*, to_char(p.purchase_date, 'YYYY-MM-DD') AS purchase_date, inv.name AS inventory_title, inv.unit AS inventory_unit
       FROM pedidos_app_inventory_purchases p
       JOIN pedidos_app_inventory inv ON inv.id = p.inventory_id
+      ${whereClause}
       ORDER BY p.purchase_date DESC, p.id DESC
-      LIMIT 250
-    `);
+      LIMIT $${params.length}
+    `;
+
+    const { rows } = await pool.query(query, params);
     res.json({ status: 'ok', purchases: rows, data: rows });
   } catch (error) {
     res.status(500).json({ status: 'error', error: 'Error al consultar compras' });
@@ -5700,10 +5735,13 @@ app.post('/api/pedidos/admin/inventory-adjustments', authenticateToken, async (r
     const inv = invRows[0];
     const prevStock = Number(inv.stock) || 0;
     
-    // Mermas, vencidos, daños y pérdidas descuentan
+    // Mermas, vencidos, daños, pérdidas o dirección explícita de resta descuentan
     let delta = rawQty;
-    if (['MERMA', 'VENCIDO', 'DAÑO', 'PERDIDA'].includes(type)) {
+    const direction = String(req.body.direction || '').toUpperCase();
+    if (direction === 'SUBTRACT' || direction === 'RESTAR' || ['MERMA', 'VENCIDO', 'DAÑO', 'PERDIDA'].includes(type) || (type === 'AJUSTE' && rawQty < 0)) {
       delta = -Math.abs(rawQty);
+    } else if (direction === 'ADD' || direction === 'SUMAR') {
+      delta = Math.abs(rawQty);
     }
 
     const newStock = Math.max(0, prevStock + delta);
