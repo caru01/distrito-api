@@ -887,6 +887,9 @@ function createCrmWorker({ pool, whatsappClient, instanceId = `crm-${process.pid
     if (event.event_type !== 'order_delivered' && !(event.event_type === 'order_status_changed' && ['Entregado','Completado'].includes(status))) return 0;
     const { rows } = await pool.query('SELECT crm_contact_id FROM pedidos_app_orders WHERE id=$1', [event.aggregate_id]);
     if (!rows[0]?.crm_contact_id) return 0;
+    try {
+      await pool.query('SELECT pedidos_app_crm_refresh_contact($1::bigint)', [rows[0].crm_contact_id]);
+    } catch {}
     return scheduleEventAutomations(pool, 'ORDER_COMPLETED', rows[0].crm_contact_id, 'ORDER', event.aggregate_id);
   }
 

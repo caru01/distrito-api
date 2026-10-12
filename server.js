@@ -31,7 +31,7 @@ const { ORDER_STATUSES, canTransitionOrder } = require('./src/order-rules');
 const { createDeliveryOrderService } = require('./src/delivery-order-service');
 const { createOutboxDispatcher } = require('./src/outbox');
 const { createWhatsAppClient } = require('./src/whatsapp-cloud');
-const { createCrmWorker } = require('./src/crm-service');
+const { createCrmWorker, ensureContact } = require('./src/crm-service');
 const { normalizePhoneE164 } = require('./src/crm/phone');
 
 const publicVapidKey = process.env.VAPID_PUBLIC_KEY;
@@ -856,6 +856,7 @@ app.get('/api/pedidos/init', async (req, res) => {
 
     // Anuncio
     let announcementRow = null;
+    let promoCardRow = null;
     try {
       const { rows: announcements } = await pool.query(`
         SELECT id, title, body, cta_label, cta_url, starts_at, ends_at,
@@ -866,9 +867,10 @@ app.get('/api/pedidos/init', async (req, res) => {
           AND (starts_at IS NULL OR starts_at <= NOW())
           AND (ends_at IS NULL OR ends_at >= NOW())
           AND audience = 'all'
-        ORDER BY priority DESC, updated_at DESC, id DESC LIMIT 1
+        ORDER BY priority DESC, updated_at DESC, id DESC
       `);
-      if (announcements.length > 0) announcementRow = announcements[0];
+      announcementRow = announcements.find(r => r.campaign_type === 'modal' || r.campaign_type === 'banner') || null;
+      promoCardRow = announcements.find(r => r.campaign_type === 'promo_card') || null;
     } catch (err) {
       console.log('Announcement table might not exist yet.');
     }
@@ -878,7 +880,8 @@ app.get('/api/pedidos/init', async (req, res) => {
       products: products.map((product) => productForResponse(req, product)),
       categories,
       settings: settingsForResponse(req, settingsRow),
-      announcement: announcementForResponse(req, announcementRow)
+      announcement: announcementForResponse(req, announcementRow),
+      promoCard: announcementForResponse(req, promoCardRow)
     });
   } catch (error) {
     console.error('Error fetching init data:', error);
@@ -1095,6 +1098,46 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
 
     const deliveryLocation = normalizeDeliveryLocation(customer);
     await client.query('BEGIN');
+
+    let resolvedCrmContactId = customer.crm_contact_id || null;
+    if (!resolvedCrmContactId && formattedPhone && formattedPhone !== '2222222' && formattedPhone.length >= 7) {
+      try {
+        const normPhone = normalizePhoneE164(formattedPhone);
+        if (normPhone) {
+          const contact = await ensureContact(client, {
+            phone: normPhone,
+            name: customer.name || 'Cliente',
+            address: customer.address || null,
+            barrio: customer.barrio || null,
+            source: req.body.source || customer.source || 'TIENDA_DIRECTA'
+          });
+          resolvedCrmContactId = contact.id;
+
+          const custRes = await client.query(`
+            INSERT INTO pedidos_app_customers (name, phone, phone_e164, address, barrio, status, marketing_opt_in)
+            VALUES ($1, $2, $3, $4, $5, 'active', TRUE)
+            ON CONFLICT (phone) DO UPDATE SET
+              name = COALESCE(NULLIF(EXCLUDED.name, ''), pedidos_app_customers.name),
+              phone_e164 = COALESCE(EXCLUDED.phone_e164, pedidos_app_customers.phone_e164),
+              address = COALESCE(NULLIF(EXCLUDED.address, ''), pedidos_app_customers.address),
+              barrio = COALESCE(NULLIF(EXCLUDED.barrio, ''), pedidos_app_customers.barrio),
+              updated_at = NOW()
+            RETURNING id
+          `, [customer.name || 'Cliente', formattedPhone, normPhone, customer.address || null, customer.barrio || null]);
+
+          if (custRes.rows.length) {
+            await client.query(`
+              INSERT INTO pedidos_app_crm_contact_customers (contact_id, customer_id)
+              VALUES ($1, $2)
+              ON CONFLICT (customer_id) DO UPDATE SET contact_id = EXCLUDED.contact_id
+            `, [contact.id, custRes.rows[0].id]);
+          }
+        }
+      } catch (crmErr) {
+        console.error('Error auto-vinculando cliente a CRM:', crmErr.message);
+      }
+    }
+
     const { rows } = await client.query(
       `INSERT INTO pedidos_app_orders 
        (customer_name, customer_phone, address, barrio, delivery_type, payment_method, total, cart_json, source, notes, voucher_reference, created_at,
@@ -1129,7 +1172,7 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
         isDelivery ? String(customer.tower || '').trim().slice(0, 50) || null : null,
         isDelivery ? String(customer.floor || '').trim().slice(0, 30) || null : null,
         finalStatus,
-        customer.crm_contact_id || null
+        resolvedCrmContactId
       ]
     );
 
@@ -2672,6 +2715,13 @@ app.put('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => 
             version: Number(rows[0].version || 0),
           },
         );
+        if (rows[0].crm_contact_id) {
+          try {
+            await client.query('SELECT pedidos_app_crm_refresh_contact($1::bigint)', [rows[0].crm_contact_id]);
+          } catch (cErr) {
+            console.error('Error refrescando contacto CRM:', cErr.message);
+          }
+        }
         await client.query('COMMIT');
         if (status === 'Cancelado' && rows[0].delivery_user_id) {
           deliveryRealtime.sendPush({
@@ -3726,13 +3776,18 @@ app.get('/api/pedidos/announcement', async (req, res) => {
         AND (starts_at IS NULL OR starts_at <= NOW())
         AND (ends_at IS NULL OR ends_at >= NOW())
         AND audience IN ('all', $1)
-      ORDER BY priority DESC, updated_at DESC, id DESC LIMIT 1
+      ORDER BY priority DESC, updated_at DESC, id DESC
     `, [audience]);
-    if (rows.length > 0) {
-      res.json({ status: 'ok', announcement: announcementForResponse(req, rows[0]) });
-    } else {
-      res.json({ status: 'ok', announcement: null });
-    }
+
+    const modalAnnouncement = rows.find(r => r.campaign_type === 'modal' || r.campaign_type === 'banner');
+    const promoCard = rows.find(r => r.campaign_type === 'promo_card');
+
+    res.json({
+      status: 'ok',
+      announcement: modalAnnouncement ? announcementForResponse(req, modalAnnouncement) : (rows[0] && rows[0].campaign_type !== 'promo_card' ? announcementForResponse(req, rows[0]) : null),
+      promoCard: promoCard ? announcementForResponse(req, promoCard) : null,
+      announcements: rows.map(r => announcementForResponse(req, r))
+    });
   } catch (error) {
     res.status(500).json({ status: 'error', error: error.message });
   }
@@ -3759,13 +3814,13 @@ function parseCampaignInput(body = {}) {
     cta_url: String(body.cta_url || '').trim(), starts_at: body.starts_at || null,
     ends_at: body.ends_at || null, is_active: Boolean(body.is_active),
     display_frequency: ['always', 'session', 'daily'].includes(body.display_frequency) ? body.display_frequency : 'session',
-    campaign_type: ['modal', 'banner'].includes(body.campaign_type) ? body.campaign_type : 'modal',
+    campaign_type: ['modal', 'banner', 'promo_card'].includes(body.campaign_type) ? body.campaign_type : 'modal',
     audience: ['all', 'new', 'returning'].includes(body.audience) ? body.audience : 'all',
     priority: Number.isInteger(Number(body.priority)) ? Number(body.priority) : 0,
     coupon_code: String(body.coupon_code || '').trim().slice(0, 50) || null,
   };
   if (!campaign.title || campaign.title.length > 255) return { error: 'El título es obligatorio y admite hasta 255 caracteres' };
-  if (campaign.body.length > 1000) return { error: 'El mensaje admite hasta 1000 caracteres' };
+  if (campaign.body.length > 4000) return { error: 'El mensaje admite hasta 4000 caracteres' };
   if (!campaign.cta_label || campaign.cta_label.length > 80) return { error: 'El texto del botón admite hasta 80 caracteres' };
   if (campaign.cta_url && !campaign.cta_url.startsWith('/') && !/^https:\/\//i.test(campaign.cta_url)) return { error: 'El enlace debe iniciar con / o usar HTTPS' };
   if (campaign.starts_at && !Number.isFinite(new Date(campaign.starts_at).getTime())) return { error: 'La fecha de inicio no es válida' };
@@ -3830,6 +3885,21 @@ app.delete('/api/pedidos/admin/announcements/:id', authenticateToken, async (req
     const { rowCount } = await pool.query('DELETE FROM pedidos_app_announcements WHERE id = $1', [req.params.id]);
     if (!rowCount) return res.status(404).json({ error: 'Campaña no encontrada' });
     res.json({ status: 'ok' });
+  } catch (error) { res.status(500).json({ status: 'error', error: error.message }); }
+});
+
+app.patch('/api/pedidos/admin/announcements/:id/toggle', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      UPDATE pedidos_app_announcements
+      SET is_active = NOT is_active,
+          published_at = CASE WHEN NOT is_active THEN NOW() ELSE published_at END,
+          updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+    `, [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Campaña no encontrada' });
+    res.json({ status: 'ok', announcement: announcementForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image_url) }) });
   } catch (error) { res.status(500).json({ status: 'error', error: error.message }); }
 });
 
