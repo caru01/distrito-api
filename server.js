@@ -2020,7 +2020,17 @@ function getBogotaPeriodDates(period) {
 app.get('/api/pedidos/admin/dashboard/profitability', authenticateToken, async (req, res) => {
   try {
     const period = ['15d', 'weekly', 'monthly'].includes(req.query.period) ? req.query.period : '15d';
-    const { startDate, endDate, label } = getBogotaPeriodDates(period);
+    let startDate, endDate, label;
+    if (req.query.startDate && req.query.endDate) {
+      startDate = req.query.startDate;
+      endDate = req.query.endDate;
+      label = `Personalizado (${startDate} a ${endDate})`;
+    } else {
+      const dates = getBogotaPeriodDates(period);
+      startDate = dates.startDate;
+      endDate = dates.endDate;
+      label = dates.label;
+    }
 
     const { rows } = await pool.query(`
       WITH period_orders AS (
@@ -2049,6 +2059,8 @@ app.get('/api/pedidos/admin/dashboard/profitability', authenticateToken, async (
       SELECT
         (SELECT COUNT(*) FROM completed_orders) AS completed_count,
         (SELECT COUNT(*) FROM period_orders WHERE status = 'Cancelado') AS cancelled_count,
+        (SELECT COALESCE(SUM(total), 0) FROM period_orders WHERE status IN ('Pendiente Pago', 'Pendiente')) AS pending_payment_total,
+        (SELECT COUNT(*)::int FROM period_orders WHERE status IN ('Pendiente Pago', 'Pendiente')) AS pending_payment_count,
         (SELECT COALESCE(SUM(total), 0) FROM completed_orders) AS net_sales,
         (SELECT COALESCE(SUM(delivery_fee), 0) FROM completed_orders) AS delivery_fee_total,
         (SELECT COALESCE(SUM(external_delivery_cost), 0) FROM completed_orders) AS delivery_cost_total,
@@ -2058,12 +2070,16 @@ app.get('/api/pedidos/admin/dashboard/profitability', authenticateToken, async (
         (SELECT COALESCE(SUM(items_in_order), 0) FROM completed_orders) AS total_items_count,
         (SELECT COALESCE(SUM(costed_products_in_order), 0) FROM order_costs) AS costed_products_count,
         (SELECT COALESCE(SUM(amount), 0) FROM pedidos_app_expenses WHERE expense_date BETWEEN $1::date AND $2::date) AS expenses,
-        (SELECT COUNT(*)::int FROM pedidos_app_expenses WHERE expense_date BETWEEN $1::date AND $2::date) AS expenses_count
+        (SELECT COUNT(*)::int FROM pedidos_app_expenses WHERE expense_date BETWEEN $1::date AND $2::date) AS expenses_count,
+        (SELECT COALESCE(SUM(total_cost), 0) FROM pedidos_app_inventory_purchases WHERE purchase_date BETWEEN $1::date AND $2::date) AS inventory_purchases,
+        (SELECT COUNT(*)::int FROM pedidos_app_inventory_purchases WHERE purchase_date BETWEEN $1::date AND $2::date) AS inventory_purchases_count
     `, [startDate, endDate]);
 
     const row = rows[0];
     const completedCount       = parseInt(row.completed_count, 10);
     const cancelledCount       = parseInt(row.cancelled_count, 10);
+    const pendingPaymentTotal  = parseInt(row.pending_payment_total || 0, 10);
+    const pendingPaymentCount  = parseInt(row.pending_payment_count || 0, 10);
     const netSales             = parseInt(row.net_sales, 10);
     const deliveryFeeTotal     = parseInt(row.delivery_fee_total, 10);
     const deliveryCostTotal    = parseInt(row.delivery_cost_total, 10);
@@ -2074,6 +2090,8 @@ app.get('/api/pedidos/admin/dashboard/profitability', authenticateToken, async (
     const costedProductsCount  = parseInt(row.costed_products_count, 10);
     const expenses             = parseFloat(row.expenses);
     const expensesCount        = parseInt(row.expenses_count, 10);
+    const inventoryPurchases   = parseFloat(row.inventory_purchases || 0);
+    const inventoryPurchasesCount = parseInt(row.inventory_purchases_count || 0, 10);
 
     const productSales         = netSales - deliveryFeeTotal;
     const deliveryNetMargin    = deliveryFeeTotal - deliveryCostTotal;
@@ -2087,6 +2105,10 @@ app.get('/api/pedidos/admin/dashboard/profitability', authenticateToken, async (
     const profitAfterExpenses  = grossProfit - expenses;
     const profitAfterExpensesIsEstimated = true;
 
+    // Dinero Real en Mano / Cuentas:
+    const realCashFlow         = netSales - inventoryPurchases - expenses - deliveryCostTotal;
+    const foodNetCash          = productSales - inventoryPurchases - expenses;
+
     res.json({
       status: 'ok',
       profitability: {
@@ -2096,6 +2118,8 @@ app.get('/api/pedidos/admin/dashboard/profitability', authenticateToken, async (
         periodEnd: endDate,
         completedCount,
         cancelledCount,
+        pendingPaymentTotal,
+        pendingPaymentCount,
         netSales,
         productSales,
         deliveryFeeTotal,
@@ -2115,6 +2139,10 @@ app.get('/api/pedidos/admin/dashboard/profitability', authenticateToken, async (
         expenses,
         expensesCount,
         hasExpenses,
+        inventoryPurchases,
+        inventoryPurchasesCount,
+        realCashFlow,
+        foodNetCash,
         profitAfterExpenses,
         profitAfterExpensesIsEstimated,
       },
@@ -3332,6 +3360,54 @@ app.get('/api/pedidos/admin/inventory', authenticateToken, async (req, res) => {
   }
 });
 
+// Obtener insumos con alertas activas (Agotados, Críticos, Stock Bajo)
+app.get('/api/pedidos/admin/inventory/alerts', authenticateToken, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        i.id,
+        i.name,
+        i.unit,
+        COALESCE(i.stock, 0)::numeric AS stock,
+        COALESCE(i.min_stock, 0)::numeric AS min_stock,
+        CASE 
+          WHEN COALESCE(i.stock, 0) <= 0 THEN 'agotado'
+          WHEN COALESCE(i.min_stock, 0) > 0 AND COALESCE(i.stock, 0) <= COALESCE(i.min_stock, 0) THEN 'critico'
+          WHEN COALESCE(i.min_stock, 0) > 0 AND COALESCE(i.stock, 0) <= COALESCE(i.min_stock, 0) * 1.4 THEN 'bajo'
+          ELSE 'saludable'
+        END AS alert_level
+      FROM pedidos_app_inventory i
+      WHERE i.track_stock = true AND (
+        COALESCE(i.stock, 0) <= 0 OR (COALESCE(i.min_stock, 0) > 0 AND COALESCE(i.stock, 0) <= COALESCE(i.min_stock, 0) * 1.4)
+      )
+      ORDER BY 
+        CASE 
+          WHEN COALESCE(i.stock, 0) <= 0 THEN 1 
+          WHEN COALESCE(i.min_stock, 0) > 0 AND COALESCE(i.stock, 0) <= COALESCE(i.min_stock, 0) THEN 2 
+          ELSE 3 
+        END, COALESCE(i.stock, 0) ASC
+    `);
+
+    const summary = {
+      total: rows.length,
+      agotados: rows.filter(r => r.alert_level === 'agotado').length,
+      criticos: rows.filter(r => r.alert_level === 'critico').length,
+      bajos: rows.filter(r => r.alert_level === 'bajo').length
+    };
+
+    res.json({
+      status: 'ok',
+      hasAlerts: rows.length > 0,
+      count: rows.length,
+      summary,
+      alerts: rows
+    });
+  } catch (error) {
+    console.error('Error al consultar alertas de inventario:', error);
+    res.status(500).json({ status: 'error', error: error.message });
+  }
+});
+
 app.post('/api/pedidos/admin/inventory', authenticateToken, async (req, res) => {
   const client = await pool.connect();
   try {
@@ -3994,7 +4070,7 @@ function reportPercentageChange(current, previous) {
   return Math.round(((currentValue - previousValue) / Math.abs(previousValue)) * 1000) / 10;
 }
 
-function buildReportData(orderRows, purchaseRows, orderCostsRows = []) {
+function buildReportData(orderRows, purchaseRows, orderCostsRows = [], expenseRows = []) {
   const completedStatuses = new Set(['Completado', 'Entregado']);
   const completedOrders = orderRows.filter((order) => completedStatuses.has(order.status));
   const customers = new Set();
@@ -4043,11 +4119,22 @@ function buildReportData(orderRows, purchaseRows, orderCostsRows = []) {
   }
 
   const totalSales = completedOrders.reduce((sum, order) => sum + Number(order.total || 0), 0);
-  const totalPurchases = purchaseRows.reduce((sum, purchase) => sum + Number(purchase.total_amount || 0), 0);
+  const deliveryRevenue = completedOrders.reduce((sum, order) => sum + Number(order.delivery_fee || 0), 0);
+  const productSales = totalSales - deliveryRevenue;
+  const totalPurchases = purchaseRows.reduce((sum, purchase) => sum + Number(purchase.total_amount || purchase.total_cost || 0), 0);
+  const totalExpenses = (expenseRows || []).reduce((sum, expense) => sum + Number(expense.amount || 0), 0);
   const externalOrders = completedOrders.filter((order) => String(order.delivery_provider_type || '').startsWith('external_'));
   const externalDeliveryCost = externalOrders.reduce((sum, order) => sum + Number(order.external_delivery_cost || 0), 0);
   const externalDeliveryRevenue = externalOrders.reduce((sum, order) => sum + Number(order.delivery_fee || 0), 0);
   const totalCogs = completedOrders.reduce((sum, order) => sum + Number(order.total_cogs || 0), 0);
+  const pendingOrders = orderRows.filter((order) => ['Pendiente Pago', 'Pendiente'].includes(order.status));
+  const pendingPaymentTotal = pendingOrders.reduce((sum, order) => sum + Number(order.total || 0), 0);
+
+  // Flujo de caja real: Total dinero cobrado - compras de insumos pagadas - gastos operativos - fletes mensajeros
+  const flujoCajaReal = totalSales - totalPurchases - totalExpenses - externalDeliveryCost;
+  // Ganancia neta de comida (sin envíos)
+  const gananciaNetaComida = productSales - totalPurchases - totalExpenses;
+  // Utilidad bruta teórica según recetas (COGS)
   const grossProfit = totalSales - totalCogs - externalDeliveryCost;
   const cancelled = orderRows.filter((order) => order.status === 'Cancelado').length;
   // Group COGS by order_id and product_id
@@ -4099,19 +4186,27 @@ function buildReportData(orderRows, purchaseRows, orderCostsRows = []) {
   return {
     kpis: {
       totalVentas: Math.round(totalSales),
+      ventasProductos: Math.round(productSales),
+      ingresoDomicilios: Math.round(deliveryRevenue),
       pedidosRealizados: orderRows.length,
       pedidosCompletados: completedOrders.length,
       pedidosCancelados: cancelled,
+      pedidosPendientesPago: pendingOrders.length,
+      carteraPendienteCobro: Math.round(pendingPaymentTotal),
       clientesAtendidos: customers.size,
       ticketPromedio: completedOrders.length ? Math.round(totalSales / completedOrders.length) : 0,
-      utilidadBruta: Math.round(grossProfit),
-      costoMercanciaVendida: Math.round(totalCogs),
+      flujoCajaReal: Math.round(flujoCajaReal),
+      gananciaNetaComida: Math.round(gananciaNetaComida),
       totalCompras: Math.round(totalPurchases),
+      totalGastos: Math.round(totalExpenses),
+      costoMercanciaVendida: Math.round(totalCogs),
+      utilidadBruta: Math.round(grossProfit),
       domiciliosExternos: externalOrders.length,
       costoDomiciliosExternos: Math.round(externalDeliveryCost),
       ingresoDomiciliosExternos: Math.round(externalDeliveryRevenue),
       margenLogisticoExterno: Math.round(externalDeliveryRevenue - externalDeliveryCost),
       margenUtilidad: totalSales ? Math.round((grossProfit / totalSales) * 1000) / 10 : 0,
+      margenFlujoCaja: totalSales ? Math.round((flujoCajaReal / totalSales) * 1000) / 10 : 0,
       productoMasRentable: mostProfitableProduct?.name || '—',
       productoMenosRentable: leastProfitableProduct?.name || '—',
       comboMasRentable: mostProfitableCombo?.name || '—',
@@ -4268,21 +4363,26 @@ app.get('/api/pedidos/admin/reports', authenticateToken, async (req, res) => {
              COALESCE(d.phone, o.external_driver_phone, '') AS driver_phone,
              COALESCE(d.vehicle_plate, o.external_vehicle_id, '—') AS driver_plate,
              COALESCE(d.vehicle_type, 'Moto') AS driver_vehicle_type,
-             TO_CHAR(o.created_at, 'YYYY-MM-DD') AS report_date
+             TO_CHAR(o.created_at AT TIME ZONE 'America/Bogota', 'YYYY-MM-DD') AS report_date
       FROM pedidos_app_orders o
       LEFT JOIN pedidos_app_delivery_companies c ON c.id = o.external_delivery_company_id
       LEFT JOIN pedidos_app_delivery_company_drivers d ON d.id = o.external_driver_id
-      WHERE o.created_at >= $1::date AND o.created_at < ($2::date + INTERVAL '1 day')
+      WHERE (o.created_at AT TIME ZONE 'America/Bogota')::date BETWEEN $1::date AND $2::date
       ORDER BY o.created_at ASC`;
     const purchaseSql = `
-      SELECT total_amount FROM pedidos_app_purchases
+      SELECT COALESCE(total_cost, 0) AS total_amount FROM pedidos_app_inventory_purchases
       WHERE purchase_date BETWEEN $1::date AND $2::date`;
+    const expenseSql = `
+      SELECT amount, category, description, expense_date FROM pedidos_app_expenses
+      WHERE expense_date BETWEEN $1::date AND $2::date`;
 
-    const [ordersResult, purchasesResult, previousOrdersResult, previousPurchasesResult, inventoryResult] = await Promise.all([
+    const [ordersResult, purchasesResult, expensesResult, previousOrdersResult, previousPurchasesResult, previousExpensesResult, inventoryResult] = await Promise.all([
       pool.query(orderSql, [from, to]),
       pool.query(purchaseSql, [from, to]),
+      pool.query(expenseSql, [from, to]),
       pool.query(orderSql, [previousFrom, previousTo]),
       pool.query(purchaseSql, [previousFrom, previousTo]),
+      pool.query(expenseSql, [previousFrom, previousTo]),
       pool.query(`
         SELECT
           COUNT(*) FILTER (WHERE track_stock = TRUE AND COALESCE(stock, 0) <= 0)::int AS out_of_stock,
@@ -4316,9 +4416,9 @@ app.get('/api/pedidos/admin/reports', authenticateToken, async (req, res) => {
       prevOrderCostsRows = prevCostsRes.rows;
     }
 
-    const current = buildReportData(ordersResult.rows, purchasesResult.rows, orderCostsRows);
-    const previous = buildReportData(previousOrdersResult.rows, previousPurchasesResult.rows, prevOrderCostsRows);
-    const trendKeys = ['totalVentas', 'pedidosRealizados', 'clientesAtendidos', 'ticketPromedio', 'utilidadBruta'];
+    const current = buildReportData(ordersResult.rows, purchasesResult.rows, orderCostsRows, expensesResult.rows);
+    const previous = buildReportData(previousOrdersResult.rows, previousPurchasesResult.rows, prevOrderCostsRows, previousExpensesResult.rows);
+    const trendKeys = ['totalVentas', 'pedidosRealizados', 'clientesAtendidos', 'ticketPromedio', 'utilidadBruta', 'flujoCajaReal'];
     const trends = Object.fromEntries(trendKeys.map((key) => [key, reportPercentageChange(current.kpis[key], previous.kpis[key])]));
 
     res.json({
@@ -4410,45 +4510,124 @@ function validateClosurePeriod(startDate, endDate) {
 
 async function buildClosurePreview(startDate, endDate, db = pool) {
   const [ordersRes, cancelledRes, expensesRes, invRes] = await Promise.all([
-    db.query(`SELECT id, total, payment_method, cart_json, delivery_provider_type, external_delivery_cost FROM pedidos_app_orders
+    db.query(`SELECT id, total, payment_method, cart_json, delivery_provider_type, external_delivery_cost, COALESCE(total_cogs, 0) AS total_cogs
+      FROM pedidos_app_orders
       WHERE (created_at AT TIME ZONE 'America/Bogota')::date BETWEEN $1 AND $2
         AND status IN ('Entregado', 'Completado')`, [startDate, endDate]),
     db.query(`SELECT COUNT(*)::int AS count FROM pedidos_app_orders
       WHERE (created_at AT TIME ZONE 'America/Bogota')::date BETWEEN $1 AND $2 AND status = 'Cancelado'`, [startDate, endDate]),
     db.query('SELECT category, amount FROM pedidos_app_expenses WHERE expense_date BETWEEN $1 AND $2', [startDate, endDate]),
-    db.query(`SELECT title AS product_name, inventory_unit AS unit, COALESCE(stock, 0) AS quantity,
-      COALESCE(stock, 0) * COALESCE(inventory_unit_cost, 0) AS value
-      FROM pedidos_app_products WHERE track_stock = TRUE ORDER BY title`),
+    db.query(`SELECT name AS product_name, unit, COALESCE(stock, 0)::numeric AS quantity,
+      ROUND(COALESCE(stock, 0)::numeric * COALESCE(unit_cost, average_cost, 0)::numeric, 2) AS value
+      FROM pedidos_app_inventory WHERE track_stock = TRUE
+      UNION ALL
+      SELECT title AS product_name, COALESCE(inventory_unit, 'unidad') AS unit, COALESCE(stock, 0)::numeric AS quantity,
+      ROUND(COALESCE(stock, 0)::numeric * COALESCE(inventory_unit_cost, average_cost, 0)::numeric, 2) AS value
+      FROM pedidos_app_products WHERE track_stock = TRUE AND stock > 0
+      ORDER BY product_name`),
   ]);
+
   const metodosPago = {};
-  const productosVendidos = {};
   const categoriasVentas = {};
   let totalVentas = 0;
+  const orderIds = [];
+
   for (const order of ordersRes.rows) {
+    orderIds.push(order.id);
     const total = Number(order.total || 0);
     totalVentas += total;
     const method = String(order.payment_method || 'Efectivo').trim();
     metodosPago[method] = (metodosPago[method] || 0) + total;
     const cart = Array.isArray(order.cart_json) ? order.cart_json : [];
     for (const item of cart) {
-      const id = String(item.id || item.product_id || item.productId || '');
       const quantity = Math.max(0, Number(item.quantity || item.qty || 1));
-      if (id) productosVendidos[id] = (productosVendidos[id] || 0) + quantity;
       const category = String(item.category || 'General');
       categoriasVentas[category] = (categoriasVentas[category] || 0) + Number(item.price || 0) * quantity;
     }
   }
-  const productIds = Object.keys(productosVendidos);
-  const productCosts = productIds.length
-    ? await db.query('SELECT id, title, inventory_unit_cost FROM pedidos_app_products WHERE id::text = ANY($1::text[])', [productIds])
-    : { rows: [] };
+
   let totalCostoProduccion = 0;
   const desgloseCostos = {};
-  for (const product of productCosts.rows) {
-    const cost = Number(product.inventory_unit_cost || 0) * Number(productosVendidos[product.id] || 0);
-    totalCostoProduccion += cost;
-    if (cost) desgloseCostos[product.title] = cost;
+
+  if (orderIds.length > 0) {
+    // 1. Obtener costos registrados por producto en pedidos_app_order_item_costs
+    const itemCostsRes = await db.query(`
+      SELECT 
+        c.order_id,
+        c.product_id,
+        COALESCE(p.title, 'Producto') AS product_title,
+        SUM(c.total_cost) AS total_cost
+      FROM pedidos_app_order_item_costs c
+      LEFT JOIN pedidos_app_products p ON p.id = c.product_id
+      WHERE c.order_id = ANY($1::int[])
+      GROUP BY c.order_id, c.product_id, p.title
+    `, [orderIds]);
+
+    const costedOrders = new Set();
+    for (const row of itemCostsRes.rows) {
+      costedOrders.add(row.order_id);
+      const title = row.product_title || 'Producto';
+      const cost = Math.round(Number(row.total_cost || 0));
+      if (cost > 0) {
+        desgloseCostos[title] = (desgloseCostos[title] || 0) + cost;
+        totalCostoProduccion += cost;
+      }
+    }
+
+    // 2. Para pedidos o ítems que no tengan registro en order_item_costs, calcular desde recetas e insumos
+    const recipeCostsRes = await db.query(`
+      SELECT 
+        p.id AS product_id,
+        p.title,
+        COALESCE(p.inventory_unit_cost, 0) AS direct_unit_cost,
+        COALESCE(SUM(pr.quantity * COALESCE(inv.unit_cost, inv.average_cost, 0)), 0) AS recipe_unit_cost
+      FROM pedidos_app_products p
+      LEFT JOIN pedidos_app_product_recipes pr ON pr.product_id = p.id
+      LEFT JOIN pedidos_app_inventory inv ON inv.id = pr.inventory_id
+      GROUP BY p.id, p.title, p.inventory_unit_cost
+    `);
+
+    const productCostMap = {};
+    for (const r of recipeCostsRes.rows) {
+      const unitCost = Number(r.recipe_unit_cost) > 0 ? Number(r.recipe_unit_cost) : Number(r.direct_unit_cost);
+      productCostMap[String(r.product_id)] = { title: r.title, unitCost };
+      if (r.title) productCostMap[r.title.toLowerCase().trim()] = { title: r.title, unitCost };
+    }
+
+    // 3. Revisar pedidos sin costeo detallado en order_item_costs
+    for (const order of ordersRes.rows) {
+      if (costedOrders.has(order.id)) continue;
+
+      const cart = Array.isArray(order.cart_json) ? order.cart_json : [];
+      let orderComputedCost = 0;
+
+      for (const item of cart) {
+        const id = String(item.id || item.product_id || item.productId || '');
+        const title = String(item.title || item.name || 'Producto').trim();
+        const qty = Math.max(0, Number(item.quantity || item.qty || 1));
+        const matched = productCostMap[id] || productCostMap[title.toLowerCase()];
+        const unitCost = matched ? matched.unitCost : 0;
+        const lineCost = Math.round(unitCost * qty);
+
+        if (lineCost > 0) {
+          const itemTitle = matched?.title || title;
+          desgloseCostos[itemTitle] = (desgloseCostos[itemTitle] || 0) + lineCost;
+          orderComputedCost += lineCost;
+        }
+      }
+
+      // Si el pedido tiene total_cogs precalculado y los ítems no tenían receta registrada
+      const orderCogs = Math.round(Number(order.total_cogs || 0));
+      if (orderComputedCost === 0 && orderCogs > 0) {
+        const fallbackTitle = cart[0]?.title || 'Productos varios';
+        desgloseCostos[fallbackTitle] = (desgloseCostos[fallbackTitle] || 0) + orderCogs;
+        totalCostoProduccion += orderCogs;
+      } else {
+        totalCostoProduccion += orderComputedCost;
+      }
+    }
   }
+
   let totalGastos = 0;
   const desgloseGastos = {};
   for (const expense of expensesRes.rows) {
@@ -4457,22 +4636,41 @@ async function buildClosurePreview(startDate, endDate, db = pool) {
     const category = expense.category || 'Otros';
     desgloseGastos[category] = (desgloseGastos[category] || 0) + amount;
   }
+
   const costoDomiciliosExternos = ordersRes.rows.reduce((sum, order) =>
     sum + (String(order.delivery_provider_type || '').startsWith('external_') ? Number(order.external_delivery_cost || 0) : 0), 0);
   if (costoDomiciliosExternos > 0) {
     totalGastos += costoDomiciliosExternos;
     desgloseGastos['Operadores logísticos externos'] = costoDomiciliosExternos;
   }
-  const inventarioSnapshot = invRes.rows.map((row) => ({ name: row.product_name, unit: row.unit,
-    quantity: Number(row.quantity), value: Number(row.value) }));
+
+  const inventarioSnapshot = invRes.rows.map((row) => ({
+    name: row.product_name,
+    unit: row.unit,
+    quantity: Number(row.quantity),
+    value: Math.round(Number(row.value || 0))
+  }));
+  const totalInventarioValorizado = inventarioSnapshot.reduce((sum, item) => sum + item.value, 0);
+
   const efectivoEsperado = Object.entries(metodosPago).reduce((sum, [method, value]) =>
     sum + (/efectivo/i.test(method) ? Number(value) : 0), 0);
+
   return {
-    totalVentas, totalPedidos: ordersRes.rows.length, pedidosCancelados: cancelledRes.rows[0].count,
-    totalCostoProduccion, totalGastos, costoDomiciliosExternos,
+    totalVentas,
+    totalPedidos: ordersRes.rows.length,
+    pedidosCancelados: cancelledRes.rows[0].count,
+    totalCostoProduccion,
+    totalGastos,
+    costoDomiciliosExternos,
     utilidadNeta: totalVentas - totalCostoProduccion - totalGastos,
-    margenBruto: totalVentas ? ((totalVentas - totalCostoProduccion) / totalVentas) * 100 : 0,
-    efectivoEsperado, metodosPago, categoriasVentas, desgloseCostos, desgloseGastos, inventarioSnapshot,
+    margenBruto: totalVentas ? Math.round(((totalVentas - totalCostoProduccion) / totalVentas) * 1000) / 10 : 0,
+    efectivoEsperado,
+    metodosPago,
+    categoriasVentas,
+    desgloseCostos,
+    desgloseGastos,
+    inventarioSnapshot,
+    totalInventarioValorizado
   };
 }
 
@@ -5474,7 +5672,7 @@ app.get('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req,
 });
 
 app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req, res) => {
-  const { inventory_id, quantity, purchase_unit, unit_cost, total_cost, supplier, purchase_date, notes } = req.body;
+  const { inventory_id, quantity, purchase_unit, unit_cost, total_cost, supplier, purchase_date, notes, invoice_url, receipt_url } = req.body;
   const rawQty = Number(quantity);
   if (!Number.isFinite(rawQty) || rawQty <= 0) {
     return res.status(400).json({ status: 'error', error: 'La cantidad debe ser mayor a cero' });
@@ -5553,10 +5751,12 @@ app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req
       conversionMultiplier !== 1 ? `Conversión: ${rawQty} ${pUnit} = ${convertedQty} ${baseUnit} ($${finalUnitCostBase}/${baseUnit})` : null
     ].filter(Boolean).join(' | ');
 
+    const finalInvoiceUrl = (invoice_url || receipt_url || '').trim() || null;
+
     const { rows: purchaseRows } = await client.query(
       `INSERT INTO pedidos_app_inventory_purchases 
-        (inventory_id, quantity, unit_cost, total_cost, supplier, supplier_id, purchase_date, notes, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+        (inventory_id, quantity, unit_cost, total_cost, supplier, supplier_id, purchase_date, notes, created_by, invoice_url)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
       [
         inv.id,
         convertedQty,
@@ -5566,7 +5766,8 @@ app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req
         supplierId,
         purchase_date ? String(purchase_date).slice(0, 10) : new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Bogota' }).format(new Date()),
         purchaseNotes,
-        req.user?.username || 'Sistema'
+        req.user?.username || 'Sistema',
+        finalInvoiceUrl
       ]
     );
 
@@ -5593,7 +5794,7 @@ app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req
 // --- EDICIÓN SEGURA DE COMPRAS DE INVENTARIO ---
 app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
-  const { quantity, purchase_unit, unit_cost, total_cost, supplier, purchase_date, notes, edit_reason } = req.body;
+  const { quantity, purchase_unit, unit_cost, total_cost, supplier, purchase_date, notes, edit_reason, invoice_url, receipt_url } = req.body;
   
   const rawQty = Number(quantity);
   if (!Number.isFinite(rawQty) || rawQty <= 0) {
@@ -5683,6 +5884,10 @@ app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, async (
 
     const normalizedSupplier = await getCanonicalSupplierName(client, supplier || originalPurchase.supplier);
 
+    const invoiceUrlToSet = invoice_url !== undefined
+      ? ((invoice_url || '').trim() || null)
+      : (receipt_url !== undefined ? ((receipt_url || '').trim() || null) : originalPurchase.invoice_url);
+
     // Historial de edición de auditoría
     const historyEntry = {
       edited_at: new Date().toISOString(),
@@ -5695,6 +5900,7 @@ app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, async (
         supplier: originalPurchase.supplier,
         purchase_date: originalPurchase.purchase_date,
         notes: originalPurchase.notes,
+        invoice_url: originalPurchase.invoice_url,
       },
       new_values: {
         quantity: newConvertedQty,
@@ -5703,6 +5909,7 @@ app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, async (
         supplier: normalizedSupplier,
         purchase_date: purchase_date ? String(purchase_date).slice(0, 10) : originalPurchase.purchase_date,
         notes: notes?.trim(),
+        invoice_url: invoiceUrlToSet,
       },
       delta: {
         quantity: deltaQty,
@@ -5726,8 +5933,9 @@ app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, async (
            purchase_date = COALESCE($5, purchase_date),
            notes = $6,
            updated_at = NOW(),
-           edit_history = COALESCE(edit_history, '[]'::jsonb) || $7::jsonb
-       WHERE id = $8 RETURNING *`,
+           edit_history = COALESCE(edit_history, '[]'::jsonb) || $7::jsonb,
+           invoice_url = $8
+       WHERE id = $9 RETURNING *`,
       [
         newConvertedQty,
         newUnitCostBase,
@@ -5736,6 +5944,7 @@ app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, async (
         purchase_date ? String(purchase_date).slice(0, 10) : null,
         updatedNotes,
         JSON.stringify([historyEntry]),
+        invoiceUrlToSet,
         id
       ]
     );
