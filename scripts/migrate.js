@@ -24,7 +24,7 @@ async function migrate() {
     `);
 
     const files = fs.readdirSync(migrationsDirectory)
-      .filter((file) => file.endsWith('.sql'))
+      .filter((file) => /^\d{3}_.*\.sql$/.test(file))
       .sort();
 
     await client.query('SELECT pg_advisory_lock(hashtext($1))', ['distrito-api-migrations']);

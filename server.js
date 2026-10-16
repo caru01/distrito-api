@@ -5185,6 +5185,12 @@ require('./rappi_api')(app, {
   authenticateToken,
   deliveryOrderService,
 });
+require('./nomina_api')(app, {
+  pool,
+  authenticateToken,
+  requirePermission,
+  logActivity,
+});
 
 const deliveryOutbox = createOutboxDispatcher({
   pool,
