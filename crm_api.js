@@ -505,7 +505,7 @@ module.exports = function registerCrmApi(app, {
             WHEN EXISTS(SELECT 1 FROM pedidos_app_crm_campaign_recipients previous WHERE previous.contact_id=contact.id AND previous.sent_at>=NOW()-($${frequencyParam}*INTERVAL '1 day')) THEN 'EXCLUDED' ELSE 'PENDING' END,
           CASE WHEN NOT contact.marketing_opt_in THEN 'MARKETING_CONSENT_REQUIRED' WHEN contact.marketing_opt_out OR contact.no_contact THEN 'CONTACT_OPTED_OUT'
             WHEN EXISTS(SELECT 1 FROM pedidos_app_crm_campaign_recipients previous WHERE previous.contact_id=contact.id AND previous.sent_at>=NOW()-($${frequencyParam}*INTERVAL '1 day')) THEN 'FREQUENCY_CAP' ELSE NULL END,
-          jsonb_build_object('contact.name',COALESCE(contact.display_name,''),'contact.phone',contact.normalized_phone,'contact.barrio',COALESCE(contact.barrio,''),'contact.orders_count',contact.orders_count,'contact.total_spent',contact.total_spent)
+          jsonb_build_object('contact.name',COALESCE(NULLIF(TRIM(contact.display_name),''),'amig@'),'contact.phone',contact.normalized_phone,'contact.barrio',COALESCE(contact.barrio,''),'contact.orders_count',contact.orders_count,'contact.total_spent',contact.total_spent)
         FROM pedidos_app_crm_contacts contact WHERE contact.deleted_at IS NULL AND ${compiled.sql}
         ON CONFLICT(campaign_id,contact_id) DO NOTHING
       `,[campaign.id,...compiled.params,(await client.query('SELECT crm_campaign_frequency_days FROM pedidos_app_settings WHERE id=1')).rows[0]?.crm_campaign_frequency_days||7]);

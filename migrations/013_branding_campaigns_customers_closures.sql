@@ -54,7 +54,7 @@ ALTER TABLE pedidos_app_announcements
   DROP CONSTRAINT IF EXISTS announcements_priority_check;
 
 ALTER TABLE pedidos_app_announcements
-  ADD CONSTRAINT announcements_campaign_type_check CHECK (campaign_type IN ('modal', 'banner')),
+  ADD CONSTRAINT announcements_campaign_type_check CHECK (campaign_type IN ('modal', 'banner', 'promo_card')),
   ADD CONSTRAINT announcements_audience_check CHECK (audience IN ('all', 'new', 'returning')),
   ADD CONSTRAINT announcements_priority_check CHECK (priority BETWEEN 0 AND 100);
 

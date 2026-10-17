@@ -1101,6 +1101,7 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
 
     let resolvedCrmContactId = customer.crm_contact_id || null;
     if (!resolvedCrmContactId && formattedPhone && formattedPhone !== '2222222' && formattedPhone.length >= 7) {
+      await client.query('SAVEPOINT crm_sync');
       try {
         const normPhone = normalizePhoneE164(formattedPhone);
         if (normPhone) {
@@ -1115,12 +1116,13 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
 
           const custRes = await client.query(`
             INSERT INTO pedidos_app_customers (name, phone, phone_e164, address, barrio, status, marketing_opt_in)
-            VALUES ($1, $2, $3, $4, $5, 'active', TRUE)
+            VALUES ($1, $2, $3, $4, $5, 'Activo', TRUE)
             ON CONFLICT (phone) DO UPDATE SET
               name = COALESCE(NULLIF(EXCLUDED.name, ''), pedidos_app_customers.name),
               phone_e164 = COALESCE(EXCLUDED.phone_e164, pedidos_app_customers.phone_e164),
               address = COALESCE(NULLIF(EXCLUDED.address, ''), pedidos_app_customers.address),
               barrio = COALESCE(NULLIF(EXCLUDED.barrio, ''), pedidos_app_customers.barrio),
+              status = 'Activo',
               updated_at = NOW()
             RETURNING id
           `, [customer.name || 'Cliente', formattedPhone, normPhone, customer.address || null, customer.barrio || null]);
@@ -1133,7 +1135,9 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
             `, [contact.id, custRes.rows[0].id]);
           }
         }
+        await client.query('RELEASE SAVEPOINT crm_sync');
       } catch (crmErr) {
+        await client.query('ROLLBACK TO SAVEPOINT crm_sync');
         console.error('Error auto-vinculando cliente a CRM:', crmErr.message);
       }
     }

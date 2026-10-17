@@ -52,6 +52,20 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
     }
   };
 
+  // Asegurar tabla de amortizaciones de deducciones en nómina
+  pool.query(`
+    CREATE TABLE IF NOT EXISTS pedidos_app_payroll_deduction_amortizations (
+      id SERIAL PRIMARY KEY,
+      payroll_period_id INTEGER NOT NULL REFERENCES pedidos_app_payroll_periods(id) ON DELETE CASCADE,
+      payroll_item_id INTEGER NOT NULL REFERENCES pedidos_app_payroll_items(id) ON DELETE CASCADE,
+      deduction_id INTEGER NOT NULL REFERENCES pedidos_app_employee_deductions(id) ON DELETE CASCADE,
+      amount_deducted NUMERIC(12,2) NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_pad_period ON pedidos_app_payroll_deduction_amortizations(payroll_period_id);
+    CREATE INDEX IF NOT EXISTS idx_pad_deduction ON pedidos_app_payroll_deduction_amortizations(deduction_id);
+  `).catch(err => console.error('[Nomina] Error asegurando tabla amortizaciones:', err.message));
+
   // Helper para sanitizar respuestas de error de servidor (SEC-02)
   const handleServerError = (res, err, publicMessage = 'No fue posible completar la operación debido a un error interno.') => {
     console.error('[Nomina Server Error]', err);
@@ -362,7 +376,10 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
         bank_account_number,
         emergency_contact_name,
         emergency_contact_phone,
-        notes
+        notes,
+        marital_status = 'Soltero/a',
+        birth_date,
+        payment_method = 'Efectivo'
       } = req.body;
 
       if (!first_name?.trim() || !last_name?.trim() || !document_number?.trim() || !position?.trim()) {
@@ -410,14 +427,16 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
           has_transport_allowance, transport_allowance_daily,
           deduce_health, deduce_pension, health_percentage, pension_percentage,
           additional_benefits, hire_date, bank_name, bank_account_type, bank_account_number,
-          emergency_contact_name, emergency_contact_phone, notes, status
+          emergency_contact_name, emergency_contact_phone, notes, status,
+          marital_status, birth_date, payment_method
         ) VALUES (
           $1, $2, $3, $4, $5, $6, $7,
           $8, $9, $10, $11, $12, $13,
           $14, $15,
           $16, $17, $18, $19,
           $20, COALESCE($21::date, CURRENT_DATE), $22, $23, $24,
-          $25, $26, $27, 'Activo'
+          $25, $26, $27, 'Activo',
+          $28, $29::date, $30
         )
         RETURNING *
       `, [
@@ -447,7 +466,10 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
         bank_account_number?.trim() || null,
         emergency_contact_name?.trim() || null,
         emergency_contact_phone?.trim() || null,
-        notes?.trim() || null
+        notes?.trim() || null,
+        marital_status?.trim() || 'Soltero/a',
+        birth_date || null,
+        payment_method?.trim() || 'Efectivo'
       ]);
 
       await audit(req, 'Empleado creado', `Empleado ${first_name} ${last_name} (${position}) registrado exitosamente`);
@@ -491,7 +513,10 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
         bank_account_number,
         emergency_contact_name,
         emergency_contact_phone,
-        notes
+        notes,
+        marital_status,
+        birth_date,
+        payment_method
       } = req.body;
 
       const { rows: currentRows } = await pool.query('SELECT * FROM pedidos_app_employees WHERE id = $1', [id]);
@@ -544,8 +569,11 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
           emergency_contact_name = $28,
           emergency_contact_phone = $29,
           notes = $30,
+          marital_status = COALESCE($31, marital_status),
+          birth_date = COALESCE($32::date, birth_date),
+          payment_method = COALESCE($33, payment_method),
           updated_at = NOW()
-        WHERE id = $31
+        WHERE id = $34
         RETURNING *
       `, [
         first_name?.trim(),
@@ -578,6 +606,9 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
         emergency_contact_name?.trim() || null,
         emergency_contact_phone?.trim() || null,
         notes?.trim() || null,
+        marital_status?.trim() || null,
+        birth_date || null,
+        payment_method?.trim() || null,
         id
       ]);
 
@@ -777,10 +808,15 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
       if (custom_daily_value !== undefined && custom_daily_value !== null) {
         dailyValue = Number(custom_daily_value);
       } else {
-        if (['Trabajó', 'Descanso', 'Permiso remunerado', 'Vacaciones', 'Festivo'].includes(status)) {
+        const isLaborMonthly = emp.contract_type?.startsWith('Laboral') && Number(emp.salary_base || 0) > 0;
+        if (status === 'Trabajó') {
           dailyValue = Number(emp.daily_rate) || Math.round((Number(emp.salary_base || 0) / 30) * 100) / 100;
         } else if (status === 'Media jornada') {
           dailyValue = Math.round(((Number(emp.daily_rate) || (Number(emp.salary_base || 0) / 30)) / 2) * 100) / 100;
+        } else if (isLaborMonthly && ['Descanso', 'Permiso remunerado', 'Vacaciones', 'Festivo'].includes(status)) {
+          dailyValue = Math.round((Number(emp.salary_base || 0) / 30) * 100) / 100;
+        } else if (!isLaborMonthly && status === 'Permiso remunerado') {
+          dailyValue = Number(emp.daily_rate) || 0;
         } else {
           dailyValue = 0;
         }
@@ -1500,9 +1536,13 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
           i.*,
           e.first_name,
           e.last_name,
+          e.document_type,
           e.document_number,
           e.position,
           e.contract_type,
+          e.phone,
+          e.email,
+          e.payment_method,
           e.bank_name,
           e.bank_account_type,
           e.bank_account_number
@@ -1551,6 +1591,17 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
           AND hire_date <= $2::date
         ORDER BY first_name ASC
       `, [period.start_date, period.end_date]);
+
+      // Limpiar ítems obsoletos sin pagos de colaboradores que ya no aplican al periodo
+      const eligibleEmpIds = employees.map(e => e.id);
+      if (eligibleEmpIds.length > 0) {
+        await client.query(`
+          DELETE FROM pedidos_app_payroll_items
+          WHERE payroll_period_id = $1 
+            AND total_paid = 0 
+            AND employee_id != ALL($2::uuid[])
+        `, [period.id, eligibleEmpIds]);
+      }
 
       let periodDaysWorked = 0;
       let periodBaseSalary = 0;
@@ -1615,9 +1666,19 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
           daysWorked = monthly.paidDays;
           baseSalaryEarned = monthly.baseSalaryEarned;
           transportAllowanceEarned = monthly.transportAllowanceEarned;
-        } else if (!isEligibleForTransport || isServices) {
-          // JORNAL / TURNO: se pagan los turnos realmente registrados; el auxilio ya viene una vez por fecha.
-          transportAllowanceEarned = 0;
+        } else {
+          // JORNAL / TURNO / PRESTACIÓN DE SERVICIOS:
+          // Solo se pagan los turnos trabajados o permisos remunerados (los descansos no se remuneran para pago por día)
+          let earnedFromShifts = 0;
+          for (const r of attRows) {
+            if (['Trabajó', 'Media jornada', 'Permiso remunerado'].includes(r.status)) {
+              earnedFromShifts += Number(r.daily_value_applied) || 0;
+            }
+          }
+          baseSalaryEarned = round2(earnedFromShifts);
+          if (!isEligibleForTransport || isServices) {
+            transportAllowanceEarned = 0;
+          }
         }
 
         let bonusesEarned = 0;
@@ -1898,15 +1959,125 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
         }
       }
 
+      // Validar reapertura a Calculado o Borrador: no debe tener pagos registrados activos
+      if (['Borrador', 'Calculado'].includes(status) && ['Aprobado', 'Cerrado'].includes(currentPeriod.status)) {
+        const { rows: payCheck } = await client.query(`
+          SELECT COUNT(*) AS count FROM pedidos_app_payroll_payments p
+          JOIN pedidos_app_payroll_items it ON it.id = p.payroll_item_id
+          WHERE it.payroll_period_id = $1 AND p.status = 'Pagado'
+        `, [id]);
+        if (Number(payCheck[0]?.count || 0) > 0) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({
+            status: 'error',
+            error: 'No es posible reabrir un periodo con pagos registrados. Anule primero los pagos.'
+          });
+        }
+      }
+
+      // Si se pasa a Cerrado, amortizar deducciones descontadas en este periodo
+      if (status === 'Cerrado' && currentPeriod.status !== 'Cerrado') {
+        const { rows: appliedItems } = await client.query(`
+          SELECT id, employee_id, advances_deduction
+          FROM pedidos_app_payroll_items
+          WHERE payroll_period_id = $1 AND advances_deduction > 0
+        `, [id]);
+
+        for (const item of appliedItems) {
+          let remToAmortize = Number(item.advances_deduction);
+          if (remToAmortize <= 0) continue;
+
+          const { rows: empDeductions } = await client.query(`
+            SELECT id, amount, balance_remaining, installment_amount, installments_total, installments_paid
+            FROM pedidos_app_employee_deductions
+            WHERE employee_id = $1 AND status IN ('Pendiente', 'Parcial') AND balance_remaining > 0
+            ORDER BY request_date ASC, id ASC
+            FOR UPDATE
+          `, [item.employee_id]);
+
+          for (const ded of empDeductions) {
+            if (remToAmortize <= 0) break;
+            const instAmount = Number(ded.installment_amount) > 0 ? Number(ded.installment_amount) : Number(ded.balance_remaining);
+            const apply = Math.min(remToAmortize, Number(ded.balance_remaining), instAmount);
+            if (apply <= 0) continue;
+
+            const newBalance = Math.max(0, Number(ded.balance_remaining) - apply);
+            const newStatus = newBalance <= 0.005 ? 'Pagado' : 'Parcial';
+            const newInstallmentsPaid = Number(ded.installments_paid || 0) + 1;
+
+            await client.query(`
+              UPDATE pedidos_app_employee_deductions SET
+                balance_remaining = $1,
+                status = $2,
+                installments_paid = $3,
+                updated_at = NOW()
+              WHERE id = $4
+            `, [newBalance, newStatus, newInstallmentsPaid, ded.id]);
+
+            await client.query(`
+              INSERT INTO pedidos_app_payroll_deduction_amortizations (
+                payroll_period_id, payroll_item_id, deduction_id, amount_deducted
+              ) VALUES ($1, $2, $3, $4)
+            `, [id, item.id, ded.id, apply]);
+
+            remToAmortize -= apply;
+          }
+        }
+      }
+
+      // Si el periodo estaba Cerrado y se reabre a Borrador o Calculado, revertir amortizaciones
+      if (currentPeriod.status === 'Cerrado' && status !== 'Cerrado') {
+        const { rows: amortizations } = await client.query(`
+          SELECT id, deduction_id, amount_deducted
+          FROM pedidos_app_payroll_deduction_amortizations
+          WHERE payroll_period_id = $1
+        `, [id]);
+
+        for (const am of amortizations) {
+          await client.query(`
+            UPDATE pedidos_app_employee_deductions SET
+              balance_remaining = balance_remaining + $1,
+              installments_paid = GREATEST(0, installments_paid - 1),
+              status = CASE 
+                WHEN (balance_remaining + $1) >= amount THEN 'Pendiente'
+                ELSE 'Parcial'
+              END,
+              updated_at = NOW()
+            WHERE id = $2
+          `, [Number(am.amount_deducted), am.deduction_id]);
+        }
+
+        await client.query(`
+          DELETE FROM pedidos_app_payroll_deduction_amortizations
+          WHERE payroll_period_id = $1
+        `, [id]);
+      }
+
       const userName = req.user?.username || 'Administrador';
 
       const { rows } = await client.query(`
         UPDATE pedidos_app_payroll_periods SET
           status = $1::varchar,
-          approved_at = CASE WHEN $1::varchar = 'Aprobado' THEN NOW() ELSE approved_at END,
-          approved_by = CASE WHEN $1::varchar = 'Aprobado' THEN $2::varchar ELSE approved_by END,
-          closed_at = CASE WHEN $1::varchar = 'Cerrado' THEN NOW() ELSE closed_at END,
-          closed_by = CASE WHEN $1::varchar = 'Cerrado' THEN $2::varchar ELSE closed_by END,
+          approved_at = CASE 
+            WHEN $1::varchar = 'Aprobado' THEN NOW() 
+            WHEN $1::varchar IN ('Borrador', 'Calculado') THEN NULL 
+            ELSE approved_at 
+          END,
+          approved_by = CASE 
+            WHEN $1::varchar = 'Aprobado' THEN $2::varchar 
+            WHEN $1::varchar IN ('Borrador', 'Calculado') THEN NULL 
+            ELSE approved_by 
+          END,
+          closed_at = CASE 
+            WHEN $1::varchar = 'Cerrado' THEN NOW() 
+            WHEN $1::varchar != 'Cerrado' THEN NULL 
+            ELSE closed_at 
+          END,
+          closed_by = CASE 
+            WHEN $1::varchar = 'Cerrado' THEN $2::varchar 
+            WHEN $1::varchar != 'Cerrado' THEN NULL 
+            ELSE closed_by 
+          END,
           updated_at = NOW()
         WHERE id = $3
         RETURNING *
@@ -2282,6 +2453,9 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
           e.document_number,
           e.position,
           e.contract_type,
+          e.phone,
+          e.email,
+          e.payment_method,
           e.bank_name,
           e.bank_account_type,
           e.bank_account_number,

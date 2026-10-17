@@ -30,7 +30,7 @@ async function migrate() {
     await client.query('SELECT pg_advisory_lock(hashtext($1))', ['distrito-api-migrations']);
     try {
       for (const file of files) {
-        const sql = fs.readFileSync(path.join(migrationsDirectory, file), 'utf8');
+        const sql = fs.readFileSync(path.join(migrationsDirectory, file), 'utf8').replace(/^\uFEFF/, '');
         const currentChecksum = checksum(sql);
         const { rows } = await client.query(
           'SELECT checksum FROM pedidos_app_schema_migrations WHERE name = $1',

@@ -1,4 +1,4 @@
-﻿-- ============================================================
+-- ============================================================
 -- 023_crm_bsuid_username.sql
 -- Adaptacion para contactos WhatsApp con numero oculto (BSUID)
 -- Meta WhatsApp Business envia fromUserId (CO.xxxx) en lugar

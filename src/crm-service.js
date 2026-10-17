@@ -77,7 +77,10 @@ function buildCampaignTemplateComponents(configuration = {}, renderedValues = {}
     const parameters = configuration.body.map((source) => {
       const normalized = String(source || '');
       if (!allowedSources.has(normalized)) throw crmError('WHATSAPP_TEMPLATE_INVALID', `Variable no permitida: ${normalized || '(vacía)'}.`, 400);
-      return { type: 'text', text: String(renderedValues[normalized] ?? '').slice(0, 1024) };
+      let val = String(renderedValues[normalized] ?? '').trim();
+      if (!val && normalized === 'contact.name') val = 'amig@';
+      if (!val) val = '-';
+      return { type: 'text', text: val.slice(0, 1024) };
     });
     components.push({ type: 'body', parameters });
   }
