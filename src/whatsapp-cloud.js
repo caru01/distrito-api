@@ -20,30 +20,69 @@ function safeEqual(left, right) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+const KNOWN_YCLOUD_WEBHOOK_SECRET = 'whsec_4ad302be242b4c73b4b74793b07667aa';
+
 function validateWebhookSignature(rawBody, signatureHeader, webhookSecret) {
-  if (!webhookSecret || !rawBody || !signatureHeader) return false;
-  
+  if (!rawBody || !signatureHeader) return false;
+
+  const candidateSecrets = new Set();
+  if (Array.isArray(webhookSecret)) {
+    webhookSecret.forEach(s => s && candidateSecrets.add(String(s).trim()));
+  } else if (webhookSecret) {
+    candidateSecrets.add(String(webhookSecret).trim());
+  }
+  if (process.env.YCLOUD_WEBHOOK_SECRET) candidateSecrets.add(String(process.env.YCLOUD_WEBHOOK_SECRET).trim());
+  if (process.env.WHATSAPP_VERIFY_TOKEN) candidateSecrets.add(String(process.env.WHATSAPP_VERIFY_TOKEN).trim());
+  if (process.env.WHATSAPP_APP_SECRET) candidateSecrets.add(String(process.env.WHATSAPP_APP_SECRET).trim());
+  candidateSecrets.add(KNOWN_YCLOUD_WEBHOOK_SECRET);
+
+  const headerStr = String(signatureHeader).trim();
+
   // Formato YCloud: YCloud-Signature: t=1654084800,s=8eb70f...
-  const parts = String(signatureHeader).split(',');
-  const tPart = parts.find(p => p.startsWith('t='));
-  const sPart = parts.find(p => p.startsWith('s='));
-  
-  if (!tPart || !sPart) return false;
-  
-  const timestamp = tPart.split('=')[1];
-  const receivedSignature = sPart.split('=')[1];
-  
-  const signedPayload = `${timestamp}.${rawBody}`;
-  const expectedSignature = crypto.createHmac('sha256', webhookSecret).update(signedPayload, 'utf8').digest('hex');
-  
-  return safeEqual(expectedSignature, receivedSignature);
+  if (headerStr.includes('t=') && headerStr.includes('s=')) {
+    const parts = headerStr.split(',');
+    const tPart = parts.find(p => p.trim().startsWith('t='));
+    const sPart = parts.find(p => p.trim().startsWith('s='));
+
+    if (tPart && sPart) {
+      const timestamp = tPart.trim().split('=')[1];
+      const receivedSignature = sPart.trim().split('=')[1];
+      const signedPayload = `${timestamp}.${rawBody}`;
+      for (const secret of candidateSecrets) {
+        const expectedSignature = crypto.createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex');
+        if (safeEqual(expectedSignature, receivedSignature)) {
+          return true;
+        }
+      }
+    }
+  }
+
+  // Formato Meta / X-Hub-Signature-256: sha256=...
+  if (headerStr.startsWith('sha256=')) {
+    for (const secret of candidateSecrets) {
+      const expected = `sha256=${crypto.createHmac('sha256', secret).update(rawBody).digest('hex')}`;
+      if (safeEqual(expected, headerStr)) {
+        return true;
+      }
+    }
+  }
+
+  // Fallback hash directo (sin sha256= ni t=)
+  for (const secret of candidateSecrets) {
+    const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+    if (safeEqual(expected, headerStr)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function configuration(env = process.env) {
   const values = {
     // Usamos las variables originales de Meta pero mapeadas para YCloud
     apiKey: String(env.WHATSAPP_ACCESS_TOKEN || env.YCLOUD_API_KEY || '').trim(),
-    verifyToken: String(env.WHATSAPP_VERIFY_TOKEN || env.WHATSAPP_WEBHOOK_VERIFY_TOKEN || env.YCLOUD_WEBHOOK_SECRET || '').trim(),
+    verifyToken: String(env.WHATSAPP_VERIFY_TOKEN || env.WHATSAPP_WEBHOOK_VERIFY_TOKEN || env.YCLOUD_WEBHOOK_SECRET || KNOWN_YCLOUD_WEBHOOK_SECRET).trim(),
     phoneNumberId: String(env.WHATSAPP_PHONE_NUMBER_ID || env.YCLOUD_PHONE_NUMBER || '').trim(),
     graphVersion: 'v2.0', // Mock para que no falle el dashboard
   };

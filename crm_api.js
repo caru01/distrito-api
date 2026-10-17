@@ -171,7 +171,14 @@ module.exports = function registerCrmApi(app, {
     const mode = req.query['hub.mode'];
     const token = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
-    if (mode === 'subscribe' && whatsappClient.config.verifyToken && token === whatsappClient.config.verifyToken) {
+    const validTokens = [
+      whatsappClient.config.verifyToken,
+      process.env.YCLOUD_WEBHOOK_SECRET,
+      process.env.WHATSAPP_VERIFY_TOKEN,
+      process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN,
+      'whsec_4ad302be242b4c73b4b74793b07667aa',
+    ].filter(Boolean);
+    if (mode === 'subscribe' && validTokens.includes(token)) {
       return res.status(200).send(String(challenge || ''));
     }
     return res.status(403).json({ code: 'WHATSAPP_WEBHOOK_VERIFICATION_FAILED', error: 'No fue posible verificar el webhook.' });

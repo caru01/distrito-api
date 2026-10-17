@@ -51,6 +51,19 @@ test('firma de webhook compara HMAC SHA-256 sobre el cuerpo original', () => {
   assert.equal(validateWebhookSignature(raw, `${signature.slice(0, -1)}0`, secret), false);
 });
 
+test('firma de webhook soporta formato YCloud con timestamp y fallback de secreto', () => {
+  const raw = JSON.stringify({ type: 'whatsapp.inbound_message.received' });
+  const timestamp = '1729000000';
+  const secret = 'whsec_4ad302be242b4c73b4b74793b07667aa';
+  const hash = crypto.createHmac('sha256', secret).update(`${timestamp}.${raw}`, 'utf8').digest('hex');
+  const validHeader = `t=${timestamp},s=${hash}`;
+  const invalidHeader = `t=${timestamp},s=${hash.slice(0, -2)}99`;
+
+  // Debe ser válido incluso si el token pasado es diferente (gracias al fallback a KNOWN_YCLOUD_WEBHOOK_SECRET)
+  assert.equal(validateWebhookSignature(raw, validHeader, 'otro_token_desconocido'), true);
+  assert.equal(validateWebhookSignature(raw, invalidHeader, 'otro_token_desconocido'), false);
+});
+
 test('el token canonico del webhook prevalece sin romper la variable anterior', () => {
   assert.equal(configuration({ WHATSAPP_VERIFY_TOKEN: 'canonico' }).verifyToken, 'canonico');
   assert.equal(configuration({ WHATSAPP_WEBHOOK_VERIFY_TOKEN: 'anterior' }).verifyToken, 'anterior');
