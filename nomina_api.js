@@ -31,6 +31,23 @@ const {
 module.exports = function(app, { pool, authenticateToken, requirePermission, logActivity }) {
   const router = express.Router();
 
+  const BOGOTA_TZ = 'America/Bogota';
+
+  // Helper para normalizar o extraer fecha en zona horaria America/Bogota ('YYYY-MM-DD')
+  const toBogotaDateOnly = (dateValue = null) => {
+    if (dateValue) {
+      const trimmed = String(dateValue).trim();
+      if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+        return trimmed;
+      }
+      const d = new Date(trimmed);
+      if (Number.isFinite(d.getTime())) {
+        return new Intl.DateTimeFormat('en-CA', { timeZone: BOGOTA_TZ }).format(d);
+      }
+    }
+    return new Intl.DateTimeFormat('en-CA', { timeZone: BOGOTA_TZ }).format(new Date());
+  };
+
   // Helper de verificación de permisos
   const checkPerm = (action) => {
     if (typeof requirePermission === 'function') {
@@ -81,7 +98,7 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
 
   // Helper para consultar configuración laboral vigente según fecha
   const getActivePayrollConfig = async (dateStr = null) => {
-    const targetDate = dateStr || new Date().toISOString().split('T')[0];
+    const targetDate = toBogotaDateOnly(dateStr);
     const { rows } = await pool.query(`
       SELECT * FROM pedidos_app_payroll_config
       WHERE valid_from <= $1::date AND (valid_to IS NULL OR valid_to >= $1::date)
@@ -321,7 +338,13 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
 
       // Historial de comidas recientes
       const { rows: meals } = await pool.query(`
-        SELECT * FROM pedidos_app_employee_meals 
+        SELECT 
+          id, employee_id, TO_CHAR(delivery_date, 'YYYY-MM-DD') AS delivery_date,
+          item_type, product_id, inventory_id, item_title, quantity,
+          unit_cost, total_cost, stock_movement_id, is_untracked,
+          idempotency_key, status, cancel_reason, annulled_at, annulled_by,
+          registered_by, notes, created_at
+        FROM pedidos_app_employee_meals 
         WHERE employee_id = $1 
         ORDER BY delivery_date DESC 
         LIMIT 30
@@ -729,7 +752,7 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
       `, [startDate, endDate]);
 
       const { rows: meals } = await pool.query(`
-        SELECT employee_id, delivery_date, COUNT(*) AS count
+        SELECT employee_id, TO_CHAR(delivery_date, 'YYYY-MM-DD') AS delivery_date, COUNT(*) AS count
         FROM pedidos_app_employee_meals
         WHERE status = 'Entregado' AND delivery_date BETWEEN $1::date AND $2::date
         GROUP BY employee_id, delivery_date
@@ -942,7 +965,26 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
       const { date_from, date_to, employee_id, status } = req.query;
       let query = `
         SELECT 
-          m.*,
+          m.id,
+          m.employee_id,
+          TO_CHAR(m.delivery_date, 'YYYY-MM-DD') AS delivery_date,
+          m.item_type,
+          m.product_id,
+          m.inventory_id,
+          m.item_title,
+          m.quantity,
+          m.unit_cost,
+          m.total_cost,
+          m.stock_movement_id,
+          m.is_untracked,
+          m.idempotency_key,
+          m.status,
+          m.cancel_reason,
+          m.annulled_at,
+          m.annulled_by,
+          m.registered_by,
+          m.notes,
+          m.created_at,
           e.first_name,
           e.last_name,
           e.document_number,
@@ -1033,7 +1075,7 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
         return res.status(404).json({ status: 'error', error: 'Empleado no encontrado.' });
       }
       const emp = empRows[0];
-      const deliveryDateActual = delivery_date || new Date().toISOString().split('T')[0];
+      const deliveryDateActual = toBogotaDateOnly(delivery_date);
       const registeredBy = req.user?.username || 'Administrador';
 
       let itemTitle = '';
@@ -1228,7 +1270,11 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
           $6, $7, $8, $9, $10,
           $11, $12, 'Entregado', $13, $14
         )
-        RETURNING *
+        RETURNING 
+          id, employee_id, TO_CHAR(delivery_date, 'YYYY-MM-DD') AS delivery_date,
+          item_type, product_id, inventory_id, item_title, quantity,
+          unit_cost, total_cost, stock_movement_id, is_untracked,
+          idempotency_key, status, registered_by, notes, created_at
       `, [
         emp.id,
         deliveryDateActual,

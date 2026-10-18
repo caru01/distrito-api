@@ -1,6 +1,10 @@
 const path = require('path');
 const dotenv = require('dotenv');
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
+
+// Garantizar que las columnas tipo DATE de PostgreSQL (oid 1082) se devuelvan como string 'YYYY-MM-DD'
+// sin conversión a objeto Date de JavaScript, evitando desfases por zona horaria de servidor o cliente.
+types.setTypeParser(1082, (val) => val);
 
 const envFileName = process.env.ENV_FILE || '.env';
 dotenv.config({ path: path.resolve(__dirname, '..', envFileName), override: true });
