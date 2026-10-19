@@ -17,34 +17,125 @@ function safeText(value, maximum = 4096) {
   return String(value || '').trim().slice(0, maximum);
 }
 
+function maskIdentifier(value) {
+  const str = String(value || '').trim();
+  if (!str) return null;
+  if (str.length <= 4) return '****';
+  return `${str.slice(0, 3)}***${str.slice(-4)}`;
+}
+
+function logCrmTrace(event, fields = {}, level = 'info') {
+  if (process.env.CRM_SILENT_LOGS === 'true') return;
+  const record = {
+    level,
+    component: 'crm-pipeline',
+    event,
+    ts: new Date().toISOString(),
+    ...fields,
+  };
+  if (level === 'error') console.error(JSON.stringify(record));
+  else console.log(JSON.stringify(record));
+}
+
+function parseMessageTimestamp(message, fallbackTime = null) {
+  const candidates = [
+    message?.sendTime,
+    message?.createTime,
+    message?.sendAt,
+    message?.createdAt,
+    message?.timestamp,
+    message?.deliverTime,
+    message?.readTime,
+    message?.updateTime,
+    message?.updatedAt,
+    message?.deliverAt,
+    fallbackTime,
+  ];
+  for (const raw of candidates) {
+    if (raw === undefined || raw === null || raw === '') continue;
+    if (raw instanceof Date && !Number.isNaN(raw.getTime())) return raw;
+    const str = String(raw).trim();
+    if (/^\d+(\.\d+)?$/.test(str)) {
+      const num = Number(str);
+      const ms = num < 1e11 ? Math.round(num * 1000) : Math.round(num);
+      const dt = new Date(ms);
+      if (!Number.isNaN(dt.getTime()) && dt.getFullYear() >= 2020) return dt;
+    } else {
+      const dt = new Date(str);
+      if (!Number.isNaN(dt.getTime()) && dt.getFullYear() >= 2020) return dt;
+    }
+  }
+  return new Date();
+}
+
 function hashPayload(value) {
   return crypto.createHash('sha256').update(Buffer.isBuffer(value) ? value : JSON.stringify(value)).digest('hex');
 }
 
-function extractMessageText(message) {
-  if (message.type === 'text') return safeText(message.text?.body);
-  if (message.type === 'button') return safeText(message.button?.text || message.button?.payload);
-  if (message.type === 'interactive') {
-    return safeText(message.interactive?.button_reply?.title || message.interactive?.list_reply?.title);
+function extractMessageText(message = {}) {
+  const type = String(message.type || '').toLowerCase();
+  if (type === 'text') return safeText(message.text?.body ?? message.text);
+  if (type === 'template') {
+    const bodyComp = Array.isArray(message.template?.components)
+      ? message.template.components.find((c) => String(c?.type || '').toUpperCase() === 'BODY')
+      : null;
+    if (bodyComp?.text) return safeText(bodyComp.text);
+    return safeText(message.template?.name ? `[Plantilla: ${message.template.name}]` : '[Plantilla]');
   }
-  if (message.type === 'image' || message.type === 'video' || message.type === 'document') {
-    return safeText(message[message.type]?.caption || `[${message.type}]`);
+  if (type === 'button') return safeText(message.button?.text || message.button?.payload || '[Botón]');
+  if (type === 'interactive') {
+    return safeText(
+      message.interactive?.button_reply?.title
+      || message.interactive?.list_reply?.title
+      || message.interactive?.nfm_reply?.body
+      || message.interactive?.body?.text
+      || '[Interactivo]'
+    );
   }
-  if (message.type === 'location') return safeText(message.location?.name || message.location?.address || '[ubicación]');
+  if (['image', 'video', 'document', 'audio', 'sticker'].includes(type)) {
+    const mediaLabels = { image: '[Imagen]', video: '[Video]', document: '[Documento]', audio: '[Audio]', sticker: '[Sticker]' };
+    return safeText(message[type]?.caption || message[type]?.filename || mediaLabels[type] || `[${type}]`);
+  }
+  if (type === 'location') return safeText(message.location?.name || message.location?.address || '[Ubicación]');
+  if (type === 'reaction') return safeText(message.reaction?.emoji ? `Reacción ${message.reaction.emoji}` : '[Reacción]');
+  if (type === 'contacts') {
+    const firstContact = Array.isArray(message.contacts) ? message.contacts[0] : null;
+    const formattedName = firstContact?.name?.formatted_name || firstContact?.name?.first_name;
+    return safeText(formattedName ? `[Contacto: ${formattedName}]` : '[Contacto compartido]');
+  }
+  if (type === 'order') return '[Pedido de catálogo]';
+  if (type === 'system' || type === 'unsupported') {
+    return safeText(message.system?.body || message.errors?.[0]?.title || message.errors?.[0]?.message || `[${type}]`, 300);
+  }
   return `[${safeText(message.type || 'mensaje', 30)}]`;
 }
 
-function publicMessageContent(message) {
-  const type = safeText(message.type || 'unknown', 20);
+function publicMessageContent(message = {}) {
+  const type = safeText(message.type || 'unknown', 20).toLowerCase();
   const source = message[type] || {};
+  const base = {};
+  if (message.wamid) base.wamid = safeText(message.wamid, 180);
   if (type === 'location') {
-    return { latitude: source.latitude, longitude: source.longitude, name: safeText(source.name, 200), address: safeText(source.address, 300) };
+    return { ...base, latitude: source.latitude, longitude: source.longitude, name: safeText(source.name, 200), address: safeText(source.address, 300) };
   }
-  if (['image', 'audio', 'video', 'document'].includes(type)) {
-    return { mediaId: safeText(source.id, 180), mimeType: safeText(source.mime_type, 120), filename: safeText(source.filename, 240), caption: safeText(source.caption, 1000), sha256: safeText(source.sha256, 128) };
+  if (['image', 'audio', 'video', 'document', 'sticker'].includes(type)) {
+    return {
+      ...base,
+      mediaId: safeText(source.id, 180),
+      mimeType: safeText(source.mime_type || source.mimeType, 120),
+      filename: safeText(source.filename, 240),
+      caption: safeText(source.caption, 1000),
+      sha256: safeText(source.sha256, 128),
+      // Enlace firmado de YCloud: permite al CRM mostrar el archivo mediante el proxy autenticado.
+      link: safeText(source.link || source.url, 2000) || null,
+      voice: source.voice === true,
+    };
   }
-  if (type === 'interactive') return { interactive: source };
-  return {};
+  if (type === 'interactive') return { ...base, interactive: source };
+  if (type === 'reaction') return { ...base, emoji: safeText(source.emoji, 32), messageId: safeText(source.message_id || source.messageId, 180) };
+  if (type === 'contacts') return { ...base, contacts: Array.isArray(message.contacts) ? message.contacts.slice(0, 5) : [] };
+  if (type === 'button') return { ...base, payload: safeText(source.payload, 250), text: safeText(source.text, 250) };
+  return base;
 }
 
 function buildCampaignTemplateComponents(configuration = {}, renderedValues = {}) {
@@ -112,12 +203,23 @@ async function scheduleEventAutomations(client, triggerType, contactId, entityTy
   return rowCount;
 }
 
-async function ensureContact(client, { phone = null, bsuid = null, username = null, name = null, source = 'WHATSAPP', email = null, address = null, barrio = null }) {
+function isConsumidorFinalIdentifier(phone, bsuid) {
+  const rawDigits = String(phone || '').replace(/\D+/g, '');
+  const cleanBsuid = String(bsuid || '').trim().toUpperCase();
+  return rawDigits === '2222222' || rawDigits === '572222222' || cleanBsuid === 'CONSUMIDOR_FINAL';
+}
+
+async function ensureContactOnce(client, { phone = null, bsuid = null, username = null, name = null, source = 'WHATSAPP', email = null, address = null, barrio = null, occurredAt = null }) {
+  const safeSource = safeText(source, 40) || 'OTRO';
+  if (safeSource === 'WHATSAPP' && isConsumidorFinalIdentifier(phone, bsuid)) {
+    throw crmError('CRM_PHONE_INVALID', 'El contacto CONSUMIDOR FINAL es exclusivo de ventas presenciales y no puede vincularse a chats de WhatsApp.', 400);
+  }
+
   const normalizedPhone = normalizePhoneE164(phone);
   const safeBsuid = safeText(bsuid, 128) || null;
   const safeUsername = safeText(username, 128) || null;
   const safeName = safeText(name, 255) || null;
-  const safeSource = safeText(source, 40) || 'OTRO';
+  const contactTime = occurredAt instanceof Date && !Number.isNaN(occurredAt.getTime()) ? occurredAt : new Date();
 
   // Validar: se necesita al menos teléfono O bsuid
   if (!normalizedPhone && !safeBsuid) {
@@ -128,74 +230,85 @@ async function ensureContact(client, { phone = null, bsuid = null, username = nu
 
   // ── Resolución por BSUID (prioridad alta) ───────────────────────────────
   if (safeBsuid) {
-    // 1. Buscar contacto existente por bsuid
-    const byBsuid = await client.query(
+    const byBsuidResult = await client.query(
       'SELECT * FROM pedidos_app_crm_contacts WHERE bsuid=$1 LIMIT 1',
       [safeBsuid]
     );
-    if (byBsuid.rows.length) {
-      contact = byBsuid.rows[0];
-      // Enriquecer con teléfono si llegó y no tenía
-      await client.query(`
+    const byPhoneResult = normalizedPhone
+      ? await client.query('SELECT * FROM pedidos_app_crm_contacts WHERE normalized_phone=$1 LIMIT 1', [normalizedPhone])
+      : { rows: [] };
+    const byBsuid = byBsuidResult.rows[0] || null;
+    const byPhone = byPhoneResult.rows[0] || null;
+
+    if (byBsuid && byPhone && Number(byBsuid.id) !== Number(byPhone.id) && byBsuid.bsuid !== 'CONSUMIDOR_FINAL' && byPhone.bsuid !== 'CONSUMIDOR_FINAL') {
+      // El mismo cliente existe dos veces (uno por BSUID, otro por teléfono): se unifican en el contacto con teléfono.
+      contact = await mergeContacts(client, byPhone.id, byBsuid.id);
+    } else if (byBsuid) {
+      contact = byBsuid;
+      const updated = await client.query(`
         UPDATE pedidos_app_crm_contacts SET
           normalized_phone=COALESCE(normalized_phone,$2),
           display_name=COALESCE(NULLIF($3,''),display_name),
           username=COALESCE(NULLIF($4,''),username),
           marketing_opt_in=TRUE,
-          last_contact_at=NOW(),updated_at=NOW()
+          deleted_at=CASE WHEN bsuid LIKE 'MERGED:%' THEN deleted_at ELSE NULL END,
+          first_contact_at=LEAST(COALESCE(first_contact_at,$5::timestamptz),$5::timestamptz),
+          last_contact_at=GREATEST(COALESCE(last_contact_at,$5::timestamptz),$5::timestamptz),
+          updated_at=NOW()
         WHERE id=$1
         RETURNING *
-      `, [contact.id, normalizedPhone, safeName, safeUsername]);
-    } else if (normalizedPhone) {
-      // 2. Puede que ya exista por teléfono; vincularle el bsuid
-      const byPhone = await client.query(
-        'SELECT * FROM pedidos_app_crm_contacts WHERE normalized_phone=$1 LIMIT 1',
-        [normalizedPhone]
-      );
-      if (byPhone.rows.length) {
-        contact = byPhone.rows[0];
-        await client.query(`
-          UPDATE pedidos_app_crm_contacts SET
-            bsuid=COALESCE(bsuid,$2),
-            display_name=COALESCE(NULLIF($3,''),display_name),
-            username=COALESCE(NULLIF($4,''),username),
-            marketing_opt_in=TRUE,
-            last_contact_at=NOW(),updated_at=NOW()
-          WHERE id=$1
-        `, [contact.id, safeBsuid, safeName, safeUsername]);
-      }
+      `, [contact.id, normalizedPhone, safeName, safeUsername, contactTime]);
+      contact = updated.rows[0] || contact;
+    } else if (byPhone) {
+      contact = byPhone;
+      const updated = await client.query(`
+        UPDATE pedidos_app_crm_contacts SET
+          bsuid=COALESCE(bsuid,$2),
+          display_name=COALESCE(NULLIF($3,''),display_name),
+          username=COALESCE(NULLIF($4,''),username),
+          marketing_opt_in=TRUE,
+          deleted_at=CASE WHEN bsuid LIKE 'MERGED:%' THEN deleted_at ELSE NULL END,
+          first_contact_at=LEAST(COALESCE(first_contact_at,$5::timestamptz),$5::timestamptz),
+          last_contact_at=GREATEST(COALESCE(last_contact_at,$5::timestamptz),$5::timestamptz),
+          updated_at=NOW()
+        WHERE id=$1
+        RETURNING *
+      `, [contact.id, safeBsuid, safeName, safeUsername, contactTime]);
+      contact = updated.rows[0] || contact;
     }
 
     if (!contact) {
-      // 3. Nuevo contacto con bsuid (puede que sin teléfono)
+      // Nuevo contacto con bsuid (puede que sin teléfono)
       const inserted = await client.query(`
         INSERT INTO pedidos_app_crm_contacts
           (normalized_phone,bsuid,username,display_name,email,address,barrio,source,
            first_contact_at,last_contact_at,status,marketing_opt_in)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW(),'PROSPECTO',TRUE)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,'PROSPECTO',TRUE)
         RETURNING *
       `, [normalizedPhone, safeBsuid, safeUsername, safeName,
           safeText(email, 255) || null, safeText(address, 1000) || null,
-          safeText(barrio, 255) || null, safeSource]);
+          safeText(barrio, 255) || null, safeSource, contactTime]);
       contact = inserted.rows[0];
     }
   } else {
-    // ── Resolución solo por teléfono (flujo original intacto) ───────────
+    // ── Resolución solo por teléfono (flujo original con protección de fechas y deleted_at) ───────────
     const { rows } = await client.query(`
       INSERT INTO pedidos_app_crm_contacts
         (normalized_phone,display_name,email,address,barrio,source,first_contact_at,last_contact_at,status,marketing_opt_in)
-      VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW(),'PROSPECTO',TRUE)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$7,'PROSPECTO',TRUE)
       ON CONFLICT (normalized_phone) DO UPDATE SET
         display_name=COALESCE(NULLIF(EXCLUDED.display_name,''),pedidos_app_crm_contacts.display_name),
         email=COALESCE(NULLIF(EXCLUDED.email,''),pedidos_app_crm_contacts.email),
         address=COALESCE(NULLIF(EXCLUDED.address,''),pedidos_app_crm_contacts.address),
         barrio=COALESCE(NULLIF(EXCLUDED.barrio,''),pedidos_app_crm_contacts.barrio),
         marketing_opt_in=TRUE,
-        first_contact_at=COALESCE(pedidos_app_crm_contacts.first_contact_at,NOW()),
-        last_contact_at=NOW(),updated_at=NOW()
+        deleted_at=CASE WHEN pedidos_app_crm_contacts.bsuid LIKE 'MERGED:%' THEN pedidos_app_crm_contacts.deleted_at ELSE NULL END,
+        first_contact_at=LEAST(COALESCE(pedidos_app_crm_contacts.first_contact_at,EXCLUDED.first_contact_at),EXCLUDED.first_contact_at),
+        last_contact_at=GREATEST(COALESCE(pedidos_app_crm_contacts.last_contact_at,EXCLUDED.last_contact_at),EXCLUDED.last_contact_at),
+        updated_at=NOW()
       RETURNING *
     `, [normalizedPhone, safeName, safeText(email, 255) || null,
-        safeText(address, 1000) || null, safeText(barrio, 255) || null, safeSource]);
+        safeText(address, 1000) || null, safeText(barrio, 255) || null, safeSource, contactTime]);
     contact = rows[0];
   }
 
@@ -212,14 +325,189 @@ async function ensureContact(client, { phone = null, bsuid = null, username = nu
   return contact;
 }
 
-async function ensureConversation(client, { contactId, providerAccountId = null, assignedUserId = null }) {
+// Ejecuta fn dentro de un SAVEPOINT cuando hay una transacción activa (si no la hay, la ejecuta directamente).
+async function withSavepoint(client, name, fn) {
+  let active = true;
+  try {
+    await client.query(`SAVEPOINT ${name}`);
+  } catch (error) {
+    if (error.code !== '25P01') throw error;
+    active = false;
+  }
+  try {
+    const result = await fn();
+    if (active) await client.query(`RELEASE SAVEPOINT ${name}`);
+    return result;
+  } catch (error) {
+    if (active) await client.query(`ROLLBACK TO SAVEPOINT ${name}`).catch(() => {});
+    throw error;
+  }
+}
+
+// Une dos contactos que representan a la misma persona (p. ej. chat por BSUID + cliente con teléfono).
+// Conserva el contacto keepId, mueve conversaciones, mensajes, pedidos y demás historial desde dropId
+// y deja dropId oculto (deleted_at) sin identificadores únicos. No borra información.
+async function mergeContacts(client, keepId, dropId, { actorUserId = null } = {}) {
+  const keepNumber = Number(keepId);
+  const dropNumber = Number(dropId);
+  if (keepNumber === dropNumber) {
+    return (await client.query('SELECT * FROM pedidos_app_crm_contacts WHERE id=$1', [keepNumber])).rows[0];
+  }
+  const locked = await client.query(
+    'SELECT * FROM pedidos_app_crm_contacts WHERE id IN ($1,$2) ORDER BY id FOR UPDATE',
+    [keepNumber, dropNumber]
+  );
+  const keep = locked.rows.find((row) => Number(row.id) === keepNumber);
+  const drop = locked.rows.find((row) => Number(row.id) === dropNumber);
+  if (!keep || !drop) throw crmError('CRM_CONTACT_NOT_FOUND', 'Contacto no encontrado para unificar.', 404);
+
+  // 1) Liberar identificadores únicos del contacto absorbido y ocultarlo (conservando un bsuid sintético para cumplir crm_contacts_identity_check).
+  await client.query(
+    'UPDATE pedidos_app_crm_contacts SET normalized_phone=NULL,bsuid=$2,deleted_at=NOW(),updated_at=NOW() WHERE id=$1',
+    [dropNumber, `MERGED:${dropNumber}`]
+  );
+
+  // 2) Enriquecer el contacto conservado (nunca se pierde una baja comercial).
+  await client.query(`
+    UPDATE pedidos_app_crm_contacts SET
+      normalized_phone=COALESCE(normalized_phone,$2),
+      bsuid=COALESCE(bsuid,$3),
+      username=COALESCE(NULLIF(username,''),$4),
+      display_name=COALESCE(NULLIF(display_name,''),$5),
+      email=COALESCE(NULLIF(email,''),$6),
+      address=COALESCE(NULLIF(address,''),$7),
+      barrio=COALESCE(NULLIF(barrio,''),$8),
+      primary_customer_id=COALESCE(primary_customer_id,$9),
+      first_contact_at=LEAST(first_contact_at,$10::timestamptz),
+      last_contact_at=GREATEST(last_contact_at,$11::timestamptz),
+      marketing_opt_out=marketing_opt_out OR $12::boolean,
+      no_contact=no_contact OR $13::boolean,
+      updated_at=NOW()
+    WHERE id=$1
+  `, [keepNumber, drop.normalized_phone, drop.bsuid, drop.username, drop.display_name, drop.email, drop.address,
+    drop.barrio, drop.primary_customer_id, drop.first_contact_at, drop.last_contact_at,
+    Boolean(drop.marketing_opt_out), Boolean(drop.no_contact)]);
+
+  // 3) Mover el historial. Cada paso es independiente: si uno falla se registra y el resto continúa.
+  const move = async (label, sql) => {
+    try {
+      await withSavepoint(client, `crm_merge_${label}`, () => client.query(sql, [keepNumber, dropNumber]));
+    } catch (error) {
+      console.error(JSON.stringify({ level: 'error', component: 'crm-merge', step: label, message: error.message }));
+    }
+  };
+
+  // Conversaciones: solo puede existir una activa por contacto/canal.
+  try {
+    await withSavepoint(client, 'crm_merge_conversations', async () => {
+      const keepActive = await client.query(`
+        SELECT id FROM pedidos_app_crm_conversations
+        WHERE contact_id=$1 AND channel='WHATSAPP' AND status IN ('OPEN','PENDING') ORDER BY id DESC LIMIT 1
+      `, [keepNumber]);
+      let activeId = keepActive.rows[0]?.id || null;
+      const dropConversations = await client.query(
+        'SELECT * FROM pedidos_app_crm_conversations WHERE contact_id=$1 ORDER BY id',
+        [dropNumber]
+      );
+      for (const conversation of dropConversations.rows) {
+        const isActive = ['OPEN', 'PENDING'].includes(conversation.status) && conversation.channel === 'WHATSAPP';
+        if (isActive && activeId) {
+          await client.query(
+            'UPDATE pedidos_app_crm_messages SET conversation_id=$1,contact_id=$2 WHERE conversation_id=$3',
+            [activeId, keepNumber, conversation.id]
+          );
+          await client.query(`
+            UPDATE pedidos_app_crm_conversations SET
+              unread_count=unread_count+$2,
+              first_message_at=LEAST(first_message_at,$3::timestamptz),
+              last_message_at=GREATEST(last_message_at,$4::timestamptz),
+              last_inbound_at=GREATEST(last_inbound_at,$5::timestamptz),
+              last_outbound_at=GREATEST(last_outbound_at,$6::timestamptz),
+              updated_at=NOW()
+            WHERE id=$1
+          `, [activeId, Number(conversation.unread_count) || 0, conversation.first_message_at,
+            conversation.last_message_at, conversation.last_inbound_at, conversation.last_outbound_at]);
+          await withSavepoint(client, 'crm_merge_drop_conversation', async () => {
+            await client.query('DELETE FROM pedidos_app_crm_conversations WHERE id=$1', [conversation.id]);
+          }).catch(async () => {
+            await client.query(
+              `UPDATE pedidos_app_crm_conversations SET status='CLOSED',closed_at=NOW(),contact_id=$2 WHERE id=$1`,
+              [conversation.id, keepNumber]
+            );
+          });
+        } else {
+          await client.query('UPDATE pedidos_app_crm_conversations SET contact_id=$2 WHERE id=$1', [conversation.id, keepNumber]);
+          if (isActive) activeId = conversation.id;
+        }
+      }
+    });
+  } catch (error) {
+    console.error(JSON.stringify({ level: 'error', component: 'crm-merge', step: 'conversations', message: error.message }));
+  }
+
+  await move('messages', 'UPDATE pedidos_app_crm_messages SET contact_id=$1 WHERE contact_id=$2');
+  await move('orders', 'UPDATE pedidos_app_orders SET crm_contact_id=$1 WHERE crm_contact_id=$2');
+  await move('activities', 'UPDATE pedidos_app_crm_activities SET contact_id=$1 WHERE contact_id=$2');
+  await move('attributions', 'UPDATE pedidos_app_crm_attributions SET contact_id=$1 WHERE contact_id=$2');
+  await move('automation_runs', 'UPDATE pedidos_app_crm_automation_runs SET contact_id=$1 WHERE contact_id=$2');
+  await move('consents', 'UPDATE pedidos_app_crm_consents SET contact_id=$1 WHERE contact_id=$2');
+  await move('notes', 'UPDATE pedidos_app_crm_notes SET contact_id=$1 WHERE contact_id=$2');
+  await move('interests', 'UPDATE pedidos_app_crm_contact_interests SET contact_id=$1 WHERE contact_id=$2');
+  await move('tags', `
+    INSERT INTO pedidos_app_crm_contact_tags (contact_id,tag_id,assigned_by)
+    SELECT $1,tag_id,assigned_by FROM pedidos_app_crm_contact_tags WHERE contact_id=$2
+    ON CONFLICT DO NOTHING
+  `);
+  await move('segments', `
+    UPDATE pedidos_app_crm_segment_members member SET contact_id=$1
+    WHERE member.contact_id=$2 AND NOT EXISTS (
+      SELECT 1 FROM pedidos_app_crm_segment_members other WHERE other.segment_id=member.segment_id AND other.contact_id=$1
+    )
+  `);
+  await move('recipients', `
+    UPDATE pedidos_app_crm_campaign_recipients recipient SET contact_id=$1
+    WHERE recipient.contact_id=$2 AND NOT EXISTS (
+      SELECT 1 FROM pedidos_app_crm_campaign_recipients other WHERE other.campaign_id=recipient.campaign_id AND other.contact_id=$1
+    )
+  `);
+  await move('customers', `
+    UPDATE pedidos_app_crm_contact_customers link SET contact_id=$1
+    WHERE link.contact_id=$2 AND NOT EXISTS (
+      SELECT 1 FROM pedidos_app_crm_contact_customers other WHERE other.contact_id=$1 AND other.customer_id=link.customer_id
+    )
+  `);
+
+  await client.query(`
+    INSERT INTO pedidos_app_crm_activities (contact_id,activity_type,entity_type,entity_id,actor_user_id,summary,metadata)
+    VALUES ($1,'CONTACT_MERGED','CRM_CONTACT',$2,$3,'Contactos unificados (misma persona)',$4::jsonb)
+  `, [keepNumber, String(keepNumber), actorUserId, JSON.stringify({ mergedContactId: dropNumber })]);
+  await client.query('SELECT pedidos_app_crm_refresh_contact($1)', [keepNumber]);
+  await appendCrmEvent(client, 'crm.contact.merged', 'crm_contact', keepNumber, { contactId: keepNumber, mergedContactId: dropNumber });
+  return (await client.query('SELECT * FROM pedidos_app_crm_contacts WHERE id=$1', [keepNumber])).rows[0];
+}
+
+// Resuelve (o crea) el contacto. Ante una carrera de concurrencia (dos webhooks del mismo cliente
+// al mismo tiempo) la violación de unicidad se reintenta y encuentra el contacto recién creado.
+async function ensureContact(client, input) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await withSavepoint(client, 'crm_ensure_contact', () => ensureContactOnce(client, input));
+    } catch (error) {
+      if (error.code === '23505' && attempt < 2) continue;
+      throw error;
+    }
+  }
+}
+
+async function ensureConversation(client, { contactId, providerAccountId = null, assignedUserId = null, occurredAt = null }) {
+  const initialTime = occurredAt instanceof Date && !Number.isNaN(occurredAt.getTime()) ? occurredAt : new Date();
   const inserted = await client.query(`
     INSERT INTO pedidos_app_crm_conversations
       (contact_id,channel,provider_account_id,status,assigned_user_id,first_message_at,last_message_at)
-    VALUES ($1,'WHATSAPP',$2,'OPEN',$3,NOW(),NOW())
+    VALUES ($1,'WHATSAPP',$2,'OPEN',$3,$4,$4)
     ON CONFLICT DO NOTHING
     RETURNING *
-  `, [contactId, providerAccountId, assignedUserId]);
+  `, [contactId, providerAccountId, assignedUserId, initialTime]);
   if (inserted.rows.length) return inserted.rows[0];
   const existing = await client.query(`
     UPDATE pedidos_app_crm_conversations SET
@@ -236,28 +524,56 @@ async function ensureConversation(client, { contactId, providerAccountId = null,
   return existing.rows[0];
 }
 
-async function processInboundMessage(client, value, message, contactProfile) {
-  // Extraer teléfono — solo si es numérico (los BSUIDs tienen letras: CO.xxxx)
-  const rawFrom = String(message.from || contactProfile?.wa_id || '').replace(/^whatsapp:/, '');
+const VALID_INBOUND_MESSAGE_TYPES = new Set([
+  'text','image','audio','video','document','sticker','location','interactive','button','reaction','contacts','order','template','system','unsupported',
+]);
+
+async function processInboundMessage(client, value, message, contactProfile, fallbackTime = null) {
+  if (!message || typeof message !== 'object') {
+    throw crmError('WHATSAPP_WEBHOOK_INVALID', 'El payload del mensaje entrante está vacío o es inválido.', 400);
+  }
+  const occurredAt = parseMessageTimestamp(message, fallbackTime);
+
+  // Extraer teléfono — solo si es numérico tras limpiar prefijos whatsapp: y +
+  const rawFrom = String(message.from || contactProfile?.wa_id || '').replace(/^whatsapp:/i, '').replace(/^\+/, '').trim();
   const phone = /^\d+$/.test(rawFrom) ? rawFrom : null;
 
   // Extraer BSUID (Business-Scoped User ID) — llega cuando el número está oculto
-  const bsuid = message.fromUserId || contactProfile?.fromUserId || null;
+  const bsuid = message.fromUserId || contactProfile?.fromUserId || message.userId || (!phone && rawFrom.length > 4 ? rawFrom : null);
 
   // Extraer username (@Ricaurte_blanco) — solo para display, nunca como identificador
-  const username = contactProfile?.username || null;
+  const username = contactProfile?.username || message.customerProfile?.username || null;
+  const contactName = contactProfile?.profile?.name || contactProfile?.name || message.customerProfile?.name || username || '';
 
-  const contactName = contactProfile?.profile?.name || contactProfile?.name || username || '';
+  const contact = await ensureContact(client, {
+    phone,
+    bsuid,
+    username,
+    name: contactName,
+    source: 'WHATSAPP',
+    occurredAt,
+  });
 
-  const contact = await ensureContact(client, { phone, bsuid, username, name: contactName, source: 'WHATSAPP' });
+  const providerAccountId = safeText(
+    value?.metadata?.phone_number_id
+    || value?.metadata?.display_phone_number
+    || message.to?.replace(/^whatsapp:/i, '')
+    || message.wabaId
+    || '',
+    120
+  ) || null;
+
   const conversation = await ensureConversation(client, {
     contactId: contact.id,
-    providerAccountId: value?.metadata?.phone_number_id || message.to?.replace(/^whatsapp:/, '') || null,
+    providerAccountId,
+    occurredAt,
   });
-  const type = ['text','image','audio','video','document','location','interactive'].includes(message.type) ? message.type : 'unknown';
-  let occurredAt = new Date();
-  if (/^\d+$/.test(String(message.timestamp || ''))) occurredAt = new Date(Number(message.timestamp) * 1000);
-  else if (message.sendAt || message.createdAt) occurredAt = new Date(message.sendAt || message.createdAt);
+
+  const rawType = String(message.type || 'unknown').toLowerCase();
+  const type = VALID_INBOUND_MESSAGE_TYPES.has(rawType) ? rawType : 'unknown';
+  const providerMessageId = safeText(message.id || message.wamid, 180) || `inbound:${hashPayload(message).slice(0, 32)}`;
+  const contextId = safeText(message.context?.id || message.context?.message_id || message.reaction?.message_id, 180) || null;
+
   const inserted = await client.query(`
     INSERT INTO pedidos_app_crm_messages
       (conversation_id,contact_id,provider_message_id,context_provider_message_id,direction,message_type,
@@ -265,48 +581,106 @@ async function processInboundMessage(client, value, message, contactProfile) {
     VALUES ($1,$2,$3,$4,'INBOUND',$5,$6,$7::jsonb,'RECEIVED',$8,$8)
     ON CONFLICT DO NOTHING
     RETURNING id
-  `, [conversation.id, contact.id, message.id, message.context?.id || null, type,
-    extractMessageText(message), JSON.stringify(publicMessageContent(message)), occurredAt]);
-  if (!inserted.rowCount) return { duplicate: true, contactId: contact.id, conversationId: conversation.id };
+  `, [
+    conversation.id,
+    contact.id,
+    providerMessageId,
+    contextId,
+    type,
+    extractMessageText(message),
+    JSON.stringify(publicMessageContent(message)),
+    occurredAt,
+  ]);
+
+  if (!inserted.rowCount) {
+    logCrmTrace('inbound_message_duplicate', {
+      contact_id: Number(contact.id),
+      conversation_id: Number(conversation.id),
+      provider_message_id: providerMessageId,
+    });
+    return { duplicate: true, contactId: contact.id, conversationId: conversation.id };
+  }
+
+  const messageId = inserted.rows[0].id;
 
   await client.query(`
     UPDATE pedidos_app_crm_conversations
-    SET unread_count=unread_count+1,first_message_at=COALESCE(first_message_at,$2),
-        last_message_at=$2,last_inbound_at=$2,status='OPEN',closed_at=NULL,updated_at=NOW()
+    SET unread_count=unread_count+1,
+        first_message_at=LEAST(COALESCE(first_message_at,$2::timestamptz),$2::timestamptz),
+        last_message_at=GREATEST(COALESCE(last_message_at,$2::timestamptz),$2::timestamptz),
+        last_inbound_at=GREATEST(COALESCE(last_inbound_at,$2::timestamptz),$2::timestamptz),
+        status='OPEN',
+        closed_at=NULL,
+        updated_at=NOW()
     WHERE id=$1
   `, [conversation.id, occurredAt]);
+
   await client.query(`
-    UPDATE pedidos_app_crm_contacts SET first_contact_at=COALESCE(first_contact_at,$2),
-      last_contact_at=$2,updated_at=NOW() WHERE id=$1
+    UPDATE pedidos_app_crm_contacts
+    SET first_contact_at=LEAST(COALESCE(first_contact_at,$2::timestamptz),$2::timestamptz),
+        last_contact_at=GREATEST(COALESCE(last_contact_at,$2::timestamptz),$2::timestamptz),
+        deleted_at=CASE WHEN bsuid LIKE 'MERGED:%' THEN deleted_at ELSE NULL END,
+        updated_at=NOW()
+    WHERE id=$1
   `, [contact.id, occurredAt]);
+
+  await client.query(`
+    UPDATE pedidos_app_crm_provider_state
+    SET webhook_connected=TRUE,
+        number_connected=TRUE,
+        last_webhook_at=NOW(),
+        last_inbound_at=GREATEST(COALESCE(last_inbound_at,$1::timestamptz),$1::timestamptz),
+        updated_at=NOW()
+    WHERE provider='WHATSAPP'
+  `, [occurredAt]);
+
   await client.query('SELECT pedidos_app_crm_refresh_contact($1)', [contact.id]);
   await client.query(`
     INSERT INTO pedidos_app_crm_activities
       (contact_id,activity_type,entity_type,entity_id,summary,metadata,occurred_at)
     VALUES ($1,'MESSAGE_RECEIVED','CRM_MESSAGE',$2,$3,$4::jsonb,$5)
-  `, [contact.id, String(inserted.rows[0].id), `Mensaje ${type} recibido por WhatsApp`,
+  `, [contact.id, String(messageId), `Mensaje ${type} recibido por WhatsApp`,
     JSON.stringify({ conversationId: conversation.id, messageType: type }), occurredAt]);
-  await appendCrmEvent(client, 'whatsapp.message.received', 'crm_conversation', conversation.id, {
-    contactId: Number(contact.id), conversationId: Number(conversation.id), messageId: Number(inserted.rows[0].id),
+
+  const domainEventId = await appendCrmEvent(client, 'whatsapp.message.received', 'crm_conversation', conversation.id, {
+    contactId: Number(contact.id),
+    conversationId: Number(conversation.id),
+    messageId: Number(messageId),
   });
+
   await scheduleEventAutomations(client, 'CONTACT_CREATED', contact.id, 'CRM_CONTACT', contact.id);
-  await scheduleEventAutomations(client, 'MESSAGE_RECEIVED', contact.id, 'CRM_MESSAGE', inserted.rows[0].id);
-  return { duplicate: false, contactId: contact.id, conversationId: conversation.id, messageId: inserted.rows[0].id };
+  await scheduleEventAutomations(client, 'MESSAGE_RECEIVED', contact.id, 'CRM_MESSAGE', messageId);
+
+  logCrmTrace('inbound_message_persisted', {
+    contact_id: Number(contact.id),
+    conversation_id: Number(conversation.id),
+    message_id: Number(messageId),
+    message_type: type,
+    sender_masked: maskIdentifier(phone || bsuid),
+    occurred_at: occurredAt.toISOString(),
+    domain_event_id: domainEventId,
+  });
+
+  return { duplicate: false, contactId: contact.id, conversationId: conversation.id, messageId };
 }
 
-async function processMessageStatus(client, statusEvent) {
-  const nextStatus = MESSAGE_STATUS[String(statusEvent.status || '').toLowerCase()];
-  if (!nextStatus || !statusEvent.id) return { ignored: true };
+async function processMessageStatus(client, statusEvent, fallbackTime = null) {
+  const nextStatus = MESSAGE_STATUS[String(statusEvent?.status || '').toLowerCase()];
+  const primaryId = safeText(statusEvent?.id || statusEvent?.wamid, 180);
+  const altId = safeText(statusEvent?.wamid && statusEvent.wamid !== primaryId ? statusEvent.wamid : null, 180) || null;
+  if (!nextStatus || !primaryId) return { ignored: true };
+
   const current = await client.query(`
     SELECT message.id,message.status,message.contact_id,message.conversation_id,recipient.id AS recipient_id,recipient.campaign_id
     FROM pedidos_app_crm_messages message
     LEFT JOIN pedidos_app_crm_campaign_recipients recipient ON recipient.message_id=message.id OR recipient.provider_message_id=message.provider_message_id
-    WHERE message.provider_message_id=$1 LIMIT 1
-  `, [statusEvent.id]);
+    WHERE message.provider_message_id=$1 OR ($2::text IS NOT NULL AND message.provider_message_id=$2)
+    LIMIT 1
+  `, [primaryId, altId]);
   if (!current.rows.length) return { ignored: true };
   const row = current.rows[0];
   const effectiveStatus = MESSAGE_RANK[nextStatus] >= (MESSAGE_RANK[row.status] ?? -1) ? nextStatus : row.status;
-  const occurredAt = /^\d+$/.test(String(statusEvent.timestamp || '')) ? new Date(Number(statusEvent.timestamp) * 1000) : new Date();
+  const occurredAt = parseMessageTimestamp(statusEvent, fallbackTime);
   const errorItem = statusEvent.errors?.[0] || null;
   await client.query(`
     UPDATE pedidos_app_crm_messages SET status=$2::varchar,
@@ -336,15 +710,25 @@ async function processMessageStatus(client, statusEvent) {
 }
 
 function whatsappWebhookEventType(body) {
-  if (body?.type === 'whatsapp.message.updated' || body?.type === 'whatsapp.smb.message.echoes') return 'YCLOUD_MESSAGE_UPDATED';
-  if (body?.type === 'whatsapp.inbound_message.received') return 'YCLOUD_INBOUND_RECEIVED';
+  const topType = String(body?.type || '').trim();
+  if (topType === 'whatsapp.message.updated' || topType === 'whatsapp.smb.message.echoes' || topType === 'whatsapp.outbound_message.updated') {
+    return 'YCLOUD_MESSAGE_UPDATED';
+  }
+  if (topType === 'whatsapp.inbound_message.received' || body?.whatsappInboundMessage) {
+    return 'YCLOUD_INBOUND_RECEIVED';
+  }
+  if (body?.whatsappMessage) {
+    const dir = String(body.whatsappMessage.direction || '').toLowerCase();
+    return dir === 'inbound' ? 'YCLOUD_INBOUND_RECEIVED' : 'YCLOUD_MESSAGE_UPDATED';
+  }
 
   let messages = 0;
   let statuses = 0;
   for (const entry of body?.entry || []) {
     for (const change of entry.changes || []) {
-      if (change.field !== 'messages') continue;
+      if (change.field !== 'messages' && change.field !== 'smb_message_echoes') continue;
       messages += Array.isArray(change.value?.messages) ? change.value.messages.length : 0;
+      messages += Array.isArray(change.value?.message_echoes) ? change.value.message_echoes.length : 0;
       statuses += Array.isArray(change.value?.statuses) ? change.value.statuses.length : 0;
     }
   }
@@ -354,62 +738,127 @@ function whatsappWebhookEventType(body) {
   return 'WHATSAPP_EVENT';
 }
 
-async function processYCloudMessageUpdated(client, msg) {
-  const providerMessageId = msg.id;
+async function processYCloudMessageUpdated(client, msg, fallbackTime = null) {
+  if (!msg || typeof msg !== 'object') return { ignored: true };
+  if (String(msg.direction || '').toLowerCase() === 'inbound') {
+    return processInboundMessage(
+      client,
+      { metadata: { phone_number_id: msg.to?.replace(/^whatsapp:/i, '') } },
+      msg,
+      msg.customerProfile || {},
+      fallbackTime
+    );
+  }
+
+  const providerMessageId = safeText(msg.id || msg.wamid, 180);
+  const altMessageId = safeText(msg.wamid && msg.wamid !== providerMessageId ? msg.wamid : null, 180) || null;
+  if (!providerMessageId) return { ignored: true };
   const status = String(msg.status || '').toLowerCase();
-  
+  const occurredAt = parseMessageTimestamp(msg, fallbackTime);
+
   const current = await client.query(`
     SELECT message.id,message.status,message.contact_id,message.conversation_id,recipient.id AS recipient_id,recipient.campaign_id
     FROM pedidos_app_crm_messages message
     LEFT JOIN pedidos_app_crm_campaign_recipients recipient ON recipient.message_id=message.id OR recipient.provider_message_id=message.provider_message_id
-    WHERE message.provider_message_id=$1 LIMIT 1
-  `, [providerMessageId]);
+    WHERE message.provider_message_id=$1 OR ($2::text IS NOT NULL AND message.provider_message_id=$2)
+    LIMIT 1
+  `, [providerMessageId, altMessageId]);
 
   if (current.rows.length) {
     const nextStatus = MESSAGE_STATUS[status];
     if (!nextStatus) return { ignored: true };
-    const occurredAtTimestamp = Math.floor(new Date(msg.updatedAt || msg.deliverAt || msg.sendAt || Date.now()).getTime() / 1000);
-    return await processMessageStatus(client, { id: providerMessageId, status, timestamp: occurredAtTimestamp });
-  } else {
-    // Si no existe, es un OUTBOUND enviado desde YCloud directamente (echo)
-    // El destinatario puede tener número oculto → usar toUserId/recipientUserId como bsuid
-    const rawTo = String(msg.to || '').replace(/^whatsapp:/, '').replace(/^\+/, '');
-    const toPhone = /^\d+$/.test(rawTo) ? rawTo : null;
-    const bsuid = msg.toUserId || msg.recipientUserId || null;
-    const username = msg.customerProfile?.username || null;
-    const contact = await ensureContact(client, { phone: toPhone, bsuid, username, name: '', source: 'WHATSAPP' });
-    const providerAccountId = String(msg.wabaId || msg.phoneNumberId || msg.from || '').replace(/^whatsapp:/, '');
-    const conversation = await ensureConversation(client, { contactId: contact.id, providerAccountId });
-    
-    const type = ['text','image','audio','video','document','location','interactive','template'].includes(msg.type) ? msg.type : 'unknown';
-    const textBody = msg.text?.body || msg.image?.caption || msg.video?.caption || msg.document?.caption || '';
-    const occurredAt = new Date(msg.sendAt || msg.createdAt || Date.now());
-    const initialStatus = MESSAGE_STATUS[status] || 'SENT';
-    
-    const inserted = await client.query(`
-      INSERT INTO pedidos_app_crm_messages
-        (conversation_id,contact_id,provider_message_id,direction,message_type,text_body,content,status,sent_at,created_at)
-      VALUES ($1,$2,$3,'OUTBOUND',$4,$5,$6::jsonb,$7,$8,$8)
-      ON CONFLICT DO NOTHING RETURNING id
-    `, [conversation.id, contact.id, providerMessageId, type, textBody, JSON.stringify(msg), initialStatus, occurredAt]);
-        
-    if (inserted.rowCount) {
-      await client.query(`UPDATE pedidos_app_crm_conversations SET last_message_at=$2,last_outbound_at=$2,updated_at=NOW() WHERE id=$1`, [conversation.id, occurredAt]);
-      await client.query('SELECT pedidos_app_crm_refresh_contact($1)', [contact.id]);
-    }
-    return { ignored: false, createdOutbound: true };
+    return await processMessageStatus(client, {
+      id: providerMessageId,
+      wamid: altMessageId,
+      status,
+      timestamp: Math.floor(occurredAt.getTime() / 1000),
+      sendTime: msg.sendTime,
+      deliverTime: msg.deliverTime,
+      readTime: msg.readTime,
+      updateTime: msg.updateTime,
+      errors: msg.errorCode ? [{ code: msg.errorCode, message: msg.errorMessage }] : undefined,
+    }, fallbackTime);
   }
+
+  // Si no existe por provider_message_id, resolvemos el contacto destinatario.
+  const rawTo = String(msg.to || '').replace(/^whatsapp:/i, '').replace(/^\+/, '').trim();
+  const toPhone = /^\d+$/.test(rawTo) ? rawTo : null;
+  const bsuid = msg.toUserId || msg.recipientUserId || (!toPhone && rawTo.length > 4 ? rawTo : null);
+  if (!toPhone && !bsuid) return { ignored: true };
+
+  const username = msg.customerProfile?.username || null;
+  const profileName = msg.customerProfile?.name || '';
+  const contact = await ensureContact(client, { phone: toPhone, bsuid, username, name: profileName, source: 'WHATSAPP', occurredAt });
+  const providerAccountId = safeText(String(msg.wabaId || msg.phoneNumberId || msg.from || '').replace(/^whatsapp:/i, ''), 120) || null;
+  const conversation = await ensureConversation(client, { contactId: contact.id, providerAccountId, occurredAt });
+
+  // Evitar condición de carrera: si existe un mensaje OUTBOUND en vuelo (QUEUED/SENDING sin provider_message_id)
+  // para esta misma conversación en los últimos 10 minutos, vincular este provider_message_id en vez de duplicar fila.
+  const inFlight = await client.query(`
+    SELECT id FROM pedidos_app_crm_messages
+    WHERE conversation_id=$1 AND direction='OUTBOUND' AND provider_message_id IS NULL
+      AND status IN ('QUEUED','SENDING') AND created_at >= NOW() - INTERVAL '10 minutes'
+    ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED
+  `, [conversation.id]);
+
+  if (inFlight.rows.length) {
+    const inFlightId = inFlight.rows[0].id;
+    await client.query(`
+      UPDATE pedidos_app_crm_messages SET provider_message_id=$2 WHERE id=$1 AND provider_message_id IS NULL
+    `, [inFlightId, providerMessageId]);
+    const nextStatus = MESSAGE_STATUS[status] || 'SENT';
+    return await processMessageStatus(client, {
+      id: providerMessageId,
+      wamid: altMessageId,
+      status: nextStatus.toLowerCase(),
+      timestamp: Math.floor(occurredAt.getTime() / 1000),
+      errors: msg.errorCode ? [{ code: msg.errorCode, message: msg.errorMessage }] : undefined,
+    }, fallbackTime);
+  }
+
+  const rawType = String(msg.type || 'unknown').toLowerCase();
+  const type = VALID_INBOUND_MESSAGE_TYPES.has(rawType) ? rawType : 'unknown';
+  const textBody = extractMessageText(msg) || (msg.template?.name ? `[Plantilla: ${msg.template.name}]` : '');
+  const initialStatus = MESSAGE_STATUS[status] || 'SENT';
+  const deliveredAt = ['DELIVERED', 'READ'].includes(initialStatus) ? occurredAt : null;
+  const readAt = initialStatus === 'READ' ? occurredAt : null;
+  const normalizedContent = { ...publicMessageContent(msg), ...msg };
+
+  const inserted = await client.query(`
+    INSERT INTO pedidos_app_crm_messages
+      (conversation_id,contact_id,provider_message_id,direction,message_type,text_body,content,status,sent_at,delivered_at,read_at,created_at)
+    VALUES ($1,$2,$3,'OUTBOUND',$4,$5,$6::jsonb,$7,$8,$9,$10,$8)
+    ON CONFLICT DO NOTHING RETURNING id
+  `, [conversation.id, contact.id, providerMessageId, type, textBody, JSON.stringify(normalizedContent), initialStatus, occurredAt, deliveredAt, readAt]);
+
+  if (inserted.rowCount) {
+    await client.query(`
+      UPDATE pedidos_app_crm_conversations
+      SET last_message_at=GREATEST(COALESCE(last_message_at,$2::timestamptz),$2::timestamptz),
+          last_outbound_at=GREATEST(COALESCE(last_outbound_at,$2::timestamptz),$2::timestamptz),
+          updated_at=NOW()
+      WHERE id=$1
+    `, [conversation.id, occurredAt]);
+    await client.query('SELECT pedidos_app_crm_refresh_contact($1)', [contact.id]);
+    await appendCrmEvent(client, 'whatsapp.message.sent', 'crm_conversation', conversation.id, {
+      contactId: Number(contact.id),
+      conversationId: Number(conversation.id),
+      messageId: Number(inserted.rows[0].id),
+    });
+  }
+  return { ignored: false, createdOutbound: true, messageId: inserted.rows[0]?.id || null };
 }
 
 async function registerWhatsAppWebhook(pool, body, rawBody) {
   const eventKey = `whatsapp:${hashPayload(rawBody || body)}`;
+  const eventType = whatsappWebhookEventType(body);
   const { rows } = await pool.query(`
     INSERT INTO pedidos_app_crm_webhook_events (event_key,event_type,signature_valid,payload)
     VALUES ($1,$2,TRUE,$3::jsonb)
     ON CONFLICT (event_key) DO NOTHING
     RETURNING id,event_key,processing_status
-  `, [eventKey, whatsappWebhookEventType(body), JSON.stringify(body)]);
-  return { eventKey, duplicate: rows.length === 0, eventId: rows[0]?.id || null };
+  `, [eventKey, eventType, JSON.stringify(body)]);
+  return { eventKey, eventType, duplicate: rows.length === 0, eventId: rows[0]?.id || null };
 }
 
 async function processStoredWhatsAppWebhook(pool, eventKey) {
@@ -417,46 +866,57 @@ async function processStoredWhatsAppWebhook(pool, eventKey) {
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(`
-      SELECT payload FROM pedidos_app_crm_webhook_events
+      SELECT payload, event_type FROM pedidos_app_crm_webhook_events
       WHERE event_key=$1 AND processing_status IN ('RECEIVED','FAILED')
       FOR UPDATE SKIP LOCKED
     `, [eventKey]);
     if (!rows.length) { await client.query('COMMIT'); return { duplicate: true, processed: 0 }; }
     const body = rows[0].payload || {};
     const eventType = rows[0].event_type || whatsappWebhookEventType(body);
+    const fallbackTime = body.createTime || body.timestamp || null;
     let processed = 0;
-    
+
     if (eventType === 'YCLOUD_INBOUND_RECEIVED') {
-      const msg = body.whatsappInboundMessage || body.whatsappMessage;
+      const msg = body.whatsappInboundMessage || body.whatsappMessage || body.message || body.data?.whatsappInboundMessage;
       if (msg) {
-        const result = await processInboundMessage(client, { metadata: { phone_number_id: msg.to?.replace(/^whatsapp:/, '') } }, msg, msg.customerProfile || {});
+        const result = await processInboundMessage(
+          client,
+          { metadata: { phone_number_id: msg.to?.replace(/^whatsapp:/i, '') || msg.wabaId } },
+          msg,
+          msg.customerProfile || {},
+          fallbackTime
+        );
         if (!result.duplicate) processed += 1;
       }
     } else if (eventType === 'YCLOUD_MESSAGE_UPDATED') {
-      const msg = body.whatsappMessage;
+      const msg = body.whatsappMessage || body.whatsappOutboundMessage || body.message || body.data?.whatsappMessage;
       if (msg) {
-        const result = await processYCloudMessageUpdated(client, msg);
+        const result = await processYCloudMessageUpdated(client, msg, fallbackTime);
         if (!result.ignored) processed += 1;
       }
     } else {
       for (const entry of body.entry || []) {
         for (const change of entry.changes || []) {
-          if (change.field !== 'messages') continue;
+          if (change.field !== 'messages' && change.field !== 'smb_message_echoes') continue;
           const value = change.value || {};
           const profiles = new Map((value.contacts || []).map((profile) => [profile.wa_id, profile]));
           for (const message of value.messages || []) {
-            const result = await processInboundMessage(client, value, message, profiles.get(message.from));
+            const result = await processInboundMessage(client, value, message, profiles.get(message.from), fallbackTime);
             if (!result.duplicate) processed += 1;
           }
+          for (const echo of value.message_echoes || []) {
+            const result = await processYCloudMessageUpdated(client, echo, fallbackTime);
+            if (!result.ignored) processed += 1;
+          }
           for (const statusEvent of value.statuses || []) {
-            const result = await processMessageStatus(client, statusEvent);
+            const result = await processMessageStatus(client, statusEvent, fallbackTime);
             if (!result.ignored) processed += 1;
           }
         }
       }
     }
     await client.query(`
-      UPDATE pedidos_app_crm_webhook_events SET processing_status='PROCESSED',processed_at=NOW() WHERE event_key=$1
+      UPDATE pedidos_app_crm_webhook_events SET processing_status='PROCESSED',processed_at=NOW(),error_code=NULL,error_message=NULL WHERE event_key=$1
     `, [eventKey]);
     await client.query(`
       UPDATE pedidos_app_crm_provider_state SET webhook_connected=TRUE,last_webhook_at=NOW(),updated_at=NOW()
@@ -471,6 +931,11 @@ async function processStoredWhatsAppWebhook(pool, eventKey) {
       SET processing_status='FAILED',error_code=$2,error_message=$3
       WHERE event_key=$1
     `, [eventKey, safeText(error.code || 'WHATSAPP_WEBHOOK_PROCESSING_FAILED', 80), safeText(error.message, 500)]).catch(() => {});
+    logCrmTrace('webhook_processing_error', {
+      event_key: eventKey,
+      code: error.code || 'WHATSAPP_WEBHOOK_PROCESSING_FAILED',
+      message: safeText(error.message, 300),
+    }, 'error');
     throw error;
   } finally {
     client.release();
@@ -483,22 +948,30 @@ async function processWhatsAppWebhook(pool, body, rawBody) {
   return processStoredWhatsAppWebhook(pool, registration.eventKey);
 }
 
-async function processPendingWhatsAppWebhooks(pool, limit = 10) {
+async function processPendingWhatsAppWebhooks(pool, limit = 25) {
   const { rows } = await pool.query(`
     SELECT event_key FROM pedidos_app_crm_webhook_events
-    WHERE provider='WHATSAPP' AND processing_status='RECEIVED'
+    WHERE provider='WHATSAPP'
+      AND (
+        processing_status='RECEIVED'
+        OR (processing_status='FAILED' AND (
+          error_code IN ('23505','23514','42P08','WHATSAPP_WEBHOOK_PROCESSING_FAILED')
+          OR received_at >= NOW() - INTERVAL '7 days'
+        ))
+      )
     ORDER BY received_at,id LIMIT $1
-  `, [Math.max(1, Math.min(100, Number(limit) || 10))]);
+  `, [Math.max(1, Math.min(200, Number(limit) || 25))]);
   let processedEvents = 0;
   for (const row of rows) {
     try {
       const result = await processStoredWhatsAppWebhook(pool, row.event_key);
       if (!result.duplicate) processedEvents += 1;
     } catch (error) {
-      console.error(JSON.stringify({
-        level: 'error', component: 'whatsapp-webhook-worker', event_key: row.event_key,
-        code: error.code || 'WHATSAPP_WEBHOOK_PROCESSING_FAILED', message: error.message,
-      }));
+      logCrmTrace('webhook_retry_failed', {
+        event_key: row.event_key,
+        code: error.code || 'WHATSAPP_WEBHOOK_PROCESSING_FAILED',
+        message: safeText(error.message, 300),
+      }, 'error');
     }
   }
   return processedEvents;
@@ -518,18 +991,25 @@ async function queueConversationMessage(pool, { conversationId, actorUserId, tex
     const conversation = conversationResult.rows[0];
     // sendTo: usar teléfono si existe, sino BSUID (usuario con número oculto)
     const sendTo = conversation.normalized_phone || conversation.bsuid;
-    if (!sendTo) throw crmError('CONTACT_NO_SEND_ADDRESS', 'El contacto no tiene teléfono ni identificador de WhatsApp disponible.', 409);
+    if (!sendTo || sendTo === 'CONSUMIDOR_FINAL') throw crmError('CONTACT_NO_SEND_ADDRESS', 'El contacto no tiene teléfono ni identificador de WhatsApp disponible.', 409);
     if (conversation.no_contact || conversation.marketing_opt_out) throw crmError('CONTACT_OPTED_OUT', 'El contacto solicitó no recibir mensajes.', 409);
     let jobType;
     let messageType;
     let payload;
+    let effectiveTextBody = null;
+    let contentPayload = {};
     if (template) {
       const templateResult = await client.query(`SELECT * FROM pedidos_app_crm_whatsapp_templates WHERE id=$1`, [template.id]);
       const templateRow = templateResult.rows[0];
       if (!templateRow || templateRow.status !== 'APPROVED') throw crmError('WHATSAPP_TEMPLATE_INVALID', 'La plantilla debe estar aprobada por Meta.', 409);
+      const tplBodyText = Array.isArray(templateRow.components)
+        ? (templateRow.components.find((c) => String(c?.type || '').toUpperCase() === 'BODY')?.text || null)
+        : null;
       jobType = 'TEMPLATE';
       messageType = 'template';
       payload = { to: sendTo, name: templateRow.name, language: templateRow.language, components: template.components || [] };
+      effectiveTextBody = safeText(tplBodyText || `[Plantilla: ${templateRow.name}]`, 4096);
+      contentPayload = { ...template, templateName: templateRow.name, language: templateRow.language, bodyText: tplBodyText };
     } else {
       const cleanText = safeText(text, 4096);
       if (!cleanText) throw crmError('WHATSAPP_MESSAGE_EMPTY', 'Escribe un mensaje antes de enviarlo.', 400);
@@ -539,18 +1019,25 @@ async function queueConversationMessage(pool, { conversationId, actorUserId, tex
       jobType = 'TEXT';
       messageType = 'text';
       payload = { to: sendTo, body: cleanText };
+      effectiveTextBody = cleanText;
+      contentPayload = { text: cleanText };
     }
     const key = safeText(idempotencyKey, 180) || crypto.randomUUID();
-    const existing = await client.query('SELECT message_id FROM pedidos_app_crm_message_jobs WHERE job_key=$1', [`manual:${actorUserId}:${key}`]);
+    const existing = await client.query(`
+      SELECT job.message_id, msg.*
+      FROM pedidos_app_crm_message_jobs job
+      LEFT JOIN pedidos_app_crm_messages msg ON msg.id = job.message_id
+      WHERE job.job_key=$1
+    `, [`manual:${actorUserId}:${key}`]);
     if (existing.rows.length) {
       await client.query('COMMIT');
-      return { duplicate: true, messageId: existing.rows[0].message_id };
+      return { duplicate: true, messageId: existing.rows[0].message_id, message: existing.rows[0] };
     }
     const messageResult = await client.query(`
       INSERT INTO pedidos_app_crm_messages
         (conversation_id,contact_id,direction,message_type,text_body,content,status,sent_by,queued_at)
-      VALUES ($1,$2,'OUTBOUND',$3,$4,$5::jsonb,'QUEUED',$6,NOW()) RETURNING id
-    `, [conversation.id, conversation.contact_id, messageType, safeText(text, 4096) || null, JSON.stringify(template || {}), actorUserId]);
+      VALUES ($1,$2,'OUTBOUND',$3,$4,$5::jsonb,'QUEUED',$6,NOW()) RETURNING *
+    `, [conversation.id, conversation.contact_id, messageType, effectiveTextBody, JSON.stringify(contentPayload), actorUserId]);
     await client.query(`
       INSERT INTO pedidos_app_crm_message_jobs (job_key,message_id,job_type,payload)
       VALUES ($1,$2,$3,$4::jsonb)
@@ -560,8 +1047,13 @@ async function queueConversationMessage(pool, { conversationId, actorUserId, tex
       INSERT INTO pedidos_app_crm_activities (contact_id,activity_type,entity_type,entity_id,actor_user_id,summary,metadata)
       VALUES ($1,'MESSAGE_QUEUED','CRM_MESSAGE',$2,$3,'Mensaje de WhatsApp en cola',$4::jsonb)
     `, [conversation.contact_id, String(messageResult.rows[0].id), actorUserId, JSON.stringify({ conversationId: conversation.id, type: messageType })]);
+    await appendCrmEvent(client, 'whatsapp.message.queued', 'crm_conversation', conversation.id, {
+      contactId: Number(conversation.contact_id),
+      conversationId: Number(conversation.id),
+      messageId: Number(messageResult.rows[0].id),
+    });
     await client.query('COMMIT');
-    return { duplicate: false, messageId: messageResult.rows[0].id };
+    return { duplicate: false, messageId: messageResult.rows[0].id, message: messageResult.rows[0] };
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
     throw error;
@@ -636,15 +1128,33 @@ function createCrmWorker({ pool, whatsappClient, instanceId = `crm-${process.pid
   }
 
   async function completeJob(job, response) {
-    const providerMessageId = response.id || response.messages?.[0]?.id;
+    const providerMessageId = response.id || response.wamid || response.messages?.[0]?.id;
     if (!providerMessageId) throw crmError('WHATSAPP_SEND_FAILED', 'El proveedor no devolvió el identificador del mensaje.', 502);
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      // Si un webhook echo llegó antes de que completeJob terminara y creó una fila duplicada con el mismo provider_message_id,
+      // absorbemos su estado y liberamos la fila duplicada para evitar violación de unicidad 23505.
+      const earlyEcho = await client.query(`
+        DELETE FROM pedidos_app_crm_messages
+        WHERE provider_message_id=$1 AND id<>$2
+        RETURNING status,sent_at,delivered_at,read_at
+      `, [providerMessageId, job.message_id]);
+      const echoRow = earlyEcho.rows[0] || null;
+      const targetStatus = echoRow && ['DELIVERED', 'READ'].includes(echoRow.status) ? echoRow.status : 'SENT';
+
       const message = await client.query(`
-        UPDATE pedidos_app_crm_messages SET provider_message_id=$2,status='SENT',sent_at=NOW(),error_code=NULL,error_message=NULL
-        WHERE id=$1 RETURNING conversation_id,contact_id
-      `, [job.message_id, providerMessageId]);
+        UPDATE pedidos_app_crm_messages
+        SET provider_message_id=$2,
+            status=CASE WHEN status IN ('DELIVERED','READ') THEN status ELSE $3::varchar END,
+            sent_at=COALESCE(sent_at,$4::timestamptz,NOW()),
+            delivered_at=COALESCE(delivered_at,$5::timestamptz),
+            read_at=COALESCE(read_at,$6::timestamptz),
+            error_code=NULL,
+            error_message=NULL
+        WHERE id=$1
+        RETURNING conversation_id,contact_id,status
+      `, [job.message_id, providerMessageId, targetStatus, echoRow?.sent_at || null, echoRow?.delivered_at || null, echoRow?.read_at || null]);
       await client.query(`
         UPDATE pedidos_app_crm_message_jobs SET status='COMPLETED',completed_at=NOW(),locked_at=NULL,locked_by=NULL,
           last_error_code=NULL,last_error_message=NULL,updated_at=NOW() WHERE id=$1
@@ -682,10 +1192,15 @@ function createCrmWorker({ pool, whatsappClient, instanceId = `crm-${process.pid
       UPDATE pedidos_app_crm_message_jobs SET status=$2::varchar,available_at=CASE WHEN $2::varchar='RETRY' THEN NOW()+($3*INTERVAL '1 second') ELSE available_at END,
         locked_at=NULL,locked_by=NULL,last_error_code=$4,last_error_message=$5,updated_at=NOW() WHERE id=$1
     `, [job.id, status, delaySeconds, safeText(error.code || 'WHATSAPP_SEND_FAILED', 80), safeText(error.message, 500)]);
-    if (job.message_id) await pool.query(`
-      UPDATE pedidos_app_crm_messages SET status=$2::varchar,error_code=$3,error_message=$4,
-        failed_at=CASE WHEN $2::varchar='FAILED' THEN NOW() ELSE failed_at END WHERE id=$1
-    `, [job.message_id, finalFailure ? 'FAILED' : 'QUEUED', safeText(error.code, 80), safeText(error.message, 500)]);
+    let msgRow = null;
+    if (job.message_id) {
+      const msgRes = await pool.query(`
+        UPDATE pedidos_app_crm_messages SET status=$2::varchar,error_code=$3,error_message=$4,
+          failed_at=CASE WHEN $2::varchar='FAILED' THEN NOW() ELSE failed_at END
+        WHERE id=$1 RETURNING id,conversation_id,contact_id,status
+      `, [job.message_id, finalFailure ? 'FAILED' : 'QUEUED', safeText(error.code, 80), safeText(error.message, 500)]);
+      msgRow = msgRes.rows[0] || null;
+    }
     let campaignId = null;
     if (job.campaign_recipient_id) {
       const recipient = await pool.query(`
@@ -696,6 +1211,14 @@ function createCrmWorker({ pool, whatsappClient, instanceId = `crm-${process.pid
       if (campaignId) await pool.query('SELECT pedidos_app_crm_refresh_campaign($1)', [campaignId]);
     }
     await pool.query(`UPDATE pedidos_app_crm_provider_state SET last_error_code=$1,last_error_at=NOW(),updated_at=NOW() WHERE provider='WHATSAPP'`, [safeText(error.code || 'WHATSAPP_SEND_FAILED', 80)]);
+    if (msgRow && finalFailure) {
+      await appendCrmEvent(pool, 'whatsapp.message.status', 'crm_conversation', msgRow.conversation_id, {
+        contactId: Number(msgRow.contact_id),
+        conversationId: Number(msgRow.conversation_id),
+        messageId: Number(msgRow.id),
+        status: 'FAILED',
+      }).catch(() => {});
+    }
   }
 
   async function processOne() {
@@ -723,7 +1246,7 @@ function createCrmWorker({ pool, whatsappClient, instanceId = `crm-${process.pid
       await client.query('BEGIN');
       const { rows } = await client.query(`
         SELECT recipient.*,campaign.variables,campaign.status AS campaign_status,
-          template.name AS template_name,template.language AS template_language,
+          template.name AS template_name,template.language AS template_language,template.components AS template_components,
           contact.normalized_phone,contact.bsuid,contact.id AS contact_id
         FROM pedidos_app_crm_campaign_recipients recipient
         JOIN pedidos_app_crm_campaigns campaign ON campaign.id=recipient.campaign_id
@@ -738,11 +1261,15 @@ function createCrmWorker({ pool, whatsappClient, instanceId = `crm-${process.pid
           providerAccountId: whatsappClient.config.phoneNumberId || null,
         });
         const components = buildCampaignTemplateComponents(recipient.variables || {}, recipient.rendered_variables || {});
+        const tplBodyText = Array.isArray(recipient.template_components)
+          ? (recipient.template_components.find((c) => String(c?.type || '').toUpperCase() === 'BODY')?.text || null)
+          : null;
+        const templateText = safeText(tplBodyText || `[Plantilla: ${recipient.template_name}]`, 4096);
         const message = await client.query(`
           INSERT INTO pedidos_app_crm_messages
-            (conversation_id,contact_id,direction,message_type,content,status,queued_at)
-          VALUES ($1,$2,'OUTBOUND','template',$3::jsonb,'QUEUED',NOW()) RETURNING id
-        `, [conversation.id, recipient.contact_id, JSON.stringify({ template: recipient.template_name, language: recipient.template_language, components })]);
+            (conversation_id,contact_id,direction,message_type,text_body,content,status,queued_at)
+          VALUES ($1,$2,'OUTBOUND','template',$3,$4::jsonb,'QUEUED',NOW()) RETURNING id
+        `, [conversation.id, recipient.contact_id, templateText, JSON.stringify({ template: recipient.template_name, language: recipient.template_language, bodyText: tplBodyText, components })]);
         await client.query(`
           UPDATE pedidos_app_crm_campaign_recipients SET message_id=$2,status='QUEUED',queued_at=NOW(),updated_at=NOW() WHERE id=$1
         `, [recipient.id, message.rows[0].id]);
@@ -949,6 +1476,7 @@ module.exports = {
   crmError,
   ensureContact,
   ensureConversation,
+  maskIdentifier,
   processPendingWhatsAppWebhooks,
   processStoredWhatsAppWebhook,
   processWhatsAppWebhook,
@@ -956,5 +1484,16 @@ module.exports = {
   queueConversationMessage,
   scheduleEventAutomations,
   // Funciones internas expuestas solo para pruebas unitarias
-  __test__: { ensureContact, ensureConversation, processInboundMessage, processYCloudMessageUpdated },
+  __test__: {
+    ensureContact,
+    ensureConversation,
+    extractMessageText,
+    maskIdentifier,
+    parseMessageTimestamp,
+    processInboundMessage,
+    processMessageStatus,
+    processYCloudMessageUpdated,
+    publicMessageContent,
+    whatsappWebhookEventType,
+  },
 };

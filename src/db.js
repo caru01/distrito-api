@@ -7,7 +7,7 @@ const { Pool, types } = require('pg');
 types.setTypeParser(1082, (val) => val);
 
 const envFileName = process.env.ENV_FILE || '.env';
-dotenv.config({ path: path.resolve(__dirname, '..', envFileName), override: true });
+dotenv.config({ path: path.resolve(__dirname, '..', envFileName), override: false });
 
 function getDatabaseUrl() {
   const isTestMode = process.env.NODE_ENV === 'test' || process.env.DATABASE_ENV === 'test' || process.env.ENV_FILE === '.env.test' || process.env.APP_ENV === 'test';

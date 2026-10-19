@@ -1100,32 +1100,33 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
     await client.query('BEGIN');
 
     let resolvedCrmContactId = customer.crm_contact_id || null;
-    if (!resolvedCrmContactId && formattedPhone && formattedPhone !== '2222222' && formattedPhone.length >= 7) {
+    const isConsumidorFinal = formattedPhone === '2222222'
+      || String(customer.name || '').trim().toUpperCase() === 'CONSUMIDOR FINAL';
+    if (!resolvedCrmContactId && (isConsumidorFinal || (formattedPhone && formattedPhone.length >= 7))) {
       await client.query('SAVEPOINT crm_sync');
       try {
-        const normPhone = normalizePhoneE164(formattedPhone);
-        if (normPhone) {
+        if (isConsumidorFinal) {
           const contact = await ensureContact(client, {
-            phone: normPhone,
-            name: customer.name || 'Cliente',
-            address: customer.address || null,
-            barrio: customer.barrio || null,
-            source: req.body.source || customer.source || 'TIENDA_DIRECTA'
+            bsuid: '2222222',
+            name: 'CONSUMIDOR FINAL',
+            source: req.body.source || customer.source || 'PRESENCIAL',
           });
+          await client.query(`
+            UPDATE pedidos_app_crm_contacts
+            SET display_name = 'CONSUMIDOR FINAL',
+                marketing_opt_in = FALSE
+            WHERE id = $1
+          `, [contact.id]);
           resolvedCrmContactId = contact.id;
 
           const custRes = await client.query(`
-            INSERT INTO pedidos_app_customers (name, phone, phone_e164, address, barrio, status, marketing_opt_in)
-            VALUES ($1, $2, $3, $4, $5, 'Activo', TRUE)
+            INSERT INTO pedidos_app_customers (name, phone, address, barrio, status, marketing_opt_in)
+            VALUES ('CONSUMIDOR FINAL', '2222222', $1, $2, 'Activo', FALSE)
             ON CONFLICT (phone) DO UPDATE SET
-              name = COALESCE(NULLIF(EXCLUDED.name, ''), pedidos_app_customers.name),
-              phone_e164 = COALESCE(EXCLUDED.phone_e164, pedidos_app_customers.phone_e164),
-              address = COALESCE(NULLIF(EXCLUDED.address, ''), pedidos_app_customers.address),
-              barrio = COALESCE(NULLIF(EXCLUDED.barrio, ''), pedidos_app_customers.barrio),
               status = 'Activo',
               updated_at = NOW()
             RETURNING id
-          `, [customer.name || 'Cliente', formattedPhone, normPhone, customer.address || null, customer.barrio || null]);
+          `, [customer.address || null, customer.barrio || null]);
 
           if (custRes.rows.length) {
             await client.query(`
@@ -1133,6 +1134,39 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
               VALUES ($1, $2)
               ON CONFLICT (customer_id) DO UPDATE SET contact_id = EXCLUDED.contact_id
             `, [contact.id, custRes.rows[0].id]);
+          }
+        } else {
+          const normPhone = normalizePhoneE164(formattedPhone);
+          if (normPhone) {
+            const contact = await ensureContact(client, {
+              phone: normPhone,
+              name: customer.name || 'Cliente',
+              address: customer.address || null,
+              barrio: customer.barrio || null,
+              source: req.body.source || customer.source || 'TIENDA_DIRECTA'
+            });
+            resolvedCrmContactId = contact.id;
+
+            const custRes = await client.query(`
+              INSERT INTO pedidos_app_customers (name, phone, phone_e164, address, barrio, status, marketing_opt_in)
+              VALUES ($1, $2, $3, $4, $5, 'Activo', TRUE)
+              ON CONFLICT (phone) DO UPDATE SET
+                name = COALESCE(NULLIF(EXCLUDED.name, ''), pedidos_app_customers.name),
+                phone_e164 = COALESCE(EXCLUDED.phone_e164, pedidos_app_customers.phone_e164),
+                address = COALESCE(NULLIF(EXCLUDED.address, ''), pedidos_app_customers.address),
+                barrio = COALESCE(NULLIF(EXCLUDED.barrio, ''), pedidos_app_customers.barrio),
+                status = 'Activo',
+                updated_at = NOW()
+              RETURNING id
+            `, [customer.name || 'Cliente', formattedPhone, normPhone, customer.address || null, customer.barrio || null]);
+
+            if (custRes.rows.length) {
+              await client.query(`
+                INSERT INTO pedidos_app_crm_contact_customers (contact_id, customer_id)
+                VALUES ($1, $2)
+                ON CONFLICT (customer_id) DO UPDATE SET contact_id = EXCLUDED.contact_id
+              `, [contact.id, custRes.rows[0].id]);
+            }
           }
         }
         await client.query('RELEASE SAVEPOINT crm_sync');
@@ -1179,6 +1213,16 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
         resolvedCrmContactId
       ]
     );
+
+    if (resolvedCrmContactId) {
+      await client.query('SAVEPOINT crm_refresh_after_order');
+      try {
+        await client.query('SELECT pedidos_app_crm_refresh_contact($1::bigint)', [resolvedCrmContactId]);
+        await client.query('RELEASE SAVEPOINT crm_refresh_after_order');
+      } catch (_refreshErr) {
+        await client.query('ROLLBACK TO SAVEPOINT crm_refresh_after_order');
+      }
+    }
 
     await reserveProductStock(client, normalized, rows[0].id, req.body.source || 'Web');
     await deliveryOrderService.appendDomainEvent(client, 'order_created', 'order', rows[0].id, {
@@ -2380,8 +2424,8 @@ app.get('/api/pedidos/admin/customers/:id', authenticateToken, async (req, res) 
     const orders = await pool.query(`
       SELECT id, created_at, delivery_type, payment_method, total, status, source, address, barrio, cart_json
       FROM pedidos_app_orders
-      WHERE crm_contact_id=$1 OR ($1::bigint IS NULL AND customer_phone_e164=$2)
-      ORDER BY created_at DESC LIMIT 100`, [customer.rows[0].crm_contact_id, customer.rows[0].phone_e164]);
+      WHERE crm_contact_id=$1 OR ($1::bigint IS NULL AND (customer_phone_e164=$2 OR customer_phone=$3))
+      ORDER BY created_at DESC LIMIT 250`, [customer.rows[0].crm_contact_id, customer.rows[0].phone_e164, customer.rows[0].phone]);
     res.json({ status: 'ok', customer: customer.rows[0], orders: orders.rows });
   } catch (error) { res.status(500).json({ status: 'error', error: error.message }); }
 });
@@ -5179,6 +5223,14 @@ require('./crm_api')(app, {
   authenticateToken,
   requirePermission,
   whatsappClient,
+  crmWorker,
+  normalizeOrderCart,
+  reserveProductStock,
+  deliveryOrderService,
+  validateOrderPayment,
+  issueTrackingToken,
+  JWT_SECRET,
+  getHorariosStatus,
 });
 require('./inventory_advanced_api')(app, {
   pool,

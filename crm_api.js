@@ -7,11 +7,12 @@ const {
   crmError,
   ensureContact,
   ensureConversation,
+  maskIdentifier,
   processStoredWhatsAppWebhook,
   queueConversationMessage,
   registerWhatsAppWebhook,
 } = require('./src/crm-service');
-const { validateWebhookSignature } = require('./src/whatsapp-cloud');
+const { validateWebhookSignature, describeWebhookSignature } = require('./src/whatsapp-cloud');
 
 const CONTACT_STATUSES = new Set([
   'NUEVO_CONTACTO','PROSPECTO','CLIENTE_NUEVO','CLIENTE_RECURRENTE',
@@ -56,7 +57,7 @@ function contactFilters(query = {}) {
 const CONTACT_FILTER_SQL = `
   contact.deleted_at IS NULL
   AND ($1='%%' OR contact.display_name ILIKE $1 OR contact.normalized_phone ILIKE $1
-    OR contact.email ILIKE $1 OR contact.barrio ILIKE $1 OR contact.username ILIKE $1
+    OR contact.email ILIKE $1 OR contact.barrio ILIKE $1 OR contact.username ILIKE $1 OR contact.bsuid ILIKE $1
     OR ($2::text IS NOT NULL AND contact.normalized_phone=$2)
     OR ($9::text<>'' AND EXISTS (
       SELECT 1 FROM pedidos_app_orders filter_order
@@ -109,11 +110,139 @@ async function segmentCount(pool, segment) {
   return rows[0];
 }
 
+const crmOrderIdempotencyCache = new Map();
+
+function formatCrmOrderWhatsAppSummary({
+  order,
+  items = [],
+  customer = {},
+  restaurantName = 'Distrito BG',
+}) {
+  const isDelivery = String(order.delivery_type || customer.deliveryType || '').toLowerCase() === 'domicilio';
+  const orderNumber = String(order.id || 0).padStart(4, '0');
+  const lines = [
+    `🍔 *${restaurantName} — Pedido Confirmado*`,
+    `*Pedido #${orderNumber}*`,
+    '',
+    `Hola *${customer.name || order.customer_name || 'Cliente'}*, tu pedido fue registrado y ya se encuentra *${order.status || 'En preparación'}* en nuestra cocina. 👨‍🍳🔥`,
+    '',
+    '*🛒 Detalle del pedido:*',
+  ];
+  for (const it of items) {
+    const qty = Number(it.quantity || it.qty || 1);
+    const unitPrice = Number(it.price || 0);
+    const sub = unitPrice * qty;
+    lines.push(`• ${qty}x ${it.title || it.name || 'Producto'} — $${sub.toLocaleString('es-CO')}`);
+    if (it.notes) {
+      lines.push(`  ↳ _${it.notes}_`);
+    }
+  }
+  lines.push('');
+  lines.push(`*Modalidad:* ${isDelivery ? '🛵 A Domicilio' : '🏪 Recoger en local'}`);
+  if (isDelivery && (order.address || customer.address)) {
+    lines.push(`*Dirección:* ${order.address || customer.address}${order.barrio || customer.barrio ? ` (${order.barrio || customer.barrio})` : ''}`);
+  }
+  const paymentMethod = String(order.payment_method || customer.paymentMethod || 'efectivo').toUpperCase();
+  lines.push(`*Método de Pago:* ${paymentMethod}`);
+  if (order.change_required && Number(order.change_required) > 0) {
+    lines.push(`*Cambio requerido:* $${Number(order.change_required).toLocaleString('es-CO')}`);
+  }
+  if (isDelivery && Number(order.delivery_fee) > 0) {
+    lines.push(`*Domicilio:* $${Number(order.delivery_fee).toLocaleString('es-CO')}`);
+  }
+  lines.push(`*Total a pagar:* $${Number(order.total || 0).toLocaleString('es-CO')}`);
+  if (order.tracking_url) {
+    lines.push('', `🔎 *Rastrea tu pedido en tiempo real:*`, order.tracking_url);
+  }
+  lines.push('', `¡Muchas gracias por elegir ${restaurantName}! ❤️`);
+  return lines.join('\n');
+}
+
+async function fallbackNormalizeOrderCart(client, rawCart, { activeOnly = true } = {}) {
+  if (!Array.isArray(rawCart) || rawCart.length === 0 || rawCart.length > 100) {
+    const error = new Error('El pedido debe contener entre 1 y 100 productos.');
+    error.statusCode = 400;
+    throw error;
+  }
+  const ids = [...new Set(rawCart.map((item) => String(item.id || item.product_id || '')).filter(Boolean))];
+  const { rows } = await client.query(
+    `SELECT id, title, price, category, status
+     FROM pedidos_app_products
+     WHERE id::text = ANY($1::text[]) AND ($2::boolean = FALSE OR status = 'Activo')`,
+    [ids, activeOnly]
+  );
+  const products = new Map(rows.map((p) => [String(p.id), p]));
+  const cart = [];
+  for (const item of rawCart) {
+    const p = products.get(String(item.id || item.product_id));
+    if (!p) {
+      const err = new Error(`El producto #${item.id || item.product_id} no existe o no está activo.`);
+      err.statusCode = 400;
+      throw err;
+    }
+    const qty = Math.max(1, Math.min(999, parseInt(item.quantity || item.qty || 1, 10)));
+    cart.push({
+      id: p.id,
+      title: p.title,
+      price: Number(p.price),
+      quantity: qty,
+      category: p.category,
+      notes: cleanText(item.notes, 255) || undefined,
+    });
+  }
+  return {
+    cart,
+    total: cart.reduce((sum, item) => sum + item.price * item.quantity, 0),
+  };
+}
+
+function fallbackValidateOrderPayment({ paymentMethod, cashAmount, cashSplit, transferSplit, orderTotal }) {
+  const method = String(paymentMethod || '').trim().toLowerCase();
+  if (!['efectivo', 'transferencia', 'compartido'].includes(method)) {
+    return {
+      isValid: false,
+      error: `Método de pago no válido: '${paymentMethod}'. Valores permitidos: efectivo, transferencia, compartido.`,
+    };
+  }
+  if (method === 'efectivo') {
+    const cash = Number(cashAmount);
+    if (Number.isFinite(cash) && cash > 0 && cash < orderTotal) {
+      return {
+        isValid: false,
+        error: `El efectivo indicado ($${cash.toLocaleString('es-CO')}) no cubre el total de $${orderTotal.toLocaleString('es-CO')}.`,
+      };
+    }
+  }
+  if (method === 'compartido') {
+    const c = Number(cashSplit) || 0;
+    const t = Number(transferSplit) || 0;
+    if (c + t < orderTotal) {
+      return {
+        isValid: false,
+        error: `La suma de pago compartido ($${(c + t).toLocaleString('es-CO')}) no cubre el total de $${orderTotal.toLocaleString('es-CO')}.`,
+      };
+    }
+  }
+  return { isValid: true, method };
+}
+
+async function fallbackReserveProductStock() {
+  return 0;
+}
+
 module.exports = function registerCrmApi(app, {
   pool,
   authenticateToken,
   requirePermission,
   whatsappClient,
+  crmWorker = null,
+  normalizeOrderCart = null,
+  reserveProductStock = null,
+  deliveryOrderService = null,
+  validateOrderPayment = null,
+  issueTrackingToken = null,
+  JWT_SECRET = null,
+  getHorariosStatus = null,
 }) {
   const webhookLimiter = rateLimit({
     windowMs: 60_000,
@@ -150,6 +279,13 @@ module.exports = function registerCrmApi(app, {
       || process.env.RENDER === 'true'
       || Boolean(process.env.RENDER_SERVICE_ID);
     if (!production || req.secure || forwardedProtocol === 'https') return next();
+    console.warn(JSON.stringify({
+      level: 'warn',
+      component: 'whatsapp-webhook',
+      event: 'webhook_https_rejected',
+      request_id: req.requestId || null,
+      forwarded_proto: forwardedProtocol || null,
+    }));
     return res.status(426).json({
       code: 'WHATSAPP_WEBHOOK_HTTPS_REQUIRED',
       error: 'El webhook de WhatsApp solo está disponible mediante HTTPS en producción.',
@@ -158,12 +294,24 @@ module.exports = function registerCrmApi(app, {
 
   const logWebhookPayload = (req) => {
     if (String(process.env.WHATSAPP_WEBHOOK_LOG_PAYLOAD || 'true').toLowerCase() === 'false') return;
+    const body = req.body || {};
+    const msg = body.whatsappInboundMessage
+      || body.whatsappMessage
+      || body.entry?.[0]?.changes?.[0]?.value?.messages?.[0]
+      || null;
+    const statusObj = body.entry?.[0]?.changes?.[0]?.value?.statuses?.[0] || null;
     console.log(JSON.stringify({
       level: 'info',
       component: 'whatsapp-webhook',
       event: 'payload_received',
       request_id: req.requestId || null,
-      payload: req.body,
+      webhook_id: body.id || body.entry?.[0]?.id || null,
+      webhook_type: body.type || body.object || 'unknown',
+      message_id: msg?.id || msg?.wamid || statusObj?.id || null,
+      message_type: msg?.type || (statusObj ? `status:${statusObj.status}` : null),
+      sender_masked: maskIdentifier(msg?.from || msg?.fromUserId || null),
+      recipient_masked: maskIdentifier(msg?.to || msg?.toUserId || statusObj?.recipient_id || null),
+      create_time: body.createTime || msg?.sendTime || msg?.timestamp || null,
     }));
   };
 
@@ -184,22 +332,34 @@ module.exports = function registerCrmApi(app, {
     return res.status(403).json({ code: 'WHATSAPP_WEBHOOK_VERIFICATION_FAILED', error: 'No fue posible verificar el webhook.' });
   });
 
-
   app.post('/api/pedidos/webhooks/whatsapp', requireWebhookHttps, webhookLimiter, async (req, res) => {
     try {
       const signature = req.headers['ycloud-signature'] || req.headers['x-hub-signature-256'];
-      if (!validateWebhookSignature(req.rawBody, signature, whatsappClient.config.verifyToken)) {
+      const effectiveRawBody = req.rawBody || (req.body && typeof req.body === 'object' && Object.keys(req.body).length ? Buffer.from(JSON.stringify(req.body), 'utf8') : null);
+      if (!validateWebhookSignature(effectiveRawBody, signature, whatsappClient.config.verifyToken)) {
+        const sigMeta = describeWebhookSignature(signature);
+        console.warn(JSON.stringify({
+          level: 'warn',
+          component: 'whatsapp-webhook',
+          event: 'webhook_signature_rejected',
+          request_id: req.requestId || null,
+          signature_format: sigMeta.format,
+          signature_timestamp: sigMeta.timestamp,
+          has_raw_body: Boolean(effectiveRawBody),
+          webhook_type: req.body?.type || req.body?.object || null,
+        }));
         return res.status(401).json({ code: 'WHATSAPP_WEBHOOK_SIGNATURE_INVALID', error: 'Firma de webhook de YCloud/Meta inválida.' });
       }
       logWebhookPayload(req);
-      
-      const registration = await registerWhatsAppWebhook(pool, req.body, req.rawBody);
+
+      const registration = await registerWhatsAppWebhook(pool, req.body, effectiveRawBody);
       const response = res.status(200).json({ status: 'accepted', duplicate: registration.duplicate });
       setImmediate(() => {
         void processStoredWhatsAppWebhook(pool, registration.eventKey)
           .then((result) => console.log(JSON.stringify({
             level: 'info', component: 'whatsapp-webhook-worker', event: 'payload_processed',
             request_id: req.requestId || null, event_key: registration.eventKey,
+            event_type: registration.eventType || null,
             duplicate: result.duplicate, processed: result.processed,
           })))
           .catch((error) => console.error(JSON.stringify({
@@ -290,7 +450,7 @@ module.exports = function registerCrmApi(app, {
       `, [req.params.id]);
       if (!contactResult.rows.length) throw crmError('CRM_CONTACT_NOT_FOUND', 'Contacto no encontrado.', 404);
       const [orders, conversations, notes, activity, interests, consents, customers, favoriteProducts] = await Promise.all([
-        pool.query(`SELECT id,status,total,source,delivery_type,payment_method,created_at,delivered_at,cart_json FROM pedidos_app_orders WHERE crm_contact_id=$1 ORDER BY created_at DESC LIMIT 100`, [req.params.id]),
+        pool.query(`SELECT id,status,total,source,delivery_type,payment_method,address,barrio,notes,delivery_fee,created_at,delivered_at,cart_json FROM pedidos_app_orders WHERE crm_contact_id=$1 ORDER BY created_at DESC LIMIT 250`, [req.params.id]),
         pool.query(`SELECT * FROM pedidos_app_crm_conversations WHERE contact_id=$1 ORDER BY last_message_at DESC NULLS LAST LIMIT 50`, [req.params.id]),
         pool.query(`SELECT note.*,creator.name AS creator_name FROM pedidos_app_crm_notes note LEFT JOIN pedidos_app_users creator ON creator.id=note.created_by WHERE note.contact_id=$1 AND note.deleted_at IS NULL ORDER BY note.created_at DESC`, [req.params.id]),
         pool.query(`SELECT * FROM pedidos_app_crm_activities WHERE contact_id=$1 ORDER BY occurred_at DESC,id DESC LIMIT 200`, [req.params.id]),
@@ -407,31 +567,145 @@ module.exports = function registerCrmApi(app, {
 
   app.get('/api/pedidos/admin/crm/conversations', authenticateToken, requirePermission('CRM','conversaciones'), async (req, res) => {
     try {
-      const page=positiveInteger(req.query.page,1,1_000_000); const limit=positiveInteger(req.query.limit,30,100);
-      const status=['OPEN','PENDING','CLOSED'].includes(req.query.status)?req.query.status:''; const search=cleanText(req.query.search,160);
-      const { rows }=await pool.query(`
-        SELECT conversation.*,contact.display_name,contact.normalized_phone,contact.status AS contact_status,
-          assigned.name AS assigned_name,last_message.text_body AS last_message_text,last_message.message_type AS last_message_type,
+      const page = positiveInteger(req.query.page, 1, 1_000_000);
+      const limit = positiveInteger(req.query.limit, 60, 200);
+      const rawStatus = String(req.query.status || '').toUpperCase();
+      const status = ['OPEN','PENDING','CLOSED'].includes(rawStatus) ? rawStatus : '';
+      const unreadOnly = rawStatus === 'UNREAD' || req.query.unread === 'true';
+      const chatsOnly = rawStatus === 'CHATS' || req.query.only_chats === 'true';
+      const contactId = /^\d+$/.test(String(req.query.contact_id || '')) ? Number(req.query.contact_id) : null;
+      const search = cleanText(req.query.search, 160);
+      const { rows } = await pool.query(`
+        SELECT conversation.*,
+          contact.display_name,contact.normalized_phone,contact.bsuid,contact.username,
+          contact.status AS contact_status,contact.orders_count,contact.total_spent,
+          contact.last_purchase_at,contact.barrio,contact.address,
+          assigned.name AS assigned_name,
+          last_message.message_id AS last_message_id,
+          last_message.text_body AS last_message_text,
+          last_message.message_type AS last_message_type,
+          last_message.direction AS last_message_direction,
+          last_message.status AS last_message_status,
+          last_message.sent_by AS last_message_sent_by,
+          last_message.created_at AS last_message_created_at,
+          COALESCE(last_message.created_at, conversation.last_inbound_at, conversation.last_message_at) AS effective_last_message_at,
           COUNT(*) OVER()::int AS filtered_count
         FROM pedidos_app_crm_conversations conversation
         JOIN pedidos_app_crm_contacts contact ON contact.id=conversation.contact_id
         LEFT JOIN pedidos_app_users assigned ON assigned.id=conversation.assigned_user_id
-        LEFT JOIN LATERAL (SELECT text_body,message_type FROM pedidos_app_crm_messages WHERE conversation_id=conversation.id ORDER BY created_at DESC,id DESC LIMIT 1) last_message ON TRUE
-        WHERE ($1='' OR conversation.status=$1) AND ($2='%%' OR contact.display_name ILIKE $2 OR contact.normalized_phone ILIKE $2)
-        ORDER BY conversation.last_message_at DESC NULLS LAST,conversation.id DESC LIMIT $3 OFFSET $4
-      `,[status,`%${search}%`,limit,(page-1)*limit]);
-      const total=rows[0]?.filtered_count||0; res.json({status:'ok',conversations:rows.map(({filtered_count,...row})=>row),pagination:{page,limit,total,pages:Math.max(1,Math.ceil(total/limit))}});
-    } catch(error){respondError(res,error);}
+        LEFT JOIN LATERAL (
+          SELECT id AS message_id,text_body,message_type,direction,status,sent_by,created_at
+          FROM pedidos_app_crm_messages
+          WHERE conversation_id=conversation.id
+          ORDER BY created_at DESC,id DESC LIMIT 1
+        ) last_message ON TRUE
+        WHERE contact.deleted_at IS NULL
+          AND ($1='' OR conversation.status=$1)
+          AND (NOT $5::boolean OR conversation.unread_count > 0)
+          AND ($6::bigint IS NULL OR conversation.contact_id=$6)
+          AND (NOT $7::boolean OR conversation.last_inbound_at IS NOT NULL OR conversation.unread_count > 0 OR last_message.sent_by IS NOT NULL)
+          AND ($2='%%'
+            OR contact.display_name ILIKE $2
+            OR contact.normalized_phone ILIKE $2
+            OR contact.username ILIKE $2
+            OR contact.bsuid ILIKE $2
+            OR EXISTS (
+              SELECT 1 FROM pedidos_app_crm_messages msg_search
+              WHERE msg_search.conversation_id=conversation.id AND msg_search.text_body ILIKE $2
+            ))
+        ORDER BY
+          CASE
+            WHEN conversation.last_inbound_at IS NOT NULL OR conversation.unread_count > 0 OR last_message.sent_by IS NOT NULL OR last_message.message_id IS NULL THEN 0
+            ELSE 1
+          END ASC,
+          COALESCE(last_message.created_at, conversation.last_inbound_at, conversation.last_message_at) DESC NULLS LAST,
+          conversation.id DESC
+        LIMIT $3 OFFSET $4
+      `, [status, `%${search}%`, limit, (page - 1) * limit, unreadOnly, contactId, chatsOnly]);
+      const total = rows[0]?.filtered_count || 0;
+      res.json({
+        status: 'ok',
+        conversations: rows.map(({ filtered_count, effective_last_message_at, ...row }) => ({
+          ...row,
+          last_message_at: effective_last_message_at || row.last_message_at,
+        })),
+        pagination: { page, limit, total, pages: Math.max(1, Math.ceil(total / limit)) },
+      });
+    } catch (error) { respondError(res, error); }
   });
 
-  app.get('/api/pedidos/admin/crm/conversations/:id', authenticateToken, requirePermission('CRM','conversaciones'), async (req,res)=>{
-    try{
-      const conversation=await pool.query(`SELECT conversation.*,contact.display_name,contact.normalized_phone,contact.status AS contact_status,contact.orders_count,contact.total_spent FROM pedidos_app_crm_conversations conversation JOIN pedidos_app_crm_contacts contact ON contact.id=conversation.contact_id WHERE conversation.id=$1`,[req.params.id]);
-      if(!conversation.rows.length) throw crmError('CONVERSATION_NOT_FOUND','Conversación no encontrada.',404);
-      const before=/^\d+$/.test(String(req.query.before||''))?Number(req.query.before):null;
-      const messages=await pool.query(`SELECT * FROM pedidos_app_crm_messages WHERE conversation_id=$1 AND ($2::bigint IS NULL OR id<$2) ORDER BY id DESC LIMIT 100`,[req.params.id,before]);
-      res.json({status:'ok',conversation:conversation.rows[0],messages:messages.rows.reverse()});
-    }catch(error){respondError(res,error);}
+  app.post('/api/pedidos/admin/crm/conversations/open', authenticateToken, requirePermission('CRM','conversaciones'), async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const contactId = Number(req.body.contact_id);
+      if (!Number.isInteger(contactId) || contactId <= 0) throw crmError('CRM_CONTACT_NOT_FOUND', 'Contacto inválido.', 400);
+      await client.query('BEGIN');
+      const contactCheck = await client.query('SELECT id FROM pedidos_app_crm_contacts WHERE id=$1 AND deleted_at IS NULL', [contactId]);
+      if (!contactCheck.rows.length) throw crmError('CRM_CONTACT_NOT_FOUND', 'Contacto no encontrado.', 404);
+      const conv = await ensureConversation(client, {
+        contactId,
+        providerAccountId: whatsappClient.config.phoneNumberId || null,
+      });
+      await client.query('COMMIT');
+      res.json({ status: 'ok', conversation: conv });
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      respondError(res, error);
+    } finally { client.release(); }
+  });
+
+  app.get('/api/pedidos/admin/crm/conversations/:id', authenticateToken, requirePermission('CRM','conversaciones'), async (req, res) => {
+    try {
+      const conversation = await pool.query(`
+        SELECT conversation.*,
+          contact.display_name,contact.normalized_phone,contact.bsuid,contact.username,
+          contact.status AS contact_status,contact.orders_count,contact.total_spent,
+          contact.average_ticket,contact.last_purchase_at,contact.first_purchase_at,
+          contact.address,contact.barrio,contact.email,contact.source AS contact_source,
+          contact.marketing_opt_in,contact.marketing_opt_out,contact.no_contact,
+          COALESCE(tags.tags,'[]'::jsonb) AS contact_tags
+        FROM pedidos_app_crm_conversations conversation
+        JOIN pedidos_app_crm_contacts contact ON contact.id=conversation.contact_id
+        LEFT JOIN LATERAL (
+          SELECT jsonb_agg(jsonb_build_object('id',tag.id,'name',tag.name,'color',tag.color) ORDER BY tag.name) AS tags
+          FROM pedidos_app_crm_contact_tags link JOIN pedidos_app_crm_tags tag ON tag.id=link.tag_id WHERE link.contact_id=contact.id
+        ) tags ON TRUE
+        WHERE conversation.id=$1
+      `, [req.params.id]);
+      if (!conversation.rows.length) throw crmError('CONVERSATION_NOT_FOUND', 'Conversación no encontrada.', 404);
+      const convRow = conversation.rows[0];
+      const before = /^\d+$/.test(String(req.query.before || '')) ? Number(req.query.before) : null;
+      const after = /^\d+$/.test(String(req.query.after || '')) ? Number(req.query.after) : null;
+      const [messages, orders, notes] = await Promise.all([
+        pool.query(`
+          SELECT * FROM pedidos_app_crm_messages
+          WHERE conversation_id=$1
+            AND ($2::bigint IS NULL OR id<$2)
+            AND ($3::bigint IS NULL OR id>$3)
+          ORDER BY created_at DESC, id DESC LIMIT 100
+        `, [req.params.id, before, after]),
+        pool.query(`
+          SELECT id,status,total,source,delivery_type,payment_method,address,barrio,notes,delivery_fee,created_at,delivered_at,cart_json
+          FROM pedidos_app_orders
+          WHERE crm_contact_id=$1
+          ORDER BY created_at DESC LIMIT 50
+        `, [convRow.contact_id]),
+        pool.query(`
+          SELECT note.*,creator.name AS creator_name
+          FROM pedidos_app_crm_notes note
+          LEFT JOIN pedidos_app_users creator ON creator.id=note.created_by
+          WHERE note.contact_id=$1 AND note.deleted_at IS NULL
+          ORDER BY note.created_at DESC LIMIT 20
+        `, [convRow.contact_id]),
+      ]);
+      res.json({
+        status: 'ok',
+        conversation: convRow,
+        messages: messages.rows.reverse(),
+        orders: orders.rows,
+        notes: notes.rows,
+      });
+    } catch (error) { respondError(res, error); }
   });
 
   app.post('/api/pedidos/admin/crm/conversations/:id/read', authenticateToken, requirePermission('CRM','conversaciones'), async(req,res)=>{
@@ -449,7 +723,319 @@ module.exports = function registerCrmApi(app, {
   });
 
   app.post('/api/pedidos/admin/crm/conversations/:id/messages', authenticateToken, requirePermission('CRM','responder'), sendLimiter, async(req,res)=>{
-    try{const result=await queueConversationMessage(pool,{conversationId:req.params.id,actorUserId:req.user.id,text:req.body.text,template:req.body.template,idempotencyKey:req.headers['idempotency-key']});res.status(result.duplicate?200:202).json({status:'ok',...result});}catch(error){respondError(res,error);}
+    try{
+      const result=await queueConversationMessage(pool,{conversationId:req.params.id,actorUserId:req.user.id,text:req.body.text,template:req.body.template,idempotencyKey:req.headers['idempotency-key']});
+      setImmediate(() => { void crmWorker?.processOne?.(); });
+      res.status(result.duplicate?200:202).json({status:'ok',...result});
+    }catch(error){respondError(res,error);}
+  });
+
+  app.post('/api/pedidos/admin/crm/conversations/:id/orders', authenticateToken, requirePermission('CRM', 'responder'), async (req, res) => {
+    try {
+      const idempotencyKey = cleanText(req.headers['idempotency-key'] || req.body.idempotencyKey, 180);
+      if (idempotencyKey && crmOrderIdempotencyCache.has(idempotencyKey)) {
+        const cached = crmOrderIdempotencyCache.get(idempotencyKey);
+        return res.status(200).json({ status: 'ok', duplicate: true, ...cached });
+      }
+
+      const convRes = await pool.query(`
+        SELECT conversation.*, contact.id AS c_id, contact.display_name, contact.normalized_phone,
+               contact.bsuid, contact.address, contact.barrio, contact.no_contact, contact.marketing_opt_out,
+               contact.deleted_at
+        FROM pedidos_app_crm_conversations conversation
+        JOIN pedidos_app_crm_contacts contact ON contact.id = conversation.contact_id
+        WHERE conversation.id = $1
+      `, [req.params.id]);
+
+      if (!convRes.rows.length) throw crmError('CONVERSATION_NOT_FOUND', 'Conversación no encontrada.', 404);
+      const conv = convRes.rows[0];
+
+      if (conv.deleted_at && !String(conv.bsuid || '').startsWith('MERGED:')) {
+        await pool.query('UPDATE pedidos_app_crm_contacts SET deleted_at=NULL WHERE id=$1', [conv.c_id]).catch(() => {});
+      }
+
+      const customer = req.body.customer || {};
+      const customerName = cleanText(customer.name || conv.display_name, 120) || 'Cliente WhatsApp';
+      const customerPhone = cleanText(customer.phone || conv.normalized_phone, 40) || '';
+      const customerDeliveryType = String(customer.deliveryType || req.body.deliveryType || 'domicilio').toLowerCase().trim();
+      const isDelivery = customerDeliveryType === 'domicilio';
+      const orderAddress = cleanText(customer.address || conv.address, 255);
+      const orderBarrio = cleanText(customer.barrio || conv.barrio, 120);
+      const deliveryReference = cleanText(customer.reference || customer.delivery_reference, 255);
+      const customerPaymentMethod = String(customer.paymentMethod || req.body.paymentMethod || 'efectivo').toLowerCase().trim();
+
+      if (isDelivery && !orderAddress) {
+        throw crmError('DELIVERY_ADDRESS_REQUIRED', 'La dirección de entrega es obligatoria para pedidos a domicilio.', 400);
+      }
+
+      const rawCart = Array.isArray(req.body.cart) ? req.body.cart : [];
+      if (!rawCart.length) {
+        throw crmError('CART_EMPTY', 'El pedido debe contener al menos un producto.', 400);
+      }
+
+      const client = await pool.connect();
+      let createdOrder;
+      let normalized;
+      let deliveryFee = 0;
+      let orderTotal = 0;
+      let paymentCheck;
+      let finalStatus;
+      let changeRequired = null;
+
+      try {
+        const effectiveNormalizeCart = normalizeOrderCart || fallbackNormalizeOrderCart;
+        normalized = await effectiveNormalizeCart(client, rawCart);
+        if (!normalized.cart || !normalized.cart.length) {
+          throw crmError('CART_EMPTY', 'El pedido debe contener al menos un producto válido.', 400);
+        }
+
+        if (isDelivery) {
+          const settingsResult = await client.query('SELECT COALESCE(delivery_cost, 0)::integer AS delivery_cost FROM pedidos_app_settings WHERE id = 1');
+          deliveryFee = Math.max(0, Number(settingsResult.rows[0]?.delivery_cost || 0));
+        }
+        orderTotal = normalized.total + deliveryFee;
+
+        const effectiveValidatePayment = validateOrderPayment || fallbackValidateOrderPayment;
+        paymentCheck = effectiveValidatePayment({
+          paymentMethod: customerPaymentMethod,
+          cashAmount: customer.cashAmount !== undefined ? customer.cashAmount : req.body.cashAmount,
+          cashSplit: customer.cash_split !== undefined ? customer.cash_split : req.body.cash_split,
+          transferSplit: customer.transfer_split !== undefined ? customer.transfer_split : req.body.transfer_split,
+          orderTotal,
+        });
+        if (!paymentCheck.isValid) {
+          throw crmError('PAYMENT_INVALID', paymentCheck.error, 400);
+        }
+
+        // Deduplicación en ventana corta de 60 segundos por si no enviaron idempotencyKey
+        const recentDuplicate = await client.query(`
+          SELECT id, created_at, status, total, delivery_fee, cart_json, customer_name, customer_phone, address, barrio, delivery_type, payment_method, change_required
+          FROM pedidos_app_orders
+          WHERE crm_contact_id = $1 AND source = 'WhatsApp CRM' AND total = $2
+            AND created_at >= NOW() - INTERVAL '60 seconds'
+          ORDER BY id DESC LIMIT 1
+        `, [conv.contact_id, orderTotal]);
+
+        if (recentDuplicate.rows.length > 0 && JSON.stringify(recentDuplicate.rows[0].cart_json) === JSON.stringify(normalized.cart)) {
+          const prev = recentDuplicate.rows[0];
+          client.release();
+          return res.status(200).json({
+            status: 'ok',
+            duplicate: true,
+            order: {
+              id: prev.id,
+              customer_name: prev.customer_name,
+              customer_phone: prev.customer_phone,
+              address: prev.address,
+              barrio: prev.barrio,
+              delivery_type: prev.delivery_type,
+              payment_method: prev.payment_method,
+              total: Number(prev.total),
+              subtotal: normalized.total,
+              delivery_fee: Number(prev.delivery_fee),
+              change_required: prev.change_required ? Number(prev.change_required) : null,
+              status: prev.status,
+              cart_json: prev.cart_json,
+              created_at: prev.created_at,
+            },
+            whatsapp: { status: 'duplicate_prevented', message: 'Pedido recuperado de la solicitud anterior idéntica.' },
+          });
+        }
+
+        await client.query('BEGIN');
+        finalStatus = req.body.sendToKitchen !== false ? 'En preparación' : 'Nuevo';
+        changeRequired = paymentCheck.method === 'efectivo' && Number(customer.cashAmount) >= orderTotal
+          ? Math.round(Number(customer.cashAmount) - orderTotal)
+          : null;
+        const finalNotes = cleanText(customer.notes || req.body.notes, 500);
+        const voucherRef = cleanText(customer.voucher_reference || req.body.voucher_reference, 120);
+
+        const { rows: orderRows } = await client.query(`
+          INSERT INTO pedidos_app_orders
+            (customer_name, customer_phone, address, barrio, delivery_type, payment_method,
+             total, cart_json, source, notes, voucher_reference, delivery_fee, change_required,
+             delivery_reference, status, crm_contact_id, created_at)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'WhatsApp CRM', $9, $10, $11, $12, $13, $14, $15, NOW())
+          RETURNING id, created_at, status, total, delivery_fee
+        `, [
+          customerName,
+          customerPhone || null,
+          orderAddress || '',
+          orderBarrio || '',
+          customerDeliveryType,
+          paymentCheck.method,
+          orderTotal,
+          JSON.stringify(normalized.cart),
+          finalNotes || '',
+          voucherRef || '',
+          deliveryFee,
+          changeRequired,
+          deliveryReference || '',
+          finalStatus,
+          conv.contact_id,
+        ]);
+        createdOrder = orderRows[0];
+
+        const effectiveReserveStock = reserveProductStock || fallbackReserveProductStock;
+        await effectiveReserveStock(client, normalized, createdOrder.id, 'WhatsApp CRM');
+
+        await client.query('SELECT pedidos_app_crm_refresh_contact($1::bigint)', [conv.contact_id]).catch(() => {});
+
+        if (deliveryOrderService?.appendDomainEvent) {
+          await deliveryOrderService.appendDomainEvent(client, 'order_created', 'order', createdOrder.id, {
+            orderId: createdOrder.id,
+            orderStatus: finalStatus,
+            source: 'WhatsApp CRM',
+            deliveryType: customerDeliveryType,
+            total: orderTotal,
+            conversationId: conv.id,
+            contactId: conv.contact_id,
+          });
+        } else {
+          await appendCrmEvent(client, 'order_created', 'order', createdOrder.id, {
+            orderId: createdOrder.id,
+            orderStatus: finalStatus,
+            source: 'WhatsApp CRM',
+            deliveryType: customerDeliveryType,
+            total: orderTotal,
+          });
+        }
+
+        const orderMsgText = `Pedido #${createdOrder.id} registrado (${finalStatus}) — Total: $${orderTotal.toLocaleString('es-CO')}`;
+        const orderContent = {
+          order_id: createdOrder.id,
+          total: orderTotal,
+          subtotal: normalized.total,
+          delivery_fee: deliveryFee,
+          status: finalStatus,
+          delivery_type: customerDeliveryType,
+          payment_method: paymentCheck.method,
+          items: normalized.cart,
+        };
+        const orderMsgRes = await client.query(`
+          INSERT INTO pedidos_app_crm_messages
+            (conversation_id, contact_id, direction, message_type, text_body, content, status, sent_by, created_at)
+          VALUES ($1, $2, 'OUTBOUND', 'order', $3, $4::jsonb, 'DELIVERED', $5, NOW())
+          RETURNING id, created_at
+        `, [conv.id, conv.contact_id, orderMsgText, JSON.stringify(orderContent), req.user?.id || null]);
+
+        await appendCrmEvent(client, 'crm.message.received', 'crm_conversation', conv.id, {
+          conversationId: conv.id,
+          contactId: conv.contact_id,
+          messageId: orderMsgRes.rows[0].id,
+          orderId: createdOrder.id,
+        });
+
+        await audit(client, req, 'CRM_ORDER_CREATED', 'order', createdOrder.id, {
+          conversationId: conv.id,
+          contactId: conv.contact_id,
+          total: orderTotal,
+          status: finalStatus,
+        });
+
+        await client.query('COMMIT');
+      } catch (txErr) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw txErr;
+      } finally {
+        client.release();
+      }
+
+      // Envío de resumen por WhatsApp fuera de la transacción
+      const isConsumidorFinal = conv.bsuid === '2222222' || conv.normalized_phone === '+572222222' || String(conv.display_name || '').toUpperCase() === 'CONSUMIDOR FINAL';
+      let whatsappResult = null;
+      const trackingToken = typeof issueTrackingToken === 'function' && JWT_SECRET ? issueTrackingToken(createdOrder.id, JWT_SECRET) : null;
+      const trackingUrl = trackingToken ? `https://www.distritobg.app/rastrear/${createdOrder.id}?t=${trackingToken}` : `https://www.distritobg.app/rastrear/${createdOrder.id}`;
+
+      if (isConsumidorFinal) {
+        whatsappResult = {
+          status: 'omitted_consumidor_final',
+          message: 'CONSUMIDOR FINAL: ventas presenciales en local, no se envía resumen por WhatsApp.',
+        };
+      } else if (req.body.sendWhatsAppSummary !== false) {
+        const summaryText = formatCrmOrderWhatsAppSummary({
+          order: {
+            id: createdOrder.id,
+            status: finalStatus,
+            delivery_type: customerDeliveryType,
+            payment_method: paymentCheck.method,
+            change_required: changeRequired,
+            delivery_fee: deliveryFee,
+            total: orderTotal,
+            address: orderAddress,
+            barrio: orderBarrio,
+            tracking_url: trackingUrl,
+          },
+          items: normalized.cart,
+          customer: { name: customerName, deliveryType: customerDeliveryType },
+          restaurantName: 'Distrito BG',
+        });
+
+        try {
+          const queued = await queueConversationMessage(pool, {
+            conversationId: conv.id,
+            actorUserId: req.user.id,
+            text: summaryText,
+            idempotencyKey: `order-summary-${createdOrder.id}`,
+          });
+          setImmediate(() => { void crmWorker?.processOne?.(); });
+          whatsappResult = {
+            status: 'queued',
+            messageId: queued.messageId,
+            message: 'Resumen enviado a la cola de WhatsApp con éxito.',
+          };
+        } catch (waErr) {
+          if (waErr.code === 'WHATSAPP_SESSION_EXPIRED') {
+            whatsappResult = {
+              status: 'window_closed',
+              code: 'WHATSAPP_SESSION_EXPIRED',
+              message: 'Ventana de 24 horas cerrada. El pedido fue creado y enviado a cocina, pero no se pudo enviar el texto libre sin plantilla.',
+            };
+          } else {
+            whatsappResult = {
+              status: 'failed',
+              code: waErr.code || 'WHATSAPP_SEND_ERROR',
+              message: waErr.message || 'Error al enviar resumen de WhatsApp.',
+            };
+          }
+        }
+      } else {
+        whatsappResult = {
+          status: 'skipped',
+          message: 'Envío de resumen por WhatsApp no solicitado.',
+        };
+      }
+
+      const responsePayload = {
+        status: 'ok',
+        order: {
+          id: createdOrder.id,
+          customer_name: customerName,
+          customer_phone: customerPhone,
+          address: orderAddress,
+          barrio: orderBarrio,
+          delivery_type: customerDeliveryType,
+          payment_method: paymentCheck.method,
+          total: orderTotal,
+          subtotal: normalized.total,
+          delivery_fee: deliveryFee,
+          change_required: changeRequired,
+          status: finalStatus,
+          cart_json: normalized.cart,
+          created_at: createdOrder.created_at,
+          tracking_url: trackingUrl,
+        },
+        whatsapp: whatsappResult,
+      };
+
+      if (idempotencyKey) {
+        crmOrderIdempotencyCache.set(idempotencyKey, { ...responsePayload, cachedAt: Date.now() });
+      }
+
+      return res.status(201).json(responsePayload);
+    } catch (error) {
+      respondError(res, error);
+    }
   });
 
   app.get('/api/pedidos/admin/crm/segments', authenticateToken, requirePermission('CRM','segmentos'), async(req,res)=>{
@@ -576,3 +1162,7 @@ module.exports = function registerCrmApi(app, {
 
   return { segmentCount };
 };
+
+module.exports.formatCrmOrderWhatsAppSummary = formatCrmOrderWhatsAppSummary;
+module.exports.crmOrderIdempotencyCache = crmOrderIdempotencyCache;
+

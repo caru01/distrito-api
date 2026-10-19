@@ -22,34 +22,64 @@ function safeEqual(left, right) {
 
 const KNOWN_YCLOUD_WEBHOOK_SECRET = 'whsec_4ad302be242b4c73b4b74793b07667aa';
 
-function validateWebhookSignature(rawBody, signatureHeader, webhookSecret) {
+function collectCandidateSecrets(webhookSecret, env = process.env) {
+  const candidateSecrets = new Set();
+  const addSecret = (raw) => {
+    if (!raw) return;
+    if (Array.isArray(raw)) {
+      raw.forEach(addSecret);
+      return;
+    }
+    String(raw)
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .forEach((item) => candidateSecrets.add(item));
+  };
+  addSecret(webhookSecret);
+  addSecret(env.YCLOUD_WEBHOOK_SECRET);
+  addSecret(env.WHATSAPP_VERIFY_TOKEN);
+  addSecret(env.WHATSAPP_WEBHOOK_VERIFY_TOKEN);
+  addSecret(env.WHATSAPP_APP_SECRET);
+  candidateSecrets.add(KNOWN_YCLOUD_WEBHOOK_SECRET);
+  return candidateSecrets;
+}
+
+function describeWebhookSignature(signatureHeader) {
+  if (!signatureHeader) return { format: 'missing', timestamp: null };
+  const headerStr = String(signatureHeader).trim();
+  if (headerStr.includes('t=') && headerStr.includes('s=')) {
+    const parts = headerStr.split(',');
+    const tPart = parts.find((p) => p.trim().startsWith('t='));
+    const timestamp = tPart ? tPart.trim().slice(2) : null;
+    return { format: 'ycloud', timestamp };
+  }
+  if (headerStr.startsWith('sha256=')) {
+    return { format: 'meta_sha256', timestamp: null };
+  }
+  return { format: 'raw_hmac', timestamp: null };
+}
+
+function validateWebhookSignature(rawBody, signatureHeader, webhookSecret, env = process.env) {
   if (!rawBody || !signatureHeader) return false;
 
-  const candidateSecrets = new Set();
-  if (Array.isArray(webhookSecret)) {
-    webhookSecret.forEach(s => s && candidateSecrets.add(String(s).trim()));
-  } else if (webhookSecret) {
-    candidateSecrets.add(String(webhookSecret).trim());
-  }
-  if (process.env.YCLOUD_WEBHOOK_SECRET) candidateSecrets.add(String(process.env.YCLOUD_WEBHOOK_SECRET).trim());
-  if (process.env.WHATSAPP_VERIFY_TOKEN) candidateSecrets.add(String(process.env.WHATSAPP_VERIFY_TOKEN).trim());
-  if (process.env.WHATSAPP_APP_SECRET) candidateSecrets.add(String(process.env.WHATSAPP_APP_SECRET).trim());
-  candidateSecrets.add(KNOWN_YCLOUD_WEBHOOK_SECRET);
-
+  const rawBuffer = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody), 'utf8');
+  const rawString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : String(rawBody);
+  const candidateSecrets = collectCandidateSecrets(webhookSecret, env);
   const headerStr = String(signatureHeader).trim();
 
   // Formato YCloud: YCloud-Signature: t=1654084800,s=8eb70f...
   if (headerStr.includes('t=') && headerStr.includes('s=')) {
     const parts = headerStr.split(',');
-    const tPart = parts.find(p => p.trim().startsWith('t='));
-    const sPart = parts.find(p => p.trim().startsWith('s='));
+    const tPart = parts.find((p) => p.trim().startsWith('t='));
+    const sPart = parts.find((p) => p.trim().startsWith('s='));
 
     if (tPart && sPart) {
-      const timestamp = tPart.trim().split('=')[1];
-      const receivedSignature = sPart.trim().split('=')[1];
-      const signedPayload = `${timestamp}.${rawBody}`;
+      const timestamp = tPart.trim().slice(2);
+      const receivedSignature = sPart.trim().slice(2).toLowerCase();
+      const signedPayload = `${timestamp}.${rawString}`;
       for (const secret of candidateSecrets) {
-        const expectedSignature = crypto.createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex');
+        const expectedSignature = crypto.createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex').toLowerCase();
         if (safeEqual(expectedSignature, receivedSignature)) {
           return true;
         }
@@ -59,18 +89,20 @@ function validateWebhookSignature(rawBody, signatureHeader, webhookSecret) {
 
   // Formato Meta / X-Hub-Signature-256: sha256=...
   if (headerStr.startsWith('sha256=')) {
+    const normalizedHeader = `sha256=${headerStr.slice(7).toLowerCase()}`;
     for (const secret of candidateSecrets) {
-      const expected = `sha256=${crypto.createHmac('sha256', secret).update(rawBody).digest('hex')}`;
-      if (safeEqual(expected, headerStr)) {
+      const expected = `sha256=${crypto.createHmac('sha256', secret).update(rawBuffer).digest('hex').toLowerCase()}`;
+      if (safeEqual(expected, normalizedHeader)) {
         return true;
       }
     }
   }
 
   // Fallback hash directo (sin sha256= ni t=)
+  const lowerHeader = headerStr.toLowerCase();
   for (const secret of candidateSecrets) {
-    const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
-    if (safeEqual(expected, headerStr)) {
+    const expected = crypto.createHmac('sha256', secret).update(rawBuffer).digest('hex').toLowerCase();
+    if (safeEqual(expected, lowerHeader)) {
       return true;
     }
   }
@@ -194,4 +226,4 @@ function createWhatsAppClient({ env = process.env, fetchImpl = global.fetch } = 
   };
 }
 
-module.exports = { configuration, createWhatsAppClient, validateWebhookSignature };
+module.exports = { configuration, createWhatsAppClient, validateWebhookSignature, describeWebhookSignature };
