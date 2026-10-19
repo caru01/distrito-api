@@ -770,8 +770,8 @@ module.exports = function registerCrmApi(app, {
 
       const customer = req.body.customer || {};
       const customerName = cleanText(customer.name || conv.display_name, 120) || 'Cliente WhatsApp';
-      const customerPhone = cleanText(customer.phone || conv.normalized_phone, 40) || '';
-      const customerDeliveryType = String(customer.deliveryType || req.body.deliveryType || 'domicilio').toLowerCase().trim();
+      const rawDt = String(customer.deliveryType || req.body.deliveryType || 'domicilio').toLowerCase().trim();
+      const customerDeliveryType = (rawDt === 'tienda' || rawDt === 'recoger') ? 'recoger' : (rawDt === 'presencial' || rawDt === 'mostrador') ? 'presencial' : 'domicilio';
       const isDelivery = customerDeliveryType === 'domicilio';
       const orderAddress = cleanText(customer.address || conv.address, 255);
       const orderBarrio = cleanText(customer.barrio || conv.barrio, 120);
@@ -825,7 +825,7 @@ module.exports = function registerCrmApi(app, {
         const recentDuplicate = await client.query(`
           SELECT id, created_at, status, total, delivery_fee, cart_json, customer_name, customer_phone, address, barrio, delivery_type, payment_method, change_required
           FROM pedidos_app_orders
-          WHERE crm_contact_id = $1 AND source = 'WhatsApp CRM' AND total = $2
+          WHERE crm_contact_id = $1 AND (source = 'WhatsApp' OR source = 'WhatsApp CRM') AND total = $2
             AND created_at >= NOW() - INTERVAL '60 seconds'
           ORDER BY id DESC LIMIT 1
         `, [conv.contact_id, orderTotal]);
@@ -869,7 +869,7 @@ module.exports = function registerCrmApi(app, {
             (customer_name, customer_phone, address, barrio, delivery_type, payment_method,
              total, cart_json, source, notes, voucher_reference, delivery_fee, change_required,
              delivery_reference, status, crm_contact_id, created_at)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'WhatsApp CRM', $9, $10, $11, $12, $13, $14, $15, NOW())
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'WhatsApp', $9, $10, $11, $12, $13, $14, $15, NOW())
           RETURNING id, created_at, status, total, delivery_fee
         `, [
           customerName,
@@ -891,7 +891,7 @@ module.exports = function registerCrmApi(app, {
         createdOrder = orderRows[0];
 
         const effectiveReserveStock = reserveProductStock || fallbackReserveProductStock;
-        await effectiveReserveStock(client, normalized, createdOrder.id, 'WhatsApp CRM');
+        await effectiveReserveStock(client, normalized, createdOrder.id, 'WhatsApp');
 
         await client.query('SELECT pedidos_app_crm_refresh_contact($1::bigint)', [conv.contact_id]).catch(() => {});
 
@@ -899,7 +899,7 @@ module.exports = function registerCrmApi(app, {
           await deliveryOrderService.appendDomainEvent(client, 'order_created', 'order', createdOrder.id, {
             orderId: createdOrder.id,
             orderStatus: finalStatus,
-            source: 'WhatsApp CRM',
+            source: 'WhatsApp',
             deliveryType: customerDeliveryType,
             total: orderTotal,
             conversationId: conv.id,
@@ -909,7 +909,7 @@ module.exports = function registerCrmApi(app, {
           await appendCrmEvent(client, 'order_created', 'order', createdOrder.id, {
             orderId: createdOrder.id,
             orderStatus: finalStatus,
-            source: 'WhatsApp CRM',
+            source: 'WhatsApp',
             deliveryType: customerDeliveryType,
             total: orderTotal,
           });

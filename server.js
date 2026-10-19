@@ -1036,8 +1036,9 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Nombre, teléfono o contacto del cliente son obligatorios.' });
     }
     client = await pool.connect();
-    const normalized = await normalizeOrderCart(client, cart);
-    const isDelivery = String(customer.deliveryType || '').toLowerCase() === 'domicilio';
+    const rawDeliveryType = String(customer.deliveryType || req.body.delivery_type || req.body.deliveryType || 'domicilio').toLowerCase().trim();
+    const normalizedDeliveryType = (rawDeliveryType === 'tienda' || rawDeliveryType === 'recoger') ? 'recoger' : (rawDeliveryType === 'presencial' || rawDeliveryType === 'mostrador') ? 'presencial' : 'domicilio';
+    const isDelivery = normalizedDeliveryType === 'domicilio';
     const settingsResult = await client.query('SELECT COALESCE(delivery_cost, 0)::integer AS delivery_cost FROM pedidos_app_settings WHERE id = 1');
     const deliveryFee = isDelivery ? Math.max(0, Number(settingsResult.rows[0]?.delivery_cost || 0)) : 0;
     const orderTotal = normalized.total + deliveryFee;
@@ -1189,11 +1190,15 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
         formattedPhone,
         customer.address || '',
         customer.barrio || '',
-        customer.deliveryType,
+        normalizedDeliveryType,
         paymentCheck.method,
         orderTotal,
         JSON.stringify(normalized.cart),
-        req.body.source || customer.source || 'Web',
+        (() => {
+          let src = req.body.source || customer.source || (resolvedCrmContactId ? 'WhatsApp' : 'Web');
+          if (src === 'WhatsApp CRM' || String(src).toLowerCase().includes('whatsapp')) return 'WhatsApp';
+          return src;
+        })(),
         customer.notes || customer.comment || '',
         customer.voucher_reference || '',
         customDate,
@@ -2870,7 +2875,9 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
     }
 
     const deliveryLocation = normalizeDeliveryLocation(customer);
-    const isDelivery = String(customer.deliveryType || '').toLowerCase() === 'domicilio';
+    const rawDt = String(customer.deliveryType || currentOrder.delivery_type || 'domicilio').toLowerCase().trim();
+    const normalizedDeliveryType = (rawDt === 'tienda' || rawDt === 'recoger') ? 'recoger' : (rawDt === 'presencial' || rawDt === 'mostrador') ? 'presencial' : 'domicilio';
+    const isDelivery = normalizedDeliveryType === 'domicilio';
     const settingsResult = await client.query('SELECT COALESCE(delivery_cost, 0)::integer AS delivery_cost FROM pedidos_app_settings WHERE id = 1');
     const deliveryFee = isDelivery ? Math.max(0, Number(settingsResult.rows[0]?.delivery_cost || 0)) : 0;
     const orderTotal = normalized.total + deliveryFee;
@@ -2919,8 +2926,12 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
        WHERE id = $11 RETURNING *`,
       [
         cartStr, orderTotal, customer.name, formattedPhone, customer.address,
-        customer.deliveryType, paymentCheck.method, customer.barrio || '',
-        req.body.source || customer.source || 'Web', customDate, id, customer.notes || '',
+        normalizedDeliveryType, paymentCheck.method, customer.barrio || '',
+        (() => {
+          let src = req.body.source || customer.source || currentOrder.source || (targetCrmContactId ? 'WhatsApp' : 'Web');
+          if (src === 'WhatsApp CRM' || String(src).toLowerCase().includes('whatsapp')) return 'WhatsApp';
+          return src;
+        })(), customDate, id, customer.notes || '',
         customer.voucher_reference || '',
         isDelivery ? String(customer.reference || customer.deliveryReference || '').trim().slice(0, 500) || null : null,
         isDelivery ? deliveryLocation.latitude : null,
