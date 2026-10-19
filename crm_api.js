@@ -352,11 +352,25 @@ module.exports = function registerCrmApi(app, {
       }
       logWebhookPayload(req);
 
-      const registration = await registerWhatsAppWebhook(pool, req.body, effectiveRawBody);
-      const response = res.status(200).json({ status: 'accepted', duplicate: registration.duplicate });
+      const regPromise = registerWhatsAppWebhook(pool, req.body, effectiveRawBody);
+      let timeoutHandle = null;
+      const raceResult = await Promise.race([
+        regPromise.then((reg) => ({ timedOut: false, reg })),
+        new Promise((resolve) => {
+          timeoutHandle = setTimeout(() => resolve({ timedOut: true, reg: null }), 1800);
+          if (typeof timeoutHandle.unref === 'function') timeoutHandle.unref();
+        }),
+      ]);
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+
+      const response = res.status(200).json({
+        status: 'accepted',
+        duplicate: raceResult.reg ? raceResult.reg.duplicate : false,
+      });
       setImmediate(() => {
-        void processStoredWhatsAppWebhook(pool, registration.eventKey)
-          .then((result) => console.log(JSON.stringify({
+        void regPromise
+          .then((registration) => processStoredWhatsAppWebhook(pool, registration.eventKey).then((result) => ({ registration, result })))
+          .then(({ registration, result }) => console.log(JSON.stringify({
             level: 'info', component: 'whatsapp-webhook-worker', event: 'payload_processed',
             request_id: req.requestId || null, event_key: registration.eventKey,
             event_type: registration.eventType || null,
@@ -364,7 +378,7 @@ module.exports = function registerCrmApi(app, {
           })))
           .catch((error) => console.error(JSON.stringify({
             level: 'error', component: 'whatsapp-webhook-worker', event: 'payload_failed',
-            request_id: req.requestId || null, event_key: registration.eventKey,
+            request_id: req.requestId || null,
             code: error.code || 'WHATSAPP_WEBHOOK_PROCESSING_FAILED', message: error.message,
           })));
       });
@@ -588,7 +602,7 @@ module.exports = function registerCrmApi(app, {
           last_message.status AS last_message_status,
           last_message.sent_by AS last_message_sent_by,
           last_message.created_at AS last_message_created_at,
-          COALESCE(last_message.created_at, conversation.last_inbound_at, conversation.last_message_at) AS effective_last_message_at,
+          GREATEST(last_message.created_at, conversation.last_inbound_at, conversation.last_message_at) AS effective_last_message_at,
           COUNT(*) OVER()::int AS filtered_count
         FROM pedidos_app_crm_conversations conversation
         JOIN pedidos_app_crm_contacts contact ON contact.id=conversation.contact_id
@@ -603,7 +617,7 @@ module.exports = function registerCrmApi(app, {
           AND ($1='' OR conversation.status=$1)
           AND (NOT $5::boolean OR conversation.unread_count > 0)
           AND ($6::bigint IS NULL OR conversation.contact_id=$6)
-          AND (NOT $7::boolean OR conversation.last_inbound_at IS NOT NULL OR conversation.unread_count > 0 OR last_message.sent_by IS NOT NULL)
+          AND (NOT $7::boolean OR conversation.last_inbound_at IS NOT NULL OR conversation.unread_count > 0 OR last_message.sent_by IS NOT NULL OR (last_message.message_type IS NOT NULL AND last_message.message_type <> 'template'))
           AND ($2='%%'
             OR contact.display_name ILIKE $2
             OR contact.normalized_phone ILIKE $2
@@ -615,10 +629,10 @@ module.exports = function registerCrmApi(app, {
             ))
         ORDER BY
           CASE
-            WHEN conversation.last_inbound_at IS NOT NULL OR conversation.unread_count > 0 OR last_message.sent_by IS NOT NULL OR last_message.message_id IS NULL THEN 0
+            WHEN conversation.last_inbound_at IS NOT NULL OR conversation.unread_count > 0 OR last_message.sent_by IS NOT NULL OR (last_message.message_type IS NOT NULL AND last_message.message_type <> 'template') OR last_message.message_id IS NULL THEN 0
             ELSE 1
           END ASC,
-          COALESCE(last_message.created_at, conversation.last_inbound_at, conversation.last_message_at) DESC NULLS LAST,
+          GREATEST(last_message.created_at, conversation.last_inbound_at, conversation.last_message_at) DESC NULLS LAST,
           conversation.id DESC
         LIMIT $3 OFFSET $4
       `, [status, `%${search}%`, limit, (page - 1) * limit, unreadOnly, contactId, chatsOnly]);
