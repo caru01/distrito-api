@@ -486,6 +486,82 @@ module.exports = function(app, { pool, authenticateToken }) {
     }
   });
 
+  // ==========================================
+  // PLAN DE PRODUCCIÓN MRP EN BASE DE DATOS
+  // ==========================================
+
+  // Obtener plan de producción activo
+  app.get('/api/pedidos/admin/production/plan', authenticateToken, async (req, res) => {
+    try {
+      const { rows } = await pool.query(`
+        SELECT id, name, is_active, plan_data, notes, created_by, updated_at
+        FROM pedidos_app_production_plans
+        WHERE is_active = TRUE
+        ORDER BY id ASC
+        LIMIT 1
+      `);
+      if (!rows.length) {
+        return res.json({ status: 'ok', plan: {}, name: 'Plan Principal Activo' });
+      }
+      res.json({
+        status: 'ok',
+        plan: rows[0].plan_data || {},
+        name: rows[0].name,
+        updated_at: rows[0].updated_at
+      });
+    } catch (error) {
+      console.error('Error al obtener plan de producción:', error);
+      res.status(500).json({ status: 'error', error: error.message });
+    }
+  });
+
+  // Guardar / Actualizar plan de producción activo
+  app.post('/api/pedidos/admin/production/plan', authenticateToken, async (req, res) => {
+    try {
+      const { plan, name, notes } = req.body;
+      const cleanPlan = (plan && typeof plan === 'object') ? plan : {};
+      const planName = (typeof name === 'string' && name.trim()) ? name.trim() : 'Plan Principal Activo';
+      const createdBy = req.user?.username || 'Admin';
+
+      const { rows } = await pool.query(`
+        INSERT INTO pedidos_app_production_plans (id, name, is_active, plan_data, notes, created_by, updated_at)
+        VALUES (1, $1, TRUE, $2, $3, $4, NOW())
+        ON CONFLICT (id) DO UPDATE SET
+          name = EXCLUDED.name,
+          plan_data = EXCLUDED.plan_data,
+          notes = COALESCE(EXCLUDED.notes, pedidos_app_production_plans.notes),
+          created_by = EXCLUDED.created_by,
+          updated_at = NOW()
+        RETURNING id, name, is_active, plan_data, updated_at
+      `, [planName, JSON.stringify(cleanPlan), notes || null, createdBy]);
+
+      res.json({
+        status: 'ok',
+        plan: rows[0].plan_data || {},
+        name: rows[0].name,
+        updated_at: rows[0].updated_at
+      });
+    } catch (error) {
+      console.error('Error al guardar plan de producción:', error);
+      res.status(500).json({ status: 'error', error: error.message });
+    }
+  });
+
+  // Reiniciar / Limpiar metas del plan de producción activo
+  app.delete('/api/pedidos/admin/production/plan', authenticateToken, async (req, res) => {
+    try {
+      await pool.query(`
+        UPDATE pedidos_app_production_plans
+        SET plan_data = '{}'::jsonb, updated_at = NOW()
+        WHERE id = 1 OR is_active = TRUE
+      `);
+      res.json({ status: 'ok', message: 'Plan de producción reiniciado', plan: {} });
+    } catch (error) {
+      console.error('Error al reiniciar plan de producción:', error);
+      res.status(500).json({ status: 'error', error: error.message });
+    }
+  });
+
 
   // ==========================================
   // 3. RECETAS DE MODIFICADORES / ADICIONES
