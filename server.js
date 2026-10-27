@@ -5258,6 +5258,11 @@ require('./nomina_api')(app, {
   requirePermission,
   logActivity,
 });
+require('./src/ai_api')(app, {
+  pool,
+  authenticateToken,
+  requirePermission,
+});
 
 const deliveryOutbox = createOutboxDispatcher({
   pool,
