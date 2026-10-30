@@ -5203,6 +5203,7 @@ getHorariosStatus = horariosApi.getHorariosStatus;
 
 deliveryRealtime = require('./delivery_api')(app, {
   pool,
+  whatsappClient,
   authenticateToken,
   requirePermission,
   trackingLimiter,

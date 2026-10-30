@@ -240,7 +240,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
   const {
     pool, authenticateToken, requirePermission, trackingLimiter, webpush,
     publicVapidKey, minPasswordLength, authorizeTrackingAccess, trackingSecret,
-    deliveryOrderService, publishEphemeral,
+    deliveryOrderService, publishEphemeral, whatsappClient,
   } = dependencies;
   const realtime = createRealtimeHub();
   const deliveryLocationService = createDeliveryLocationService({ pool });
@@ -1034,7 +1034,96 @@ module.exports = function registerDeliveryApi(app, dependencies) {
       });
       sendPush({ userId, title: 'Nuevo pedido asignado', body: `Tienes asignado el pedido #${orderId}`, url: `/pedidos/${orderId}` })
         .catch((error) => console.error('Error enviando push de asignación:', error));
-      res.json({ status: 'ok', order: formatOrder(result.order), replayed: result.replayed });
+
+      // Notificación automática por WhatsApp al domiciliario con los datos de la entrega
+      let whatsappSent = false;
+      let whatsappError = null;
+      let whatsappUrl = null;
+      let driverMessage = '';
+      let driverPhone = '';
+
+      try {
+        const { rows: orderRows } = await pool.query(`
+          SELECT o.*, u.name AS driver_first_name, u.last_name AS driver_last_name, u.phone AS driver_phone
+          FROM pedidos_app_orders o
+          LEFT JOIN pedidos_app_users u ON u.id = o.delivery_user_id
+          WHERE o.id = $1
+        `, [orderId]);
+        const fullOrder = orderRows[0];
+
+        if (fullOrder) {
+          driverPhone = fullOrder.driver_phone ? String(fullOrder.driver_phone).replace(/\D/g, '') : '';
+          if (driverPhone.length === 10) driverPhone = '57' + driverPhone;
+
+          let cartItems = [];
+          if (Array.isArray(fullOrder.cart_json)) cartItems = fullOrder.cart_json;
+          else if (typeof fullOrder.cart_json === 'string') {
+            try { cartItems = JSON.parse(fullOrder.cart_json || '[]'); } catch {}
+          }
+          const itemsList = cartItems.map(item => {
+            const qty = item.quantity || item.qty || 1;
+            const name = item.title || item.name || 'Producto';
+            const notes = item.notes ? `\n   ↳ _Nota: ${item.notes}_` : '';
+            return ` • *${qty}x* ${name}${notes}`;
+          }).join('\n');
+
+          const orderNum = String(fullOrder.id).padStart(4, '0');
+          const totalFmt = '$' + Number(fullOrder.total || 0).toLocaleString('es-CO');
+          const changeInfo = fullOrder.change_required ? `\n🔄 *Cambio para:* $${Number(fullOrder.change_required).toLocaleString('es-CO')}` : '';
+          const detailInfo = [fullOrder.delivery_apartment ? `Apto: ${fullOrder.delivery_apartment}` : '', fullOrder.delivery_tower ? `Torre: ${fullOrder.delivery_tower}` : '', fullOrder.delivery_floor ? `Piso: ${fullOrder.delivery_floor}` : ''].filter(Boolean).join(' · ');
+
+          const addressStr = `${fullOrder.address || ''}${fullOrder.barrio ? `, ${fullOrder.barrio}` : ''}`;
+          const mapsUrl = (fullOrder.delivery_latitude && fullOrder.delivery_longitude)
+            ? `https://www.google.com/maps/search/?api=1&query=${fullOrder.delivery_latitude},${fullOrder.delivery_longitude}`
+            : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addressStr + ', Valledupar')}`;
+
+          driverMessage = `🛵 *NUEVO DOMICILIO ASIGNADO*
+🏠 *Distric House*
+━━━━━━━━━━━━━━━━━━
+📋 *Pedido:* #${orderNum}
+👤 *Cliente:* ${fullOrder.customer_name || 'Cliente'}
+📱 *Teléfono:* ${fullOrder.customer_phone || 'No registrado'}
+📍 *Dirección:* ${addressStr}
+${detailInfo ? `🏢 *Detalle:* ${detailInfo}\n` : ''}🗺️ *Google Maps:*
+${mapsUrl}
+
+🍔 *PRODUCTOS A ENTREGAR:*
+${itemsList || ' • Ver en factura física'}
+
+💰 *DATOS DE COBRO:*
+💵 *Total a cobrar:* ${totalFmt}
+💳 *Método de pago:* ${fullOrder.payment_method || 'Efectivo'}${changeInfo}
+${fullOrder.notes ? `📝 *Observaciones:* ${fullOrder.notes}\n` : ''}━━━━━━━━━━━━━━━━━━
+¡Conduce con precaución! 🛵💨`;
+
+          if (driverPhone) {
+            whatsappUrl = `https://api.whatsapp.com/send/?phone=${driverPhone}&text=${encodeURIComponent(driverMessage)}`;
+            if (whatsappClient) {
+              try {
+                await whatsappClient.sendText({ to: driverPhone, body: driverMessage });
+                whatsappSent = true;
+                console.log(`[delivery] Mensaje de entrega #${orderId} enviado automáticamente al WhatsApp de domiciliario (${driverPhone})`);
+              } catch (waErr) {
+                whatsappError = waErr.message;
+                console.error(`[delivery] Error enviando WhatsApp al domiciliario (${driverPhone}):`, waErr.message);
+              }
+            }
+          }
+        }
+      } catch (genErr) {
+        console.error('[delivery] Error preparando mensaje de WhatsApp para el domiciliario:', genErr);
+      }
+
+      res.json({
+        status: 'ok',
+        order: formatOrder(result.order),
+        replayed: result.replayed,
+        whatsapp_sent: whatsappSent,
+        whatsapp_error: whatsappError,
+        whatsapp_url: whatsappUrl,
+        driver_message: driverMessage,
+        driver_phone: driverPhone,
+      });
     } catch (error) {
       sendDomainError(res, error, 'No fue posible asignar el pedido');
     }
