@@ -1373,7 +1373,7 @@ app.get('/api/pedidos/rastrear/:id', trackingLimiter, async (req, res) => {
         delivered_at: order.delivered_at,
         delivery_duration_seconds: order.delivery_duration_seconds == null ? null : Number(order.delivery_duration_seconds),
         store: {
-          name: order.restaurant_name || 'Distrito BG',
+          name: order.restaurant_name || 'Distric House',
           address: order.store_address || 'Valledupar, Colombia',
           latitude: Number(order.store_latitude ?? 10.4631),
           longitude: Number(order.store_longitude ?? -73.2532),
@@ -1486,7 +1486,7 @@ app.get('/api/pedidos/track/:id', trackingLimiter, async (req, res) => {
         delivery_completed_at: order.delivery_completed_at,
         delivery_duration_seconds: order.delivery_duration_seconds == null ? null : Number(order.delivery_duration_seconds),
         store: {
-          name: order.restaurant_name || 'Distrito BG',
+          name: order.restaurant_name || 'Distric House',
           address: order.store_address || 'Valledupar, Colombia',
           latitude: Number(order.store_latitude ?? 10.4631),
           longitude: Number(order.store_longitude ?? -73.2532),
@@ -1676,12 +1676,12 @@ app.post('/api/pedidos/admin/forgot-password', authLimiter, async (req, res) => 
       : `https://admin.distritobg.app/admin/reset-password?token=${resetToken}`;
 
     const mailOptions = {
-      from: '"Soporte Distrito BG" <' + (process.env.EMAIL_USER || 'soporte@distritobg.com') + '>',
+      from: '"Soporte Distric House" <' + (process.env.EMAIL_USER || 'soporte@distritobg.com') + '>',
       to: email,
-      subject: 'Recuperación de Contraseña - Distrito BG',
+      subject: 'Recuperación de Contraseña - Distric House',
       html: `
         <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
-          <h2 style="color: #D4A017;">Distrito BG</h2>
+          <h2 style="color: #D4A017;">Distric House</h2>
           <p>Hola <b>${user.username}</b>,</p>
           <p>Hemos recibido una solicitud para restablecer tu contraseña. Si fuiste tú, haz clic en el siguiente enlace (válido por 1 hora):</p>
           <a href="${resetLink}" style="display: inline-block; padding: 10px 20px; background-color: #D4A017; color: #000; text-decoration: none; border-radius: 5px; font-weight: bold;">Restablecer mi contraseña</a>

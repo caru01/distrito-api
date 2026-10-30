@@ -115,7 +115,7 @@ function formatOrder(row, options = {}) {
     driverLocationAt: row.driver_location_at || null,
     arrival,
     store: {
-      name: row.store_name || 'Distrito BG',
+      name: row.store_name || 'Distric House',
       address: row.store_address || 'Valledupar, Colombia',
       latitude: row.store_latitude == null ? null : Number(row.store_latitude),
       longitude: row.store_longitude == null ? null : Number(row.store_longitude),
@@ -1013,7 +1013,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
       drivers: liveDrivers,
       orders: orders.rows.map(formatOrder),
       store: {
-        name: restaurant.restaurant_name || 'Distrito BG',
+        name: restaurant.restaurant_name || 'Distric House',
         address: restaurant.address || 'Valledupar, Colombia',
         latitude: Number(restaurant.store_latitude ?? 10.4631),
         longitude: Number(restaurant.store_longitude ?? -73.2532),

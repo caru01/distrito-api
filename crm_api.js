@@ -116,7 +116,7 @@ function formatCrmOrderWhatsAppSummary({
   order,
   items = [],
   customer = {},
-  restaurantName = 'Distrito BG',
+  restaurantName = 'Distric House',
 }) {
   const isDelivery = String(order.delivery_type || customer.deliveryType || '').toLowerCase() === 'domicilio';
   const orderNumber = String(order.id || 0).padStart(4, '0');
@@ -982,7 +982,7 @@ module.exports = function registerCrmApi(app, {
           },
           items: normalized.cart,
           customer: { name: customerName, deliveryType: customerDeliveryType },
-          restaurantName: 'Distrito BG',
+          restaurantName: 'Distric House',
         });
 
         try {

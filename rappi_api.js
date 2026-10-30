@@ -374,7 +374,7 @@ module.exports = function(app, { pool, authenticateToken, deliveryOrderService }
         console.warn('[Rappi Webhook] Webhook recibido pero la integración de Rappi está Desactivada');
         return res.status(403).json({
           status: 'error',
-          error: 'Integración de Rappi deshabilitada temporalmente en Distrito BG'
+          error: 'Integración de Rappi deshabilitada temporalmente en Distric House'
         });
       }
 
