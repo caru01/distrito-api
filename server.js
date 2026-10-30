@@ -83,6 +83,7 @@ const configuredOrigins = (process.env.CORS_ORIGINS || '')
   .filter(Boolean);
 const allowedOrigins = [
   ...configuredOrigins,
+  /^https?:\/\/(?:[a-zA-Z0-9-]+\.)*distritobg\.app(?::\d+)?$/,
   'https://distritobg.app',          // Web principal
   'https://admin.distritobg.app',    // Panel admin
   'https://delivery.distritobg.app', // PWA domiciliarios
@@ -1036,6 +1037,7 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Nombre, teléfono o contacto del cliente son obligatorios.' });
     }
     client = await pool.connect();
+    const normalized = await normalizeOrderCart(client, cart);
     const rawDeliveryType = String(customer.deliveryType || req.body.delivery_type || req.body.deliveryType || 'domicilio').toLowerCase().trim();
     const normalizedDeliveryType = (rawDeliveryType === 'tienda' || rawDeliveryType === 'recoger') ? 'recoger' : (rawDeliveryType === 'presencial' || rawDeliveryType === 'mostrador') ? 'presencial' : 'domicilio';
     const isDelivery = normalizedDeliveryType === 'domicilio';
