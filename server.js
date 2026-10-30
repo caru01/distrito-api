@@ -2580,6 +2580,8 @@ app.get('/api/pedidos/admin/orders', authenticateToken, async (req, res) => {
               crm_contact_id,
               (SELECT bsuid FROM pedidos_app_crm_contacts WHERE id = pedidos_app_orders.crm_contact_id) AS crm_bsuid,
               (SELECT username FROM pedidos_app_crm_contacts WHERE id = pedidos_app_orders.crm_contact_id) AS crm_username,
+             (SELECT TRIM(CONCAT(name, ' ', last_name)) FROM pedidos_app_users WHERE id = pedidos_app_orders.delivery_user_id) AS delivery_driver_name,
+             (SELECT phone FROM pedidos_app_users WHERE id = pedidos_app_orders.delivery_user_id) AS delivery_driver_phone,
              (SELECT name FROM pedidos_app_delivery_companies company
               WHERE company.id = external_delivery_company_id) AS external_company_name,
              (delivery_fee - external_delivery_cost) AS logistics_margin
@@ -2718,16 +2720,7 @@ app.put('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => 
         
         const isAdmin = ['Admin', 'Administrador', 'Super Administrador', 'super_admin'].includes(req.user?.role || req.user?.role_name || '');
 
-        if (ownDelivery && ['En camino', 'Entregado'].includes(status) && !isAdmin) {
-          await client.query('ROLLBACK');
-          return res.status(409).json({
-            status: 'error',
-            code: 'DELIVERY_DOMAIN_ACTION_REQUIRED',
-            error: status === 'En camino'
-              ? 'El domiciliario debe confirmar que inició la entrega desde Delivery.'
-              : 'La entrega debe finalizarse desde Delivery con GPS o con una excepción de geocerca autorizada.',
-          });
-        }
+// Admin / manual dispatch: delivery app restriction bypassed for internal drivers
         if (req.body.version != null && Number(req.body.version) !== Number(currentOrder.version || 0)) {
           await client.query('ROLLBACK');
           return res.status(409).json({
@@ -2757,13 +2750,16 @@ app.put('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => 
           ? 'Cancelado'
           : willBeFinal
             ? 'Entregado'
-            : ['Cancelado', 'Entregado'].includes(currentOrder.delivery_status) ? 'Pendiente' : null;
+            : status === 'En camino'
+              ? 'En camino'
+              : ['Cancelado', 'Entregado'].includes(currentOrder.delivery_status) ? 'Pendiente' : null;
         const { rows } = await client.query(
           `UPDATE pedidos_app_orders
            SET status = $1,
                updated_at = NOW(),
                completed_at = CASE WHEN $2 THEN COALESCE(completed_at, NOW()) ELSE completed_at END,
                delivered_at = CASE WHEN $2 THEN COALESCE(delivered_at, NOW()) ELSE NULL END,
+               on_the_way_at = CASE WHEN $1 = 'En camino' THEN COALESCE(on_the_way_at, NOW()) ELSE on_the_way_at END,
                delivery_status = COALESCE($4::varchar, delivery_status),
                delivery_completed_at = CASE WHEN $4::varchar = 'Entregado' THEN COALESCE(delivery_completed_at, NOW()) ELSE delivery_completed_at END,
                version = version + 1

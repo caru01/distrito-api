@@ -948,8 +948,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
                profile.shift_active, profile.shift_started_at, profile.tracking_mode,
                profile.tracking_device_id, profile.gps_status,
                CASE
-                 WHEN profile.shift_active
-                   AND profile.last_seen_at >= NOW() - make_interval(secs => COALESCE(settings.presence_timeout_seconds,90))
+                 WHEN u.status = 'Activo'
                    THEN CASE WHEN COALESCE(active_order.active_order_count,0)>0 THEN 'Ocupado' ELSE 'Libre' END
                  ELSE 'Desconectado'
                END AS live_status,
