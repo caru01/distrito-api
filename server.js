@@ -2755,11 +2755,11 @@ app.put('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => 
               : ['Cancelado', 'Entregado'].includes(currentOrder.delivery_status) ? 'Pendiente' : null;
         const { rows } = await client.query(
           `UPDATE pedidos_app_orders
-           SET status = $1,
+           SET status = $1::varchar,
                updated_at = NOW(),
-               completed_at = CASE WHEN $2 THEN COALESCE(completed_at, NOW()) ELSE completed_at END,
-               delivered_at = CASE WHEN $2 THEN COALESCE(delivered_at, NOW()) ELSE NULL END,
-               on_the_way_at = CASE WHEN $1 = 'En camino' THEN COALESCE(on_the_way_at, NOW()) ELSE on_the_way_at END,
+               completed_at = CASE WHEN $2::boolean THEN COALESCE(completed_at, NOW()) ELSE completed_at END,
+               delivered_at = CASE WHEN $2::boolean THEN COALESCE(delivered_at, NOW()) ELSE NULL END,
+               on_the_way_at = CASE WHEN $1::varchar = 'En camino' THEN COALESCE(on_the_way_at, NOW()) ELSE on_the_way_at END,
                delivery_status = COALESCE($4::varchar, delivery_status),
                delivery_completed_at = CASE WHEN $4::varchar = 'Entregado' THEN COALESCE(delivery_completed_at, NOW()) ELSE delivery_completed_at END,
                version = version + 1
