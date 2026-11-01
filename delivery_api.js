@@ -1165,7 +1165,8 @@ module.exports = function registerDeliveryApi(app, dependencies) {
       const fullOrder = rows[0];
       if (!fullOrder) return res.status(404).json({ error: 'Pedido no encontrado' });
 
-      let driverPhone = fullOrder.driver_phone ? String(fullOrder.driver_phone).replace(/\D/g, '') : '';
+      let driverPhone = fullOrder.driver_phone || fullOrder.external_driver_phone || '';
+      driverPhone = String(driverPhone).replace(/\D/g, '');
       if (driverPhone.length === 10) driverPhone = '57' + driverPhone;
       if (!driverPhone) {
         return res.status(400).json({ error: 'El domiciliario asignado no tiene teléfono registrado.' });

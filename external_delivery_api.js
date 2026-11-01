@@ -64,8 +64,65 @@ async function recordEvent(client, order, eventType, actor, notes, metadata = {}
   })]);
 }
 
+async function checkDriverWhatsAppWindow(pool, rawPhone) {
+  if (!rawPhone) return false;
+  const cleanPhone = String(rawPhone).replace(/\D/g, '').slice(-10);
+  if (!cleanPhone) return false;
+  try {
+    const { rows } = await pool.query(`
+      SELECT (c.last_inbound_at IS NOT NULL AND c.last_inbound_at >= NOW() - INTERVAL '24 hours') AS is_window_open
+      FROM pedidos_app_crm_conversations c
+      JOIN pedidos_app_crm_contacts ct ON ct.id = c.contact_id
+      WHERE ct.normalized_phone LIKE '%' || $1
+      ORDER BY c.last_inbound_at DESC NULLS LAST
+      LIMIT 1
+    `, [cleanPhone]);
+    return Boolean(rows[0]?.is_window_open);
+  } catch (err) {
+    console.error('[external_delivery] Error checking WhatsApp window:', err);
+    return false;
+  }
+}
+
+function buildDriverDeliveryMessage(fullOrder) {
+  let cartItems = [];
+  if (Array.isArray(fullOrder.cart_json)) cartItems = fullOrder.cart_json;
+  else if (typeof fullOrder.cart_json === 'string') {
+    try { cartItems = JSON.parse(fullOrder.cart_json || '[]'); } catch {}
+  }
+  const itemsList = cartItems.map(item => {
+    const qty = item.quantity || item.qty || 1;
+    const name = item.title || item.name || 'Producto';
+    const notes = item.notes ? `\n   ↳ _Nota: ${item.notes}_` : '';
+    return ` • *${qty}x* ${name}${notes}`;
+  }).join('\n');
+
+  const orderNum = String(fullOrder.id).padStart(4, '0');
+  const totalFmt = '$' + Number(fullOrder.total || 0).toLocaleString('es-CO');
+  const changeInfo = fullOrder.change_required ? `\n🔄 *Cambio para:* $${Number(fullOrder.change_required).toLocaleString('es-CO')}` : '';
+  const detailInfo = [fullOrder.delivery_apartment ? `Apto: ${fullOrder.delivery_apartment}` : '', fullOrder.delivery_tower ? `Torre: ${fullOrder.delivery_tower}` : '', fullOrder.delivery_floor ? `Piso: ${fullOrder.delivery_floor}` : ''].filter(Boolean).join(' · ');
+  const addressStr = `${fullOrder.address || ''}${fullOrder.barrio ? `, ${fullOrder.barrio}` : ''}`;
+
+  return `🛵 *NUEVO DOMICILIO ASIGNADO*
+🏠 *Distric House*
+━━━━━━━━━━━━━━━━━━
+📋 *Pedido:* #${orderNum}
+👤 *Cliente:* ${fullOrder.customer_name || 'Cliente'}
+📱 *Teléfono:* ${fullOrder.customer_phone || 'No registrado'}
+📍 *Dirección:* ${addressStr}
+${detailInfo ? `🏢 *Detalle:* ${detailInfo}\n` : ''}
+🍔 *PRODUCTOS A ENTREGAR:*
+${itemsList || ' • Ver en factura física'}
+
+💰 *DATOS DE COBRO:*
+💵 *Total a cobrar:* ${totalFmt}
+💳 *Método de pago:* ${fullOrder.payment_method || 'Efectivo'}${changeInfo}
+${fullOrder.notes ? `📝 *Observaciones:* ${fullOrder.notes}\n` : ''}━━━━━━━━━━━━━━━━━━
+¡Conduce con precaución! 🛵💨`;
+}
+
 module.exports = function registerExternalDeliveryApi(app, dependencies) {
-  const { pool, authenticateToken, requirePermission } = dependencies;
+  const { pool, whatsappClient, authenticateToken, requirePermission } = dependencies;
 
   const requireAnyPermission = (...perms) => async (req, res, next) => {
     if (!req.user) return res.status(401).json({ error: 'Acceso denegado' });
@@ -602,10 +659,10 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
         await client.query('ROLLBACK');
         return res.status(404).json({ error: 'Pedido de domicilio no encontrado' });
       }
-      if (!['Listo', 'Asignado externo'].includes(current.status)
-          || !['Pendiente', 'Asignado externo'].includes(current.delivery_status)) {
+      if (!['Listo', 'Asignado externo', 'En camino'].includes(current.status)
+          || !['Pendiente', 'Asignado externo', 'En camino'].includes(current.delivery_status)) {
         await client.query('ROLLBACK');
-        return res.status(409).json({ error: 'El pedido ya salió del restaurante y no puede reasignarse' });
+        return res.status(409).json({ error: 'El pedido no puede reasignarse en su estado actual' });
       }
       previousUserId = current.delivery_user_id;
       const providerType = companyResult.rows[0].integration_type === 'api' ? 'external_api' : 'external_manual';
@@ -619,17 +676,17 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
       }
       const updated = await client.query(`
         UPDATE pedidos_app_orders SET
-          status='Asignado externo', delivery_status='Asignado externo',
+          status='En camino', delivery_status='En camino',
           delivery_provider_type=$1, delivery_user_id=$12,
           external_delivery_company_id=$2, external_driver_name=$3,
           external_driver_phone=$4, external_vehicle_id=$5,
           external_delivery_cost=$6, external_delivery_notes=$7,
           external_eta_minutes=$8, external_provider_reference=$9,
           external_driver_id=$10,
-          external_assigned_at=NOW(), external_handed_off_at=NULL,
+          external_assigned_at=NOW(), external_handed_off_at=NOW(),
+          delivery_accepted_at=NOW(), picked_up_at=NOW(), on_the_way_at=NOW(),
           external_delivery_confirmed_at=NULL, external_delivery_confirmed_by=NULL,
           external_delivery_confirmed_by_name=NULL, external_delivery_confirmation_notes=NULL,
-          delivery_accepted_at=NULL, picked_up_at=NULL, on_the_way_at=NULL,
           version=version+1, updated_at=NOW()
         WHERE id=$11 RETURNING *
       `, [
@@ -672,7 +729,38 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
     } finally {
       client.release();
     }
-    res.json({ status: 'ok', order });
+
+    // Notificación automática por WhatsApp al mensajero de la empresa externa
+    let whatsappSent = false;
+    let whatsappError = null;
+    let driverPhone = order?.external_driver_phone ? String(order.external_driver_phone).replace(/\D/g, '') : '';
+    if (driverPhone.length === 10) driverPhone = '57' + driverPhone;
+
+    const driverMessage = order ? buildDriverDeliveryMessage(order) : '';
+    const isWindowOpen = await checkDriverWhatsAppWindow(pool, driverPhone);
+    const whatsappUrl = driverPhone ? `https://api.whatsapp.com/send/?phone=${driverPhone}&text=${encodeURIComponent(driverMessage)}` : null;
+
+    if (driverPhone && isWindowOpen && whatsappClient) {
+      try {
+        await whatsappClient.sendText({ to: driverPhone, body: driverMessage });
+        whatsappSent = true;
+        console.log(`[external_delivery] Mensaje de entrega #${orderId} enviado por WhatsApp a mensajero externo (${driverPhone})`);
+      } catch (waErr) {
+        whatsappError = waErr.message;
+        console.error(`[external_delivery] Error enviando WhatsApp al mensajero (${driverPhone}):`, waErr.message);
+      }
+    }
+
+    res.json({
+      status: 'ok',
+      order,
+      whatsapp_sent: whatsappSent,
+      whatsapp_error: whatsappError,
+      window_open: isWindowOpen,
+      whatsapp_url: whatsappUrl,
+      message: whatsappSent ? 'Mensaje enviado al domiciliario' : (isWindowOpen ? 'Error al enviar por WhatsApp' : 'Ventana de 24h inactiva'),
+      driver_phone: driverPhone,
+    });
   });
 
   app.post('/api/pedidos/admin/delivery/orders/:id/external-handoff', ...canManage, async (req, res) => {

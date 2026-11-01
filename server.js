@@ -5254,6 +5254,7 @@ deliveryRealtime = require('./delivery_api')(app, {
 });
 require('./external_delivery_api')(app, {
   pool,
+  whatsappClient,
   authenticateToken,
   requirePermission,
 });
