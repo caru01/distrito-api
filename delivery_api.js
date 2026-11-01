@@ -236,6 +236,26 @@ function createRealtimeHub() {
   return { add, publish, onlineUserIds, stats };
 }
 
+async function checkDriverWhatsAppWindow(pool, rawPhone) {
+  if (!rawPhone) return false;
+  const cleanPhone = String(rawPhone).replace(/\D/g, '').slice(-10);
+  if (!cleanPhone) return false;
+  try {
+    const { rows } = await pool.query(`
+      SELECT (c.last_inbound_at IS NOT NULL AND c.last_inbound_at >= NOW() - INTERVAL '24 hours') AS is_window_open
+      FROM pedidos_app_crm_conversations c
+      JOIN pedidos_app_crm_contacts ct ON ct.id = c.contact_id
+      WHERE ct.normalized_phone LIKE '%' || $1
+      ORDER BY c.last_inbound_at DESC NULLS LAST
+      LIMIT 1
+    `, [cleanPhone]);
+    return Boolean(rows[0]?.is_window_open);
+  } catch (err) {
+    console.error('[delivery] Error checking WhatsApp window:', err);
+    return false;
+  }
+}
+
 function buildDriverDeliveryMessage(fullOrder) {
   let cartItems = [];
   if (Array.isArray(fullOrder.cart_json)) cartItems = fullOrder.cart_json;
@@ -1092,7 +1112,10 @@ module.exports = function registerDeliveryApi(app, dependencies) {
 
           const driverMessage = buildDriverDeliveryMessage(fullOrder);
 
-          if (driverPhone && whatsappClient) {
+          const isWindowOpen = await checkDriverWhatsAppWindow(pool, driverPhone);
+          const whatsappUrl = `https://api.whatsapp.com/send/?phone=${driverPhone}&text=${encodeURIComponent(driverMessage)}`;
+
+          if (isWindowOpen && whatsappClient) {
             try {
               await whatsappClient.sendText({ to: driverPhone, body: driverMessage });
               whatsappSent = true;
@@ -1107,13 +1130,18 @@ module.exports = function registerDeliveryApi(app, dependencies) {
         console.error('[delivery] Error preparando mensaje de WhatsApp para el domiciliario:', genErr);
       }
 
+      const driverMessage = fullOrder ? buildDriverDeliveryMessage(fullOrder) : '';
+      const whatsappUrl = driverPhone ? `https://api.whatsapp.com/send/?phone=${driverPhone}&text=${encodeURIComponent(driverMessage)}` : null;
+
       res.json({
         status: 'ok',
         order: formatOrder(result.order),
         replayed: result.replayed,
         whatsapp_sent: whatsappSent,
         whatsapp_error: whatsappError,
-        message: 'Mensaje enviado al domiciliario',
+        window_open: isWindowOpen,
+        whatsapp_url: whatsappUrl,
+        message: whatsappSent ? 'Mensaje enviado al domiciliario' : (isWindowOpen ? 'Error al enviar por WhatsApp' : 'Ventana de 24h inactiva'),
         driver_phone: driverPhone,
       });
     } catch (error) {
@@ -1144,11 +1172,25 @@ module.exports = function registerDeliveryApi(app, dependencies) {
       }
 
       const driverMessage = buildDriverDeliveryMessage(fullOrder);
-      if (whatsappClient) {
+      const isWindowOpen = await checkDriverWhatsAppWindow(pool, driverPhone);
+      const whatsappUrl = `https://api.whatsapp.com/send/?phone=${driverPhone}&text=${encodeURIComponent(driverMessage)}`;
+      let whatsappSent = false;
+
+      if (isWindowOpen && whatsappClient) {
         await whatsappClient.sendText({ to: driverPhone, body: driverMessage });
+        whatsappSent = true;
       }
 
-      res.json({ status: 'ok', sent_to: driverPhone, message: 'Mensaje enviado al domiciliario' });
+      res.json({
+        status: 'ok',
+        sent_to: driverPhone,
+        whatsapp_sent: whatsappSent,
+        window_open: isWindowOpen,
+        whatsapp_url: whatsappUrl,
+        message: whatsappSent
+          ? 'Mensaje enviado al domiciliario'
+          : 'Ventana de 24h de WhatsApp inactiva (el domiciliario debe escribir "Hola" al restaurante)'
+      });
     } catch (err) {
       console.error('[delivery] Error notificando al domiciliario:', err);
       res.status(500).json({ error: err.message || 'No fue posible enviar el mensaje al domiciliario' });
