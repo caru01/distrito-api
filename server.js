@@ -1757,6 +1757,18 @@ app.post('/api/pedidos/admin/login', authLimiter, async (req, res) => {
       FROM pedidos_app_users u
       LEFT JOIN pedidos_app_roles r ON u.role_id = r.id
       WHERE u.username = $1 OR u.email = $1 OR u.document = $1
+      ORDER BY
+        CASE
+          WHEN LOWER(u.username) = LOWER($1) THEN 1
+          WHEN LOWER(u.email) = LOWER($1) THEN 2
+          WHEN u.document = $1 THEN 3
+          ELSE 4
+        END ASC,
+        CASE
+          WHEN r.name IN ('Super Administrador', 'Administrador', 'Admin', 'Gerente') THEN 1
+          ELSE 2
+        END ASC,
+        u.id ASC
     `, [username]);
 
     if (rows.length === 0) {
@@ -1764,26 +1776,43 @@ app.post('/api/pedidos/admin/login', authLimiter, async (req, res) => {
       return res.status(401).json({ error: 'Usuario o contraseña incorrecta' });
     }
 
-    const user = rows[0];
+    let user = null;
+    let anyBlocked = false;
+    let anyInactive = false;
 
-    if (user.status !== 'Activo') {
-      return res.status(403).json({ error: 'La cuenta está desactivada' });
+    // Buscar entre los usuarios coincidentes el que coincida con la contraseña ingresada
+    for (const candidate of rows) {
+      if (candidate.status !== 'Activo') {
+        anyInactive = true;
+        continue;
+      }
+      if (candidate.blocked_until && new Date(candidate.blocked_until) > new Date()) {
+        anyBlocked = true;
+        continue;
+      }
+      const valid = await bcrypt.compare(password, candidate.password_hash);
+      if (valid) {
+        user = candidate;
+        break;
+      }
     }
 
-    if (user.blocked_until && new Date(user.blocked_until) > new Date()) {
-      return res.status(403).json({ error: 'Cuenta bloqueada temporalmente por demasiados intentos. Intente más tarde.' });
-    }
+    if (!user) {
+      if (anyBlocked) {
+        return res.status(403).json({ error: 'Cuenta bloqueada temporalmente por demasiados intentos. Intente más tarde.' });
+      }
+      if (anyInactive && rows.every(r => r.status !== 'Activo')) {
+        return res.status(403).json({ error: 'La cuenta está desactivada' });
+      }
 
-    const validPassword = await bcrypt.compare(password, user.password_hash);
-
-    if (!validPassword) {
-      const newFails = (user.failed_attempts || 0) + 1;
+      const targetUser = rows[0];
+      const newFails = (targetUser.failed_attempts || 0) + 1;
       let blockedUntil = null;
       if (newFails >= 5) {
         blockedUntil = new Date(Date.now() + 15 * 60000); // 15 mins
       }
-      await pool.query("UPDATE pedidos_app_users SET failed_attempts = $1, blocked_until = $2 WHERE id = $3", [newFails, blockedUntil, user.id]);
-      await pool.query("INSERT INTO pedidos_app_audit_logs (user_id, username_attempted, action, ip, browser, os) VALUES ($1, $2, 'Intento Fallido (Clave incorrecta)', $3, $4, $5)", [user.id, username, ip, browser, os]);
+      await pool.query("UPDATE pedidos_app_users SET failed_attempts = $1, blocked_until = $2 WHERE id = $3", [newFails, blockedUntil, targetUser.id]);
+      await pool.query("INSERT INTO pedidos_app_audit_logs (user_id, username_attempted, action, ip, browser, os) VALUES ($1, $2, 'Intento Fallido (Clave incorrecta)', $3, $4, $5)", [targetUser.id, username, ip, browser, os]);
 
       if (newFails >= 5) {
          return res.status(403).json({ error: 'Demasiados intentos fallidos. Cuenta bloqueada por 15 minutos.' });
