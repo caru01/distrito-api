@@ -289,7 +289,7 @@ ${itemsList || ' • Ver en factura física'}
 💰 *DATOS DE COBRO:*
 💵 *Total a cobrar:* ${totalFmt}
 💳 *Método de pago:* ${fullOrder.payment_method || 'Efectivo'}${changeInfo}
-${fullOrder.notes ? `📝 *Observaciones:* ${fullOrder.notes}\n` : ''}━━━━━━━━━━━━━━━━━━
+${fullOrder.notes ? `📝 *Observaciones:* ${fullOrder.notes}\n` : ''}${fullOrder.external_delivery_notes ? `📌 *Observación logística:* ${fullOrder.external_delivery_notes}\n` : ''}━━━━━━━━━━━━━━━━━━
 ¡Conduce con precaución! 🛵💨`;
 }
 
@@ -1081,6 +1081,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
   app.post('/api/pedidos/admin/delivery/orders/:id/assign', authenticateToken, requirePermission('Domicilios', 'asignar'), async (req, res) => {
     const orderId = Number(req.params.id);
     const userId = Number(req.body.userId);
+    const notes = typeof req.body.notes === 'string' ? req.body.notes.trim() : null;
     if (!Number.isInteger(orderId) || !Number.isInteger(userId)) {
       return res.status(400).json({ error: 'Selecciona un domiciliario activo para asignar el pedido' });
     }
@@ -1088,6 +1089,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
       const result = await deliveryOrderService.reserveOrder({
         orderId, driverId: userId, actor: req.user,
         idempotencyKey: req.headers['idempotency-key'] || req.body.operationId,
+        notes,
       });
       sendPush({ userId, title: 'Nuevo pedido asignado', body: `Tienes asignado el pedido #${orderId}`, url: `/pedidos/${orderId}` })
         .catch((error) => console.error('Error enviando push de asignación:', error));
@@ -1096,6 +1098,9 @@ module.exports = function registerDeliveryApi(app, dependencies) {
       let whatsappSent = false;
       let whatsappError = null;
       let driverPhone = '';
+      let isWindowOpen = false;
+      let fullOrder = null;
+      let whatsappUrl = null;
 
       try {
         const { rows: orderRows } = await pool.query(`
@@ -1104,7 +1109,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
           LEFT JOIN pedidos_app_users u ON u.id = o.delivery_user_id
           WHERE o.id = $1
         `, [orderId]);
-        const fullOrder = orderRows[0];
+        fullOrder = orderRows[0];
 
         if (fullOrder) {
           driverPhone = fullOrder.driver_phone ? String(fullOrder.driver_phone).replace(/\D/g, '') : '';
@@ -1112,8 +1117,8 @@ module.exports = function registerDeliveryApi(app, dependencies) {
 
           const driverMessage = buildDriverDeliveryMessage(fullOrder);
 
-          const isWindowOpen = await checkDriverWhatsAppWindow(pool, driverPhone);
-          const whatsappUrl = `https://api.whatsapp.com/send/?phone=${driverPhone}&text=${encodeURIComponent(driverMessage)}`;
+          isWindowOpen = await checkDriverWhatsAppWindow(pool, driverPhone);
+          whatsappUrl = driverPhone ? `https://api.whatsapp.com/send/?phone=${driverPhone}&text=${encodeURIComponent(driverMessage)}` : null;
 
           if (isWindowOpen && whatsappClient) {
             try {
@@ -1129,9 +1134,6 @@ module.exports = function registerDeliveryApi(app, dependencies) {
       } catch (genErr) {
         console.error('[delivery] Error preparando mensaje de WhatsApp para el domiciliario:', genErr);
       }
-
-      const driverMessage = fullOrder ? buildDriverDeliveryMessage(fullOrder) : '';
-      const whatsappUrl = driverPhone ? `https://api.whatsapp.com/send/?phone=${driverPhone}&text=${encodeURIComponent(driverMessage)}` : null;
 
       res.json({
         status: 'ok',

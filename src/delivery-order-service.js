@@ -411,7 +411,7 @@ class DeliveryOrderService {
     });
   }
 
-  async reserveOrder({ orderId, driverId, actor, idempotencyKey }) {
+  async reserveOrder({ orderId, driverId, actor, idempotencyKey, notes }) {
     return this.withOperation({
       operation: 'reserveOrder', key: idempotencyKey, actorId: actor.id, orderId,
       request: { driverId },
@@ -477,13 +477,13 @@ class DeliveryOrderService {
             delivery_accepted_at=CASE WHEN $3::int IS NULL THEN NOW() ELSE NULL END,
             picked_up_at=CASE WHEN $3::int IS NULL THEN NOW() ELSE NULL END,
             on_the_way_at=CASE WHEN $3::int IS NULL THEN NOW() ELSE NULL END,
-            external_delivery_notes=NULL,
+            external_delivery_notes=COALESCE($9, external_delivery_notes),
             external_eta_minutes=NULL, external_provider_reference=NULL,
             external_handed_off_at=NULL, accepted_by_device_id=NULL,
             version=version+1, updated_at=NOW()
         WHERE id=$2 AND (status='Listo' OR status='En camino')
         RETURNING *
-      `, [driverId, orderId, extCompanyId, extDriverId, extDriverName, extDriverPhone, extVehicleId, extDeliveryCost]);
+      `, [driverId, orderId, extCompanyId, extDriverId, extDriverName, extDriverPhone, extVehicleId, extDeliveryCost, notes || null]);
       if (!rows.length) throw domainError('ORDER_ALREADY_TAKEN', 'El pedido ya no está disponible para asignación.', 409);
       await client.query(`
         INSERT INTO pedidos_app_delivery_events

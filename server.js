@@ -858,6 +858,7 @@ app.get('/api/pedidos/init', async (req, res) => {
     // Anuncio
     let announcementRow = null;
     let promoCardRow = null;
+    let promoCardsRows = [];
     try {
       const { rows: announcements } = await pool.query(`
         SELECT id, title, body, cta_label, cta_url, starts_at, ends_at,
@@ -871,7 +872,8 @@ app.get('/api/pedidos/init', async (req, res) => {
         ORDER BY priority DESC, updated_at DESC, id DESC
       `);
       announcementRow = announcements.find(r => r.campaign_type === 'modal' || r.campaign_type === 'banner') || null;
-      promoCardRow = announcements.find(r => r.campaign_type === 'promo_card') || null;
+      promoCardsRows = announcements.filter(r => r.campaign_type === 'promo_card');
+      promoCardRow = promoCardsRows[0] || null;
     } catch (err) {
       console.log('Announcement table might not exist yet.');
     }
@@ -882,7 +884,8 @@ app.get('/api/pedidos/init', async (req, res) => {
       categories,
       settings: settingsForResponse(req, settingsRow),
       announcement: announcementForResponse(req, announcementRow),
-      promoCard: announcementForResponse(req, promoCardRow)
+      promoCard: announcementForResponse(req, promoCardRow),
+      promoCards: promoCardsRows.map(r => announcementForResponse(req, r))
     });
   } catch (error) {
     console.error('Error fetching init data:', error);
@@ -3942,12 +3945,14 @@ app.get('/api/pedidos/announcement', async (req, res) => {
     `, [audience]);
 
     const modalAnnouncement = rows.find(r => r.campaign_type === 'modal' || r.campaign_type === 'banner');
-    const promoCard = rows.find(r => r.campaign_type === 'promo_card');
+    const promoCards = rows.filter(r => r.campaign_type === 'promo_card');
+    const promoCard = promoCards[0] || null;
 
     res.json({
       status: 'ok',
       announcement: modalAnnouncement ? announcementForResponse(req, modalAnnouncement) : (rows[0] && rows[0].campaign_type !== 'promo_card' ? announcementForResponse(req, rows[0]) : null),
       promoCard: promoCard ? announcementForResponse(req, promoCard) : null,
+      promoCards: promoCards.map(r => announcementForResponse(req, r)),
       announcements: rows.map(r => announcementForResponse(req, r))
     });
   } catch (error) {
