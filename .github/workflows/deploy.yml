@@ -1,0 +1,67 @@
+name: Deploy distrito-api to Contabo VPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to Contabo VPS
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          script_stop: true
+          script: |
+            echo "🚀 Iniciando despliegue de Distric House API..."
+
+            TARGET_DIR="${{ secrets.VPS_PATH }}"
+            if [ -z "$TARGET_DIR" ]; then
+              if [ -d "/var/www/distrito-api" ]; then
+                TARGET_DIR="/var/www/distrito-api"
+              elif [ -d "/root/distrito-api" ]; then
+                TARGET_DIR="/root/distrito-api"
+              elif [ -d "$HOME/distrito-api" ]; then
+                TARGET_DIR="$HOME/distrito-api"
+              elif [ -d "/var/www/api" ]; then
+                TARGET_DIR="/var/www/api"
+              else
+                echo "❌ No se encontró automáticamente el directorio del backend. Configura el secret VPS_PATH en GitHub."
+                exit 1
+              fi
+            fi
+
+            echo "📂 Navegando a $TARGET_DIR..."
+            cd "$TARGET_DIR"
+
+            echo "📥 Descargando últimos cambios de Git (main)..."
+            git fetch origin main
+            git reset --hard origin/main
+
+            echo "📦 Instalando dependencias de Node.js..."
+            npm install --omit=dev --no-audit --no-fund
+
+            echo "🔄 Reiniciando servicio en PM2..."
+            if pm2 list | grep -q "server"; then
+              pm2 reload server --update-env || pm2 restart server --update-env
+            elif pm2 list | grep -q "distrito-api"; then
+              pm2 reload distrito-api --update-env || pm2 restart distrito-api --update-env
+            elif pm2 list | grep -q "api"; then
+              pm2 reload api --update-env || pm2 restart api --update-env
+            else
+              echo "⚠️ Proceso específico no identificado en PM2, aplicando restart general..."
+              pm2 restart all --update-env || true
+            fi
+
+            echo "✅ Estado de procesos PM2:"
+            pm2 status
+
+            echo "🎉 ¡Despliegue de Distric House API completado exitosamente!"
