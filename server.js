@@ -1182,6 +1182,34 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
       }
     }
 
+    // Prevención de pedidos duplicados (ej: reintentos de WhatsApp, doble clic o recarga en menos de 3 minutos)
+    const normPhoneCheck = typeof normalizePhoneE164 === 'function' ? normalizePhoneE164(formattedPhone) : null;
+    const recentDupRes = await client.query(`
+      SELECT id, status, total, delivery_fee, change_required, created_at
+      FROM pedidos_app_orders
+      WHERE (customer_phone = $1 OR customer_phone_e164 = $2 OR (crm_contact_id = $3 AND $3::text IS NOT NULL))
+        AND total = $4
+        AND status NOT IN ('Cancelado')
+        AND created_at >= NOW() - INTERVAL '3 minutes'
+      ORDER BY id DESC
+      LIMIT 1
+    `, [formattedPhone, normPhoneCheck || ('+' + formattedPhone), resolvedCrmContactId ? String(resolvedCrmContactId) : null, orderTotal]);
+
+    if (recentDupRes.rows.length > 0) {
+      const existing = recentDupRes.rows[0];
+      console.warn(`[Checkout] Pedido duplicado prevenido para ${formattedPhone}. Reutilizando pedido existente #${existing.id}`);
+      return res.status(200).json({
+        status: 'ok',
+        order_id: existing.id,
+        subtotal: normalized.total,
+        delivery_fee: existing.delivery_fee,
+        total: existing.total,
+        change_required: existing.change_required,
+        tracking_token: issueTrackingToken(existing.id, JWT_SECRET),
+        duplicate_prevented: true
+      });
+    }
+
     const { rows } = await client.query(
       `INSERT INTO pedidos_app_orders 
        (customer_name, customer_phone, address, barrio, delivery_type, payment_method, total, cart_json, source, notes, voucher_reference, created_at,
