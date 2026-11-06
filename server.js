@@ -4215,6 +4215,10 @@ function buildReportData(orderRows, purchaseRows, orderCostsRows = [], expenseRo
   const totalPurchases = purchaseRows.reduce((sum, purchase) => sum + Number(purchase.total_amount || purchase.total_cost || 0), 0);
   const totalExpenses = (expenseRows || []).reduce((sum, expense) => sum + Number(expense.amount || 0), 0);
   const externalOrders = completedOrders.filter((order) => String(order.delivery_provider_type || '').startsWith('external_'));
+  const allDeliveryOrders = completedOrders.filter((order) =>
+    String(order.delivery_type || '').toLowerCase() === 'domicilio' &&
+    (String(order.delivery_provider_type || '').startsWith('external_') || order.delivery_user_id != null || (order.driver_name && order.driver_name !== 'Sin mensajero'))
+  );
   const externalDeliveryCost = externalOrders.reduce((sum, order) => sum + Number(order.external_delivery_cost || 0), 0);
   const externalDeliveryRevenue = externalOrders.reduce((sum, order) => sum + Number(order.delivery_fee || 0), 0);
   const totalCogs = completedOrders.reduce((sum, order) => sum + Number(order.total_cogs || 0), 0);
@@ -4322,6 +4326,7 @@ function buildReportData(orderRows, purchaseRows, orderCostsRows = [], expenseRo
             companyStats[comp] = {
               name: comp,
               company_id: o.external_delivery_company_id,
+              is_internal: Boolean(comp.includes('Interno') || o.delivery_user_id != null),
               count: 0,
               cost: 0,
               revenue: 0,
@@ -4338,6 +4343,7 @@ function buildReportData(orderRows, purchaseRows, orderCostsRows = [], expenseRo
         return Object.values(companyStats).map(c => ({
           name: c.name,
           company_id: c.company_id,
+          is_internal: c.is_internal,
           count: c.count,
           cost: Math.round(c.cost),
           revenue: Math.round(c.revenue),
@@ -4348,7 +4354,7 @@ function buildReportData(orderRows, purchaseRows, orderCostsRows = [], expenseRo
       })(),
       domicilios_empresas: (() => {
         const companyStats = {};
-        for (const o of externalOrders) {
+        for (const o of allDeliveryOrders) {
           const comp = String(o.external_company_name || 'Sin empresa');
           if (!companyStats[comp]) {
             companyStats[comp] = {
@@ -4380,7 +4386,7 @@ function buildReportData(orderRows, purchaseRows, orderCostsRows = [], expenseRo
       })(),
       domicilios_mensajeros: (() => {
         const driverStats = {};
-        for (const o of externalOrders) {
+        for (const o of allDeliveryOrders) {
           const driverName = String(o.driver_name || 'Sin mensajero');
           const compName = String(o.external_company_name || 'Sin empresa');
           const driverKey = `${driverName}-${compName}`;
@@ -4388,6 +4394,7 @@ function buildReportData(orderRows, purchaseRows, orderCostsRows = [], expenseRo
             driverStats[driverKey] = {
               name: driverName,
               company: compName,
+              is_internal: Boolean(o.delivery_user_id != null || compName.includes('Interno')),
               phone: o.driver_phone || '',
               plate: o.driver_plate || '—',
               vehicle_type: o.driver_vehicle_type || 'Moto',
@@ -4410,7 +4417,7 @@ function buildReportData(orderRows, purchaseRows, orderCostsRows = [], expenseRo
           avg_duration_mins: d.durations.length ? Math.round((d.durations.reduce((a, b) => a + b, 0) / d.durations.length) / 60) : null
         })).sort((a, b) => b.count - a.count);
       })(),
-      domicilios_detalle: externalOrders.map(o => ({
+      domicilios_detalle: allDeliveryOrders.map(o => ({
         id: o.id,
         date: o.created_at,
         delivered_at: o.delivered_at,
@@ -4418,6 +4425,7 @@ function buildReportData(orderRows, purchaseRows, orderCostsRows = [], expenseRo
         customer_phone: o.customer_phone || '',
         destination: [o.barrio, o.address].filter(Boolean).join(', ') || 'Sin dirección registrada',
         company_name: o.external_company_name || 'Sin empresa',
+        is_internal: Boolean(o.delivery_user_id != null || String(o.external_company_name || '').includes('Interno')),
         driver_name: o.driver_name || 'Sin mensajero',
         driver_phone: o.driver_phone || '',
         driver_plate: o.driver_plate || '—',
@@ -4448,16 +4456,18 @@ app.get('/api/pedidos/admin/reports', authenticateToken, async (req, res) => {
       SELECT o.id, o.customer_name, o.customer_phone, o.payment_method, o.total, o.cart_json, o.status,
              o.delivery_fee, o.delivery_provider_type, o.external_delivery_cost, COALESCE(o.total_cogs, 0) as total_cogs,
              o.created_at, o.delivered_at, o.delivery_duration_seconds, o.address, o.barrio,
-             o.external_delivery_company_id, o.external_driver_id,
-             COALESCE(c.name, 'Sin empresa') AS external_company_name,
-             COALESCE(d.name, o.external_driver_name, 'Sin mensajero') AS driver_name,
-             COALESCE(d.phone, o.external_driver_phone, '') AS driver_phone,
-             COALESCE(d.vehicle_plate, o.external_vehicle_id, '—') AS driver_plate,
-             COALESCE(d.vehicle_type, 'Moto') AS driver_vehicle_type,
+             o.external_delivery_company_id, o.external_driver_id, o.delivery_user_id, o.delivery_type,
+             COALESCE(c.name, CASE WHEN o.delivery_user_id IS NOT NULL THEN 'Interno (Flota Propia)' ELSE 'Sin empresa' END) AS external_company_name,
+             COALESCE(d.name, o.external_driver_name, u.name, 'Sin mensajero') AS driver_name,
+             COALESCE(d.phone, o.external_driver_phone, u.phone, '') AS driver_phone,
+             COALESCE(d.vehicle_plate, o.external_vehicle_id, dp.plate, '—') AS driver_plate,
+             COALESCE(d.vehicle_type, dp.vehicle_type, 'Moto') AS driver_vehicle_type,
              TO_CHAR(o.created_at AT TIME ZONE 'America/Bogota', 'YYYY-MM-DD') AS report_date
       FROM pedidos_app_orders o
       LEFT JOIN pedidos_app_delivery_companies c ON c.id = o.external_delivery_company_id
       LEFT JOIN pedidos_app_delivery_company_drivers d ON d.id = o.external_driver_id
+      LEFT JOIN pedidos_app_users u ON u.id = o.delivery_user_id
+      LEFT JOIN pedidos_app_delivery_profiles dp ON dp.user_id = o.delivery_user_id
       WHERE (o.created_at AT TIME ZONE 'America/Bogota')::date BETWEEN $1::date AND $2::date
       ORDER BY o.created_at ASC`;
     const purchaseSql = `
@@ -5293,6 +5303,11 @@ require('./nomina_api')(app, {
   logActivity,
 });
 require('./src/ai_api')(app, {
+  pool,
+  authenticateToken,
+  requirePermission,
+});
+require('./print_agent_api')(app, {
   pool,
   authenticateToken,
   requirePermission,
