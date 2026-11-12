@@ -19,6 +19,7 @@
  */
 
 const express = require('express');
+const { isClientError, redactSensitiveText } = require('./src/http-errors');
 
 const {
   calculateSettlementEstimator,
@@ -64,7 +65,7 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
         const ua = req.headers['user-agent'] || '-';
         await logActivity(req.user.id, 'Nomina', action, details, ip, 'Linux/Windows', ua.substring(0, 50), requestData);
       } catch (e) {
-        console.error('Error registrando auditoría de Nómina:', e.message);
+        console.error('Error registrando auditoría de Nómina:', redactSensitiveText(e?.message || e));
       }
     }
   };
@@ -81,12 +82,13 @@ module.exports = function(app, { pool, authenticateToken, requirePermission, log
     );
     CREATE INDEX IF NOT EXISTS idx_pad_period ON pedidos_app_payroll_deduction_amortizations(payroll_period_id);
     CREATE INDEX IF NOT EXISTS idx_pad_deduction ON pedidos_app_payroll_deduction_amortizations(deduction_id);
-  `).catch(err => console.error('[Nomina] Error asegurando tabla amortizaciones:', err.message));
+  `).catch(err => console.error('[Nomina] Error asegurando tabla amortizaciones:', redactSensitiveText(err?.message || err)));
 
   // Helper para sanitizar respuestas de error de servidor (SEC-02)
   const handleServerError = (res, err, publicMessage = 'No fue posible completar la operación debido a un error interno.') => {
-    console.error('[Nomina Server Error]', err);
-    if (err && err.statusCode && err.statusCode !== 500) {
+    console.error('[Nomina Server Error]', redactSensitiveText(err?.stack || err?.message || err));
+    if (res.headersSent) return undefined;
+    if (isClientError(err)) {
       return res.status(err.statusCode).json({ status: 'error', error: err.message, code: err.code });
     }
     return res.status(500).json({

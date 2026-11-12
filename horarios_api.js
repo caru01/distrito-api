@@ -1,3 +1,5 @@
+const { redactSensitiveText, sendInternalError } = require('./src/http-errors');
+
 module.exports = function(app, pool, authenticateToken) {
   const DEFAULT_TIMEZONE = 'America/Bogota';
   const DAYS = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
@@ -96,7 +98,7 @@ module.exports = function(app, pool, authenticateToken) {
         timezone,
       };
     } catch(err) {
-      console.error('Error in getHorariosStatus:', err);
+      console.error('Error in getHorariosStatus:', redactSensitiveText(err?.message || err));
       return { status: 'error', isOpen: false, statusText: 'Horario no disponible', currentSchedule: null, horarios: [], config: { timezone: DEFAULT_TIMEZONE }, timezone: DEFAULT_TIMEZONE };
     }
   };
@@ -121,7 +123,7 @@ module.exports = function(app, pool, authenticateToken) {
         currentStatus: status
       });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      return sendInternalError(res, err, 'No fue posible consultar los horarios.', { component: 'horarios-api' });
     }
   });
 
@@ -140,8 +142,8 @@ module.exports = function(app, pool, authenticateToken) {
       await client.query('COMMIT');
       res.json({ status: 'ok' });
     } catch(err) {
-      await client.query('ROLLBACK');
-      res.status(500).json({ error: err.message });
+      await client.query('ROLLBACK').catch(() => {});
+      return sendInternalError(res, err, 'No fue posible actualizar los horarios.', { component: 'horarios-api' });
     } finally {
       client.release();
     }
@@ -160,7 +162,7 @@ module.exports = function(app, pool, authenticateToken) {
       );
       res.json({ status: 'ok' });
     } catch(err) {
-      res.status(500).json({ error: err.message });
+      return sendInternalError(res, err, 'No fue posible actualizar la configuración de horarios.', { component: 'horarios-api' });
     }
   });
 
@@ -179,7 +181,7 @@ module.exports = function(app, pool, authenticateToken) {
       );
       res.json({ status: 'ok', exception: rows[0] });
     } catch(err) {
-      res.status(500).json({ error: err.message });
+      return sendInternalError(res, err, 'No fue posible guardar la excepción de horario.', { component: 'horarios-api' });
     }
   });
 
@@ -188,7 +190,7 @@ module.exports = function(app, pool, authenticateToken) {
       await pool.query('DELETE FROM pedidos_app_horarios_exceptions WHERE id = $1', [req.params.id]);
       res.json({ status: 'ok' });
     } catch(err) {
-      res.status(500).json({ error: err.message });
+      return sendInternalError(res, err, 'No fue posible eliminar la excepción de horario.', { component: 'horarios-api' });
     }
   });
 

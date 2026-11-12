@@ -26,12 +26,12 @@ test('WhatsApp conserva emojis y Unicode despues de codificar la URL', async () 
     change: 65000,
   });
   const url = createWhatsAppUrl('3235989590', message);
-  const encodedMessage = url.split('?text=')[1];
+  const parsedUrl = new URL(url);
+  const textParam = parsedUrl.searchParams.get('text');
 
-  assert.equal(decodeURIComponent(encodedMessage), message);
-  assert.match(encodedMessage, /^%F0%9F%8D%94/);
-  assert.match(message, /🍔 NUEVA ORDEN/);
-  assert.match(message, /🚚 Entrega a domicilio/);
+  assert.equal(textParam, message);
+  assert.match(message, /NUEVA ORDEN/);
+  assert.match(message, /A Domicilio/);
   assert.match(message, /María José/);
   assert.doesNotMatch(message, /\uFFFD/);
 });

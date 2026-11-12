@@ -33,6 +33,7 @@ const { createOutboxDispatcher } = require('./src/outbox');
 const { createWhatsAppClient } = require('./src/whatsapp-cloud');
 const { createCrmWorker, ensureContact } = require('./src/crm-service');
 const { normalizePhoneE164 } = require('./src/crm/phone');
+const { httpError, isClientError, redactSensitiveText, sendInternalError } = require('./src/http-errors');
 
 const publicVapidKey = process.env.VAPID_PUBLIC_KEY;
 const privateVapidKey = process.env.VAPID_PRIVATE_KEY;
@@ -898,7 +899,7 @@ app.get('/api/pedidos/init', async (req, res) => {
         message: 'Devolviendo datos locales. Ejecuta npm run migrate en distrito-api para preparar PostgreSQL.'
       });
     }
-    res.status(500).json({ status: 'error', message: 'Fallo al conectar con la base de datos', details: error.message });
+    sendInternalError(res, error, 'Fallo temporal al conectar con la base de datos');
   }
 });
 
@@ -1285,8 +1286,10 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
     });
   } catch (error) {
     if (client) await client.query('ROLLBACK').catch(() => {});
-    console.error('Error guardando orden:', error);
-    res.status(error.statusCode || 500).json({ status: 'error', code: error.code, error: error.message, message: error.message });
+    return sendInternalError(res, error, 'No fue posible procesar el pedido. Por favor intenta nuevamente.', {
+      component: 'checkout',
+      includeMessageField: true,
+    });
   } finally {
     if (client) client.release();
   }
@@ -1542,10 +1545,7 @@ app.get('/api/pedidos/track/:id', trackingLimiter, async (req, res) => {
       },
     });
   } catch (error) {
-    res.status(error.statusCode || 500).json({
-      code: error.code,
-      error: error.statusCode ? error.message : 'No fue posible consultar el pedido',
-    });
+    return sendInternalError(res, error, 'No fue posible consultar el pedido', { component: 'orders-track' });
   }
 });
 
@@ -2287,7 +2287,7 @@ app.get('/api/pedidos/admin/categories', authenticateToken, async (req, res) => 
     res.json({ status: 'ok', categories: rows });
   } catch (error) {
     console.error('Error fetching categories:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -2317,7 +2317,7 @@ app.put('/api/pedidos/admin/categories/reorder', authenticateToken, async (req, 
     res.json({ status: 'ok', message: 'Categorías reordenadas exitosamente' });
   } catch (error) {
     console.error('Error reordering categories:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -2334,7 +2334,7 @@ app.post('/api/pedidos/admin/categories', authenticateToken, async (req, res) =>
     res.json({ status: 'ok', category: rows[0] });
   } catch (error) {
     console.error('Error creating category:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -2350,7 +2350,7 @@ app.put('/api/pedidos/admin/categories/:id', authenticateToken, async (req, res)
     res.json({ status: 'ok', category: rows[0] });
   } catch (error) {
     console.error('Error updating category:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -2362,7 +2362,7 @@ app.delete('/api/pedidos/admin/categories/:id', authenticateToken, async (req, r
     res.json({ status: 'ok' });
   } catch (error) {
     console.error('Error deleting category:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -2419,7 +2419,7 @@ app.get('/api/pedidos/admin/clientes/buscar', authenticateToken, async (req, res
     res.json({ status: 'ok', clientes: rows });
   } catch (error) {
     console.error('Error buscando clientes:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -2472,7 +2472,7 @@ app.get('/api/pedidos/admin/customers', authenticateToken, async (req, res) => {
     const total = listResult.rows[0]?.filtered_count || 0;
     res.json({ status: 'ok', customers: listResult.rows.map(({ filtered_count, ...row }) => row),
       summary: summaryResult.rows[0], pagination: { page, limit, total, pages: Math.max(1, Math.ceil(total / limit)) } });
-  } catch (error) { res.status(500).json({ status: 'error', error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.get('/api/pedidos/admin/customers/:id', authenticateToken, async (req, res) => {
@@ -2494,7 +2494,7 @@ app.get('/api/pedidos/admin/customers/:id', authenticateToken, async (req, res) 
       WHERE crm_contact_id=$1 OR ($1::bigint IS NULL AND (customer_phone_e164=$2 OR customer_phone=$3))
       ORDER BY created_at DESC LIMIT 250`, [customer.rows[0].crm_contact_id, customer.rows[0].phone_e164, customer.rows[0].phone]);
     res.json({ status: 'ok', customer: customer.rows[0], orders: orders.rows });
-  } catch (error) { res.status(500).json({ status: 'error', error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 async function syncCustomerMarketingConsent(client, customerId, granted, actorUserId, { recordOptOut = false } = {}) {
@@ -2540,7 +2540,8 @@ app.post('/api/pedidos/admin/customers', authenticateToken, async (req, res) => 
     res.status(201).json({ status: 'ok', customer: rows[0] });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
-    res.status(error.code === '23505' ? 409 : 500).json({ error: error.code === '23505' ? 'Ya existe un cliente con este teléfono' : error.message });
+    if (error.code === '23505') return res.status(409).json({ error: 'Ya existe un cliente con este teléfono' });
+    return sendInternalError(res, error, 'No fue posible crear el cliente.', { component: 'customers' });
   } finally { client.release(); }
 });
 
@@ -2574,7 +2575,8 @@ app.put('/api/pedidos/admin/customers/:id', authenticateToken, async (req, res) 
     res.json({ status: 'ok', customer: rows[0] });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
-    res.status(error.code === '23505' ? 409 : 500).json({ error: error.code === '23505' ? 'Ya existe un cliente con este teléfono' : error.message });
+    if (error.code === '23505') return res.status(409).json({ error: 'Ya existe un cliente con este teléfono' });
+    return sendInternalError(res, error, 'No fue posible actualizar el cliente.', { component: 'customers' });
   } finally { client.release(); }
 });
 
@@ -2583,7 +2585,7 @@ app.post('/api/pedidos/admin/customers/:id/contact', authenticateToken, async (r
     const { rows } = await pool.query('UPDATE pedidos_app_customers SET last_contact_at=NOW(), updated_at=NOW() WHERE id=$1 RETURNING last_contact_at', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'Cliente no encontrado' });
     res.json({ status: 'ok', last_contact_at: rows[0].last_contact_at });
-  } catch (error) { res.status(500).json({ error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 // ================= ESTADÍSTICAS LIGERAS =================
@@ -2652,7 +2654,7 @@ app.get('/api/pedidos/admin/orders', authenticateToken, async (req, res) => {
     res.json({ status: 'ok', orders: rows });
   } catch (error) {
     console.error('Error fetching orders:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -2707,7 +2709,7 @@ app.post('/api/pedidos/admin/orders/:id/notify-whatsapp', authenticateToken, asy
     res.json({ status: 'ok', sent_to: sendTo, is_bsuid: !isE164 });
   } catch (error) {
     console.error('Error notificando por WhatsApp:', error);
-    res.status(500).json({ error: error.message || 'Error enviando notificación' });
+    sendInternalError(res, error);
   }
 });
 app.post('/api/pedidos/admin/orders/:id/tracking-sent', authenticateToken, async (req, res) => {
@@ -2755,10 +2757,17 @@ app.put('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => 
           }
           return res.json({ status: 'ok', order: result.order, replayed: result.replayed });
         } catch (error) {
-          return res.status(error.statusCode || 500).json({
-            status: 'error', code: error.code || 'ORDER_CANCEL_FAILED',
-            error: error.statusCode ? error.message : 'No fue posible cancelar el pedido',
-            details: error.details,
+          if (isClientError(error)) {
+            return res.status(error.statusCode).json({
+              status: 'error',
+              code: error.code || 'ORDER_CANCEL_FAILED',
+              error: error.message,
+              ...(error.details !== undefined ? { details: error.details } : {}),
+            });
+          }
+          return sendInternalError(res, error, 'No fue posible cancelar el pedido', {
+            component: 'orders-cancel',
+            code: 'ORDER_CANCEL_FAILED',
           });
         }
       }
@@ -2894,8 +2903,7 @@ app.put('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => 
       res.status(400).json({ status: 'error', error: 'No se enviaron datos para actualizar' });
     }
   } catch (error) {
-    console.error('Error updating order:', error);
-    res.status(error.statusCode || 500).json({ status: 'error', error: error.message });
+    return sendInternalError(res, error, 'No fue posible actualizar el pedido.', { component: 'orders' });
   }
 });
 
@@ -3010,8 +3018,7 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
     res.json({ status: 'ok', order: rows[0] });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
-    console.error('Error editing order:', error);
-    res.status(error.statusCode || 500).json({ status: 'error', error: error.message });
+    return sendInternalError(res, error, 'No fue posible editar el pedido.', { component: 'orders-edit' });
   } finally { client.release(); }
 });
 
@@ -3033,7 +3040,7 @@ app.delete('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) 
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error deleting order:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   } finally { client.release(); }
 });
 
@@ -3051,7 +3058,7 @@ app.get('/api/pedidos/admin/products', authenticateToken, async (req, res) => {
     res.json({ status: 'ok', products: rows.map((product) => productForResponse(req, product)) });
   } catch (error) {
     console.error('Error fetching products:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -3081,7 +3088,7 @@ app.put('/api/pedidos/admin/products/reorder', authenticateToken, async (req, re
     res.json({ status: 'ok', message: 'Productos reordenados exitosamente' });
   } catch (error) {
     console.error('Error reordering products:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -3105,8 +3112,8 @@ app.post('/api/pedidos/admin/products', authenticateToken, async (req, res) => {
     );
     res.status(201).json({ status: 'ok', product: productForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image) }) });
   } catch (error) {
-    console.error('Error creating product:', error);
-    res.status(error.code === '23505' ? 409 : 500).json({ status: 'error', error: error.code === '23505' ? 'El código de barras ya está asignado' : error.message });
+    if (error.code === '23505') return res.status(409).json({ status: 'error', error: 'El código de barras ya está asignado' });
+    return sendInternalError(res, error, 'No fue posible crear el producto.', { component: 'products' });
   }
 });
 
@@ -3141,8 +3148,8 @@ app.put('/api/pedidos/admin/products/:id', authenticateToken, async (req, res) =
     if (!rows.length) return res.status(404).json({ status: 'error', error: 'Producto no encontrado' });
     res.json({ status: 'ok', product: productForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image) }) });
   } catch (error) {
-    console.error('Error updating product:', error);
-    res.status(error.code === '23505' ? 409 : 500).json({ status: 'error', error: error.code === '23505' ? 'El código de barras ya está asignado' : error.message });
+    if (error.code === '23505') return res.status(409).json({ status: 'error', error: 'El código de barras ya está asignado' });
+    return sendInternalError(res, error, 'No fue posible actualizar el producto.', { component: 'products' });
   }
 });
 
@@ -3170,7 +3177,7 @@ app.delete('/api/pedidos/admin/products/:id', authenticateToken, async (req, res
     res.json({ status: 'ok' });
   } catch (error) {
     console.error('Error deleting product:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -3215,7 +3222,7 @@ app.get('/api/pedidos/admin/product-stock', authenticateToken, requirePermission
       ORDER BY (track_stock AND COALESCE(stock, 0) <= low_stock_threshold) DESC, title
     `);
     res.json({ status: 'ok', data: rows });
-  } catch (error) { res.status(500).json({ error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.post('/api/pedidos/admin/product-stock/:id/movements', authenticateToken, requirePermission('Inventario', 'editar'), async (req, res) => {
@@ -3249,8 +3256,8 @@ app.post('/api/pedidos/admin/product-stock/:id/movements', authenticateToken, re
     await client.query('COMMIT');
     res.json({ status: 'ok', stock: next });
   } catch (error) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: error.message });
+    await client.query('ROLLBACK').catch(() => {});
+    return sendInternalError(res, error, 'No fue posible ajustar el inventario del producto.', { component: 'product-stock' });
   } finally { client.release(); }
 });
 
@@ -3272,7 +3279,8 @@ app.patch('/api/pedidos/admin/product-stock/:id', authenticateToken, requirePerm
     if (!rows.length) return res.status(404).json({ error: 'Producto no encontrado' });
     res.json({ status: 'ok', data: rows[0] });
   } catch (error) {
-    res.status(error.code === '23505' ? 409 : 500).json({ error: error.code === '23505' ? 'El código de barras ya está asignado a otro producto' : error.message });
+    if (error.code === '23505') return res.status(409).json({ error: 'El código de barras ya está asignado a otro producto' });
+    return sendInternalError(res, error, 'No fue posible actualizar la configuración de inventario del producto.', { component: 'products' });
   }
 });
 
@@ -3316,7 +3324,7 @@ app.get('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
     res.json({ status: 'ok', settings: settingsForResponse(req, rows[0]) });
   } catch (error) {
     console.error('Error fetching settings:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -3441,7 +3449,7 @@ app.put('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
     res.json({ status: 'ok', settings: settingsForResponse(req, rows[0]) });
   } catch (error) {
     console.error('Error updating settings:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -3473,7 +3481,7 @@ app.get('/api/pedidos/admin/inventory', authenticateToken, async (req, res) => {
     `);
     res.json({ status: 'ok', inventory: rows, items: rows, data: rows });
   } catch (error) {
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -3521,7 +3529,7 @@ app.get('/api/pedidos/admin/inventory/alerts', authenticateToken, async (req, re
     });
   } catch (error) {
     console.error('Error al consultar alertas de inventario:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -3566,8 +3574,8 @@ app.post('/api/pedidos/admin/inventory', authenticateToken, async (req, res) => 
     await client.query('COMMIT');
     res.json({ status: 'ok', item: rows[0], inventory: rows[0] });
   } catch (error) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ status: 'error', error: error.message });
+    await client.query('ROLLBACK').catch(() => {});
+    return sendInternalError(res, error, 'No fue posible crear el insumo.', { component: 'inventory' });
   } finally {
     client.release();
   }
@@ -3581,7 +3589,7 @@ app.put('/api/pedidos/admin/inventory/:id', authenticateToken, async (req, res) 
 
     await client.query('BEGIN');
     const { rows: current } = await client.query('SELECT id, name FROM pedidos_app_inventory WHERE id = $1 FOR UPDATE', [id]);
-    if (!current.length) throw new Error('Insumo no encontrado');
+    if (!current.length) throw httpError(404, 'Insumo no encontrado');
 
     // Validar nombre duplicado con otro insumo distinto
     if (name?.trim()) {
@@ -3627,8 +3635,8 @@ app.put('/api/pedidos/admin/inventory/:id', authenticateToken, async (req, res) 
     await client.query('COMMIT');
     res.json({ status: 'ok', item: rows[0], inventory: rows[0] });
   } catch (error) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ status: 'error', error: error.message });
+    await client.query('ROLLBACK').catch(() => {});
+    return sendInternalError(res, error, 'No fue posible actualizar el insumo.', { component: 'inventory' });
   } finally {
     client.release();
   }
@@ -3640,7 +3648,7 @@ app.delete('/api/pedidos/admin/inventory/:id', authenticateToken, async (req, re
     await pool.query('DELETE FROM pedidos_app_inventory WHERE id = $1', [id]);
     res.json({ status: 'ok' });
   } catch (error) {
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -3658,7 +3666,7 @@ app.post('/api/pedidos/admin/inventory/:id/movement', authenticateToken, async (
     try {
       await client.query('BEGIN');
       const { rows: ingredients } = await client.query('SELECT * FROM pedidos_app_inventory WHERE id = $1 FOR UPDATE', [id]);
-      if (!ingredients.length) throw new Error('Ingrediente no encontrado.');
+      if (!ingredients.length) throw httpError(404, 'Ingrediente no encontrado.');
       if (movement_type === 'IN') {
         const cost = Number(unit_cost || ingredients[0].unit_cost || 0);
         const lotCode = `AJU-${id}-${Date.now()}`;
@@ -3694,13 +3702,13 @@ app.post('/api/pedidos/admin/inventory/:id/movement', authenticateToken, async (
       await client.query('COMMIT');
       res.json({ status: 'ok' });
     } catch (e) {
-      await client.query('ROLLBACK');
+      await client.query('ROLLBACK').catch(() => {});
       throw e;
     } finally {
       client.release();
     }
   } catch (error) {
-    res.status(error.statusCode || 500).json({ status: 'error', error: error.message });
+    return sendInternalError(res, error, 'No fue posible registrar el movimiento de inventario.', { component: 'inventory' });
   }
 });
 
@@ -3710,7 +3718,7 @@ app.get('/api/pedidos/admin/inventory/:id/movements', authenticateToken, async (
     const { rows } = await pool.query('SELECT * FROM pedidos_app_inventory_movements WHERE inventory_id = $1 ORDER BY created_at DESC', [id]);
     res.json({ status: 'ok', movements: rows });
   } catch (error) {
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 // ================= COMPRAS =================
@@ -3719,7 +3727,7 @@ app.get('/api/pedidos/admin/purchases', authenticateToken, async (req, res) => {
     const { rows } = await pool.query('SELECT * FROM pedidos_app_purchases ORDER BY created_at DESC');
     res.json({ status: 'ok', purchases: rows });
   } catch (error) {
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -3750,11 +3758,11 @@ app.post('/api/pedidos/admin/purchases', authenticateToken, async (req, res) => 
         'SELECT id, purchase_unit, consumption_unit, conversion_factor FROM pedidos_app_inventory WHERE id = $1 FOR UPDATE',
         [item.inventory_id]
       );
-      if (!ingredients.length) throw new Error(`Ingrediente #${item.inventory_id} no encontrado.`);
+      if (!ingredients.length) throw httpError(404, `Ingrediente #${item.inventory_id} no encontrado.`);
       const ingredient = ingredients[0];
       const factor = Number(item.conversion_factor || ingredient.conversion_factor || 1);
       const usableQuantity = Number(item.usable_quantity || (Number(item.quantity) * factor));
-      if (!Number.isFinite(usableQuantity) || usableQuantity <= 0) throw new Error('El rendimiento útil debe ser mayor a cero.');
+      if (!Number.isFinite(usableQuantity) || usableQuantity <= 0) throw httpError(400, 'El rendimiento útil debe ser mayor a cero.');
       const totalWithTax = Number(item.total_cost) * (1 + Number(item.iva_amount || 0) / 100);
       const unitCost = totalWithTax / usableQuantity;
       const lotCode = item.lot_code || `${String(ingredient.sku || 'LOT').replace(/\s+/g, '-').toUpperCase()}-${String(purchase.purchase_date).replace(/-/g, '')}-${String(index + 1).padStart(3, '0')}`;
@@ -3782,8 +3790,8 @@ app.post('/api/pedidos/admin/purchases', authenticateToken, async (req, res) => 
     await client.query('COMMIT');
     res.json({ status: 'ok', purchase });
   } catch (error) {
-    await client.query('ROLLBACK');
-    res.status(error.statusCode || 500).json({ status: 'error', error: error.message });
+    await client.query('ROLLBACK').catch(() => {});
+    return sendInternalError(res, error, 'No fue posible registrar la compra.', { component: 'purchases' });
   } finally {
     client.release();
   }
@@ -3801,7 +3809,7 @@ app.get('/api/pedidos/admin/purchases/:id/items', authenticateToken, async (req,
     );
     res.json({ status: 'ok', items: rows });
   } catch (error) {
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -3864,7 +3872,7 @@ app.put('/api/pedidos/admin/purchases/:id', authenticateToken, async (req, res) 
     res.json({ status: 'ok' });
   } catch (error) {
     await client.query('ROLLBACK');
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   } finally {
     client.release();
   }
@@ -3892,7 +3900,7 @@ app.post('/api/pedidos/rate', async (req, res) => {
 
     res.json({ status: 'ok', product: result.rows[0] });
   } catch (error) {
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -3911,8 +3919,7 @@ app.post('/api/pedidos/push/subscribe', async (req, res) => {
     );
     res.status(201).json({ status: 'ok' });
   } catch (err) {
-    console.error('Error guardando suscripción:', err);
-    res.status(500).json({ error: err.message });
+    return sendInternalError(res, err, 'No fue posible guardar la suscripción push.', { component: 'push' });
   }
 });
 
@@ -3927,7 +3934,7 @@ app.get('/api/pedidos/admin/push/subscriptions/count', authenticateToken, async 
     `);
     res.json({ status: 'ok', count: rows[0].total, customers: rows[0].customers, drivers: rows[0].drivers });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return sendInternalError(res, err, 'No fue posible consultar las suscripciones push.', { component: 'push' });
   }
 });
 
@@ -3952,8 +3959,7 @@ app.post('/api/pedidos/admin/push/send', authenticateToken, async (req, res) => 
     await Promise.all(promises);
     res.json({ status: 'ok', sent: rows.length });
   } catch (err) {
-    console.error('Error enviando push:', err);
-    res.status(500).json({ error: err.message });
+    return sendInternalError(res, err, 'No fue posible enviar la notificación push.', { component: 'push' });
   }
 });
 
@@ -3984,7 +3990,7 @@ app.get('/api/pedidos/announcement', async (req, res) => {
       announcements: rows.map(r => announcementForResponse(req, r))
     });
   } catch (error) {
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -4034,7 +4040,7 @@ app.get('/api/pedidos/admin/announcements', authenticateToken, async (req, res) 
       FROM pedidos_app_announcements ORDER BY updated_at DESC, id DESC
     `);
     res.json({ status: 'ok', announcements: rows.map((row) => announcementForResponse(req, row)) });
-  } catch (error) { res.status(500).json({ status: 'error', error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.post('/api/pedidos/admin/announcements', authenticateToken, async (req, res) => {
@@ -4051,7 +4057,7 @@ app.post('/api/pedidos/admin/announcements', authenticateToken, async (req, res)
     `, [c.title, c.image_url, c.body, c.cta_label, c.cta_url, c.starts_at, c.ends_at,
       c.display_frequency, c.campaign_type, c.audience, c.priority, c.coupon_code, c.is_active]);
     res.status(201).json({ status: 'ok', announcement: announcementForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image_url) }) });
-  } catch (error) { res.status(500).json({ status: 'error', error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.put('/api/pedidos/admin/announcements/:id', authenticateToken, async (req, res) => {
@@ -4072,7 +4078,7 @@ app.put('/api/pedidos/admin/announcements/:id', authenticateToken, async (req, r
     `, [c.title, imageUrl, c.body, c.cta_label, c.cta_url, c.starts_at, c.ends_at,
       c.display_frequency, c.campaign_type, c.audience, c.priority, c.coupon_code, c.is_active, req.params.id]);
     res.json({ status: 'ok', announcement: announcementForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image_url) }) });
-  } catch (error) { res.status(500).json({ status: 'error', error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.delete('/api/pedidos/admin/announcements/:id', authenticateToken, async (req, res) => {
@@ -4080,7 +4086,7 @@ app.delete('/api/pedidos/admin/announcements/:id', authenticateToken, async (req
     const { rowCount } = await pool.query('DELETE FROM pedidos_app_announcements WHERE id = $1', [req.params.id]);
     if (!rowCount) return res.status(404).json({ error: 'Campaña no encontrada' });
     res.json({ status: 'ok' });
-  } catch (error) { res.status(500).json({ status: 'error', error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.patch('/api/pedidos/admin/announcements/:id/toggle', authenticateToken, async (req, res) => {
@@ -4095,7 +4101,7 @@ app.patch('/api/pedidos/admin/announcements/:id/toggle', authenticateToken, asyn
     `, [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'Campaña no encontrada' });
     res.json({ status: 'ok', announcement: announcementForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image_url) }) });
-  } catch (error) { res.status(500).json({ status: 'error', error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.get('/api/pedidos/admin/announcement', authenticateToken, async (req, res) => {
@@ -4107,7 +4113,7 @@ app.get('/api/pedidos/admin/announcement', authenticateToken, async (req, res) =
     `);
     res.json({ status: 'ok', announcement: rows.length ? announcementForResponse(req, rows[0]) : null });
   } catch (error) {
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -4165,7 +4171,7 @@ app.put('/api/pedidos/admin/announcement', authenticateToken, async (req, res) =
       res.status(201).json({ status: 'ok', announcement: announcementForResponse(req, { ...inserted.rows[0], has_image: Boolean(inserted.rows[0].image_url) }) });
     }
   } catch (error) {
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -4559,7 +4565,7 @@ app.get('/api/pedidos/admin/reports', authenticateToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Error generating reports:', error);
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -4569,7 +4575,7 @@ app.get('/api/pedidos/admin/expenses', authenticateToken, async (req, res) => {
     const { rows } = await pool.query('SELECT * FROM pedidos_app_expenses ORDER BY expense_date DESC, id DESC');
     res.json({ status: 'ok', data: rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return sendInternalError(res, err, 'No fue posible consultar los gastos.', { component: 'expenses' });
   }
 });
 
@@ -4597,8 +4603,8 @@ app.post('/api/pedidos/admin/expenses', authenticateToken, async (req, res) => {
     await client.query('COMMIT');
     res.json({ status: 'ok', data: expense });
   } catch (err) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    await client.query('ROLLBACK').catch(() => {});
+    return sendInternalError(res, err, 'No fue posible registrar el gasto.', { component: 'expenses' });
   } finally {
     client.release();
   }
@@ -4614,7 +4620,7 @@ app.put('/api/pedidos/admin/expenses/:id', authenticateToken, async (req, res) =
     );
     res.json({ status: 'ok', data: rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return sendInternalError(res, err, 'No fue posible actualizar el gasto.', { component: 'expenses' });
   }
 });
 
@@ -4624,7 +4630,7 @@ app.delete('/api/pedidos/admin/expenses/:id', authenticateToken, async (req, res
     await pool.query('DELETE FROM pedidos_app_expenses WHERE id = $1', [id]);
     res.json({ status: 'ok' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return sendInternalError(res, err, 'No fue posible eliminar el gasto.', { component: 'expenses' });
   }
 });
 
@@ -4808,7 +4814,7 @@ app.get('/api/pedidos/admin/closures/preview', authenticateToken, async (req, re
   const invalid = validateClosurePeriod(startDate, endDate);
   if (invalid) return res.status(400).json({ error: invalid });
   try { res.json({ status: 'ok', data: await buildClosurePreview(startDate, endDate) }); }
-  catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+  catch (err) { return sendInternalError(res, err, 'No fue posible generar la vista previa del cierre.', { component: 'closures' }); }
 });
 
 app.post('/api/pedidos/admin/closures', authenticateToken, async (req, res) => {
@@ -4846,7 +4852,7 @@ app.post('/api/pedidos/admin/closures', authenticateToken, async (req, res) => {
       summary.diferenciaEfectivo, notes]);
     await client.query('COMMIT');
     res.status(201).json({ status: 'ok', data: rows[0] });
-  } catch (err) { await client.query('ROLLBACK').catch(() => {}); res.status(500).json({ error: err.message }); }
+  } catch (err) { await client.query('ROLLBACK').catch(() => {}); return sendInternalError(res, err, 'No fue posible registrar el cierre contable.', { component: 'closures' }); }
   finally { client.release(); }
 });
 
@@ -4855,7 +4861,7 @@ app.get('/api/pedidos/admin/closures', authenticateToken, async (req, res) => {
     const { rows } = await pool.query('SELECT * FROM pedidos_app_closures ORDER BY id DESC');
     res.json({ status: 'ok', data: rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return sendInternalError(res, err, 'No fue posible consultar los cierres contables.', { component: 'closures' });
   }
 });
 
@@ -4870,7 +4876,7 @@ app.put('/api/pedidos/admin/closures/:id/reopen', authenticateToken, async (req,
     if (!rows.length) return res.status(404).json({ error: 'Cierre no encontrado o ya está abierto' });
     res.json({ status: 'ok', data: rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return sendInternalError(res, err, 'No fue posible reabrir el cierre contable.', { component: 'closures' });
   }
 });
 
@@ -4885,7 +4891,7 @@ app.get('/api/pedidos/admin/profile', authenticateToken, async (req, res) => {
     `, [req.user.id]);
     res.json({ status: 'ok', data: rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return sendInternalError(res, err, 'No fue posible consultar el perfil.', { component: 'profile' });
   }
 });
 
@@ -4902,7 +4908,7 @@ app.put('/api/pedidos/admin/profile/password', authenticateToken, async (req, re
     await pool.query("INSERT INTO pedidos_app_audit_logs (user_id, action) VALUES ($1, 'Cambio de Contraseña')", [req.user.id]);
     res.json({ status: 'ok' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return sendInternalError(res, err, 'No fue posible actualizar la contraseña.', { component: 'profile' });
   }
 });
 
@@ -4917,7 +4923,7 @@ app.get('/api/pedidos/admin/audit', authenticateToken, async (req, res) => {
     `);
     res.json({ status: 'ok', data: rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return sendInternalError(res, err, 'No fue posible consultar los registros de auditoría.', { component: 'audit' });
   }
 });
 
@@ -4935,7 +4941,7 @@ app.get('/api/pedidos/admin/sessions', authenticateToken, async (req, res) => {
     `);
     res.json({ status: 'ok', data: rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return sendInternalError(res, err, 'No fue posible consultar las sesiones.', { component: 'sessions' });
   }
 });
 
@@ -4952,7 +4958,7 @@ app.get('/api/pedidos/admin/profile/sessions', authenticateToken, async (req, re
     `, [req.user.id, req.user.jti]);
     res.json({ status: 'ok', data: rows });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -4968,7 +4974,7 @@ app.delete('/api/pedidos/admin/profile/sessions/:id', authenticateToken, async (
     await logActivity(req.user.id, 'Perfil', 'Cerrar sesión', `Sesión ID: ${req.params.id}`, req.ip, '', '', {});
     res.json({ status: 'ok', was_current: rows[0].was_current });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -4979,7 +4985,7 @@ app.delete('/api/pedidos/admin/sessions/:id', authenticateToken, async (req, res
     await pool.query("INSERT INTO pedidos_app_audit_logs (user_id, action, details) VALUES ($1, 'Forzar Cierre de Sesión', $2)", [req.user.id, `Sesión ID: ${id}`]);
     res.json({ status: 'ok' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return sendInternalError(res, err, 'No fue posible cerrar la sesión.', { component: 'sessions' });
   }
 });
 
@@ -4992,7 +4998,7 @@ app.put('/api/pedidos/admin/profile/info', authenticateToken, async (req, res) =
     );
     res.json({ status: 'ok', message: 'Perfil actualizado' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -5047,7 +5053,7 @@ app.get('/api/pedidos/admin/users', authenticateToken, requirePermission('Usuari
       ORDER BY COALESCE(u.name, u.username), u.username
     `, [DEFAULT_MAX_ACTIVE_ORDERS, COMMITTED_DELIVERY_STATUSES]);
     res.json({ status: 'ok', data: rows });
-  } catch (error) { res.status(500).json({ error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.post('/api/pedidos/admin/users', authenticateToken, requirePermission('Usuarios', 'crear'), async (req, res) => {
@@ -5072,7 +5078,7 @@ app.post('/api/pedidos/admin/users', authenticateToken, requirePermission('Usuar
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
     if (error.code === '23505') return res.status(409).json({ error: 'El usuario, correo o documento ya está registrado' });
-    res.status(error.statusCode || 500).json({ error: error.message });
+    return sendInternalError(res, error, 'No fue posible crear el usuario.', { component: 'users' });
   } finally { client.release(); }
 });
 
@@ -5115,7 +5121,7 @@ app.put('/api/pedidos/admin/users/:id', authenticateToken, requirePermission('Us
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
     if (error.code === '23505') return res.status(409).json({ error: 'El usuario, correo o documento ya está registrado' });
-    res.status(error.statusCode || 500).json({ error: error.message });
+    return sendInternalError(res, error, 'No fue posible actualizar el usuario.', { component: 'users' });
   } finally { client.release(); }
 });
 
@@ -5129,7 +5135,7 @@ app.delete('/api/pedidos/admin/users/:id', authenticateToken, requirePermission(
     await pool.query("UPDATE pedidos_app_sessions SET status='Cerrada por desactivación', revoked_at=NOW() WHERE user_id=$1 AND status='Activa'", [req.params.id]);
     await logActivity(req.user.id, 'Usuarios', 'Desactivar', `Usuario ID: ${req.params.id}`, req.ip, '', '', {});
     res.json({ status: 'ok' });
-  } catch (error) { res.status(500).json({ error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.get('/api/pedidos/admin/roles', authenticateToken, requirePermission('Roles', 'ver'), async (req, res) => {
@@ -5141,7 +5147,7 @@ app.get('/api/pedidos/admin/roles', authenticateToken, requirePermission('Roles'
       GROUP BY r.id ORDER BY r.is_system_role DESC, r.name
     `);
     res.json({ status: 'ok', data: rows });
-  } catch (error) { res.status(500).json({ error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.get('/api/pedidos/admin/roles-meta', authenticateToken, requirePermission('Roles', 'ver'), async (req, res) => {
@@ -5153,7 +5159,7 @@ app.get('/api/pedidos/admin/roles-meta', authenticateToken, requirePermission('R
       ORDER BY module, action
     `);
     res.json({ status: 'ok', data: rows });
-  } catch (error) { res.status(500).json({ error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.post('/api/pedidos/admin/roles', authenticateToken, requirePermission('Roles', 'crear'), async (req, res) => {
@@ -5163,7 +5169,10 @@ app.post('/api/pedidos/admin/roles', authenticateToken, requirePermission('Roles
     const { rows } = await pool.query('INSERT INTO pedidos_app_roles (name, description) VALUES ($1, $2) RETURNING *', [name, description]);
     await logActivity(req.user.id, 'Roles', 'Crear', `Rol creado: ${name}`, req.ip, '', '', req.body);
     res.json({ status: 'ok', data: rows[0] });
-  } catch (error) { res.status(error.code === '23505' ? 409 : 500).json({ error: error.code === '23505' ? 'Ya existe un rol con ese nombre' : error.message }); }
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ error: 'Ya existe un rol con ese nombre' });
+    return sendInternalError(res, error, 'No fue posible crear el rol.', { component: 'roles' });
+  }
 });
 
 app.put('/api/pedidos/admin/roles/:id', authenticateToken, requirePermission('Roles', 'editar'), async (req, res) => {
@@ -5176,7 +5185,7 @@ app.put('/api/pedidos/admin/roles/:id', authenticateToken, requirePermission('Ro
     await pool.query('UPDATE pedidos_app_roles SET name=$1, description=$2 WHERE id=$3', [safeName, description, id]);
     await logActivity(req.user.id, 'Roles', 'Editar', `Rol editado ID: ${id}`, req.ip, '', '', req.body);
     res.json({ status: 'ok' });
-  } catch (error) { res.status(500).json({ error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.delete('/api/pedidos/admin/roles/:id', authenticateToken, requirePermission('Roles', 'eliminar'), async (req, res) => {
@@ -5190,7 +5199,7 @@ app.delete('/api/pedidos/admin/roles/:id', authenticateToken, requirePermission(
     if (rows[0].is_system_role || rows[0].users_count > 0) return res.status(409).json({ error: 'No se puede eliminar un rol del sistema o asignado a usuarios' });
     await pool.query('DELETE FROM pedidos_app_roles WHERE id=$1', [req.params.id]);
     res.json({ status: 'ok' });
-  } catch (error) { res.status(500).json({ error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.get('/api/pedidos/admin/roles/:id/permissions', authenticateToken, requirePermission('Roles', 'ver'), async (req, res) => {
@@ -5203,7 +5212,7 @@ app.get('/api/pedidos/admin/roles/:id/permissions', authenticateToken, requirePe
       ORDER BY p.module, p.action
     `, [req.params.id]);
     res.json({ status: 'ok', data: rows.map(r => r.permission) });
-  } catch (error) { res.status(500).json({ error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.post('/api/pedidos/admin/roles/:id/permissions', authenticateToken, requirePermission('Roles', 'editar'), async (req, res) => {
@@ -5232,8 +5241,8 @@ app.post('/api/pedidos/admin/roles/:id/permissions', authenticateToken, requireP
     await client.query('COMMIT');
     res.json({ status: 'ok' });
   } catch (error) {
-    await client.query('ROLLBACK');
-    res.status(500).json({ error: error.message });
+    await client.query('ROLLBACK').catch(() => {});
+    return sendInternalError(res, error, 'No fue posible actualizar los permisos del rol.', { component: 'roles' });
   } finally {
     client.release();
   }
@@ -5243,7 +5252,7 @@ app.get('/api/pedidos/admin/permissions', authenticateToken, requirePermission('
   try {
     const { rows } = await pool.query('SELECT * FROM pedidos_app_permissions');
     res.json({ status: 'ok', data: rows });
-  } catch (error) { res.status(500).json({ error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.post('/api/pedidos/admin/permissions', authenticateToken, requirePermission('Permisos', 'crear'), async (req, res) => {
@@ -5251,7 +5260,7 @@ app.post('/api/pedidos/admin/permissions', authenticateToken, requirePermission(
     const { module, action, description } = req.body;
     const { rows } = await pool.query('INSERT INTO pedidos_app_permissions (module, action, description) VALUES ($1, $2, $3) RETURNING *', [module, action, description]);
     res.json({ status: 'ok', data: rows[0] });
-  } catch (error) { res.status(500).json({ error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.put('/api/pedidos/admin/permissions/:id', authenticateToken, requirePermission('Permisos', 'editar'), async (req, res) => {
@@ -5259,14 +5268,14 @@ app.put('/api/pedidos/admin/permissions/:id', authenticateToken, requirePermissi
     const { module, action, description } = req.body;
     await pool.query('UPDATE pedidos_app_permissions SET module=$1, action=$2, description=$3 WHERE id=$4', [module, action, description, req.params.id]);
     res.json({ status: 'ok' });
-  } catch (error) { res.status(500).json({ error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 app.delete('/api/pedidos/admin/permissions/:id', authenticateToken, requirePermission('Permisos', 'eliminar'), async (req, res) => {
   try {
     await pool.query('DELETE FROM pedidos_app_permissions WHERE id=$1', [req.params.id]);
     res.json({ status: 'ok' });
-  } catch (error) { res.status(500).json({ error: error.message }); }
+  } catch (error) { sendInternalError(res, error); }
 });
 
 const PORT = process.env.PORT || 3001;
@@ -5339,6 +5348,10 @@ require('./print_agent_api')(app, {
   pool,
   authenticateToken,
   requirePermission,
+});
+require('./customer_auth_api')(app, {
+  pool,
+  JWT_SECRET,
 });
 
 const deliveryOutbox = createOutboxDispatcher({
@@ -5470,7 +5483,7 @@ app.post('/api/pedidos/admin/combos', authenticateToken, async (req, res) => {
       [combo_product_id]
     );
     if (!comboExists.length) {
-      throw new Error('El producto combo seleccionado no existe.');
+      throw httpError(400, 'El producto combo seleccionado no existe.');
     }
 
     // 2. Validar que el combo no sea componente de otro combo (profundidad = 1)
@@ -5479,7 +5492,7 @@ app.post('/api/pedidos/admin/combos', authenticateToken, async (req, res) => {
       [combo_product_id]
     );
     if (isChildOfAnother.length > 0) {
-      throw new Error('Este producto ya es componente de otro combo y no puede convertirse en combo (no se permite anidación).');
+      throw httpError(400, 'Este producto ya es componente de otro combo y no puede convertirse en combo (no se permite anidación).');
     }
 
     const seenComponents = new Set();
@@ -5490,17 +5503,17 @@ app.post('/api/pedidos/admin/combos', authenticateToken, async (req, res) => {
 
       // Regla: cantidad > 0 y entero
       if (!Number.isInteger(qty) || qty <= 0) {
-        throw new Error('Cada componente debe tener una cantidad entera mayor a cero.');
+        throw httpError(400, 'Cada componente debe tener una cantidad entera mayor a cero.');
       }
 
       // Regla: no componente de sí mismo
       if (compId === String(combo_product_id)) {
-        throw new Error('Un producto no puede ser componente de sí mismo.');
+        throw httpError(400, 'Un producto no puede ser componente de sí mismo.');
       }
 
       // Regla: no duplicados
       if (seenComponents.has(compId)) {
-        throw new Error('No se permiten componentes duplicados en el mismo combo.');
+        throw httpError(400, 'No se permiten componentes duplicados en el mismo combo.');
       }
       seenComponents.add(compId);
 
@@ -5510,7 +5523,7 @@ app.post('/api/pedidos/admin/combos', authenticateToken, async (req, res) => {
         [compId]
       );
       if (!compExists.length) {
-        throw new Error(`El componente con ID ${compId} no existe.`);
+        throw httpError(400, `El componente con ID ${compId} no existe.`);
       }
 
       // Regla: el componente no puede ser un combo a su vez (no anidación circular ni multinivel)
@@ -5519,7 +5532,7 @@ app.post('/api/pedidos/admin/combos', authenticateToken, async (req, res) => {
         [compId]
       );
       if (compIsCombo.length > 0) {
-        throw new Error(`El producto "${compExists[0].title}" ya es un combo. No se permite anidar combos dentro de combos.`);
+        throw httpError(400, `El producto "${compExists[0].title}" ya es un combo. No se permite anidar combos dentro de combos.`);
       }
     }
 
@@ -5541,8 +5554,8 @@ app.post('/api/pedidos/admin/combos', authenticateToken, async (req, res) => {
     await client.query('COMMIT');
     res.json({ status: 'ok', message: 'Combo configurado correctamente.' });
   } catch (error) {
-    await client.query('ROLLBACK');
-    res.status(400).json({ status: 'error', error: error.message });
+    await client.query('ROLLBACK').catch(() => {});
+    return sendInternalError(res, error, 'No fue posible configurar el combo.', { component: 'combos' });
   } finally {
     client.release();
   }
@@ -5592,7 +5605,10 @@ app.post('/api/pedidos/admin/recipes', authenticateToken, async (req, res) => {
     );
     res.json({ status: 'ok', recipe: rows[0] });
   } catch (error) {
-    res.status(400).json({ status: 'error', error: error.message });
+    if (error.code === '23503' || error.code === '22P02') {
+      return res.status(400).json({ status: 'error', error: 'El producto o insumo especificado no es válido.' });
+    }
+    return sendInternalError(res, error, 'No fue posible guardar la receta.', { component: 'recipes' });
   }
 });
 
@@ -5628,7 +5644,7 @@ app.post('/api/pedidos/admin/recipes/copy', authenticateToken, async (req, res) 
     );
 
     if (!sourceItems.length) {
-      throw new Error('El producto origen no tiene una receta técnica configurada.');
+      throw httpError(400, 'El producto origen no tiene una receta técnica configurada.');
     }
 
     // 2. Si el modo es 'replace' (por defecto), eliminar la receta actual del producto destino
@@ -5659,8 +5675,8 @@ app.post('/api/pedidos/admin/recipes/copy', authenticateToken, async (req, res) 
 
     res.json({ status: 'ok', copied_count: sourceItems.length, recipes: updatedRows });
   } catch (error) {
-    await client.query('ROLLBACK');
-    res.status(400).json({ status: 'error', error: error.message });
+    await client.query('ROLLBACK').catch(() => {});
+    return sendInternalError(res, error, 'No fue posible copiar la receta.', { component: 'recipes' });
   } finally {
     client.release();
   }
@@ -5742,7 +5758,7 @@ app.get('/api/pedidos/admin/profitability', authenticateToken, async (req, res) 
 
     res.json({ status: 'ok', data: profitability });
   } catch (error) {
-    res.status(500).json({ status: 'error', error: error.message });
+    sendInternalError(res, error);
   }
 });
 
@@ -5840,7 +5856,7 @@ app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req
       'SELECT id, name, unit, stock, track_stock, average_cost, purchase_unit, conversion_factor FROM pedidos_app_inventory WHERE id::text = $1 FOR UPDATE',
       [inventory_id]
     );
-    if (!invRows.length) throw new Error('El insumo no existe.');
+    if (!invRows.length) throw httpError(400, 'El insumo no existe.');
     
     const inv = invRows[0];
     const baseUnit = (inv.unit || 'unidad').toLowerCase().trim();
@@ -5854,16 +5870,16 @@ app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req
       if (['kg', 'kilogramos', 'kilos', 'kilo'].includes(pUnit)) conversionMultiplier = 1000;
       else if (['lb', 'libras', 'libra'].includes(pUnit)) conversionMultiplier = 500;
       else if (['gramos', 'g'].includes(pUnit)) conversionMultiplier = 1;
-      else throw new Error(`La unidad de compra "${pUnit}" no es compatible con la unidad base "${baseUnit}". Usa Kg o gramos.`);
+      else throw httpError(400, `La unidad de compra "${pUnit}" no es compatible con la unidad base "${baseUnit}". Usa Kg o gramos.`);
     } else if (['mililitros', 'ml'].includes(baseUnit)) {
       if (['l', 'litros', 'litro'].includes(pUnit)) conversionMultiplier = 1000;
       else if (['mililitros', 'ml'].includes(pUnit)) conversionMultiplier = 1;
-      else throw new Error(`La unidad de compra "${pUnit}" no es compatible con la unidad base "${baseUnit}". Usa Litros o ml.`);
+      else throw httpError(400, `La unidad de compra "${pUnit}" no es compatible con la unidad base "${baseUnit}". Usa Litros o ml.`);
     } else if (['unidad', 'unidades', 'unid'].includes(baseUnit)) {
       if (['unidad', 'unidades', 'unid'].includes(pUnit)) conversionMultiplier = 1;
       else if (['docena', 'docenas'].includes(pUnit)) conversionMultiplier = 12;
       else if (['kg', 'g', 'l', 'ml'].includes(pUnit)) {
-        throw new Error(`No es posible convertir "${pUnit}" a unidades físicas sin una regla de rendimiento.`);
+        throw httpError(400, `No es posible convertir "${pUnit}" a unidades físicas sin una regla de rendimiento.`);
       }
     }
 
@@ -5876,7 +5892,7 @@ app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req
     } else if (Number.isFinite(inputUnitCost) && inputUnitCost >= 0) {
       finalTotalCost = rawQty * inputUnitCost;
     } else {
-      throw new Error('Debes indicar el costo total o el costo unitario de la compra.');
+      throw httpError(400, 'Debes indicar el costo total o el costo unitario de la compra.');
     }
 
     const finalUnitCostBase = Math.round((finalTotalCost / convertedQty) * 10000) / 10000;
@@ -5939,8 +5955,8 @@ app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req
     await client.query('COMMIT');
     res.json({ status: 'ok', purchase: purchaseRows[0] });
   } catch (error) {
-    await client.query('ROLLBACK');
-    res.status(400).json({ status: 'error', error: error.message });
+    await client.query('ROLLBACK').catch(() => {});
+    return sendInternalError(res, error, 'No fue posible registrar la compra de inventario.', { component: 'inventory-purchases' });
   } finally {
     client.release();
   }
@@ -5968,7 +5984,7 @@ app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, async (
        WHERE p.id = $1 FOR UPDATE`,
       [id]
     );
-    if (!purRows.length) throw new Error('La compra no existe.');
+    if (!purRows.length) throw httpError(400, 'La compra no existe.');
     const originalPurchase = purRows[0];
     const inventoryId = originalPurchase.inventory_id;
 
@@ -5977,7 +5993,7 @@ app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, async (
       'SELECT id, name, unit, stock, track_stock, average_cost FROM pedidos_app_inventory WHERE id = $1 FOR UPDATE',
       [inventoryId]
     );
-    if (!invRows.length) throw new Error('Insumo no encontrado.');
+    if (!invRows.length) throw httpError(400, 'Insumo no encontrado.');
     const inv = invRows[0];
 
     const baseUnit = (inv.unit || 'unidad').toLowerCase().trim();
@@ -5989,11 +6005,11 @@ app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, async (
       if (['kg', 'kilogramos', 'kilos', 'kilo'].includes(pUnit)) conversionMultiplier = 1000;
       else if (['lb', 'libras', 'libra'].includes(pUnit)) conversionMultiplier = 500;
       else if (['gramos', 'g'].includes(pUnit)) conversionMultiplier = 1;
-      else throw new Error(`La unidad de compra "${pUnit}" no es compatible con la unidad base "${baseUnit}".`);
+      else throw httpError(400, `La unidad de compra "${pUnit}" no es compatible con la unidad base "${baseUnit}".`);
     } else if (['mililitros', 'ml'].includes(baseUnit)) {
       if (['l', 'litros', 'litro'].includes(pUnit)) conversionMultiplier = 1000;
       else if (['mililitros', 'ml'].includes(pUnit)) conversionMultiplier = 1;
-      else throw new Error(`La unidad de compra "${pUnit}" no es compatible con la unidad base "${baseUnit}".`);
+      else throw httpError(400, `La unidad de compra "${pUnit}" no es compatible con la unidad base "${baseUnit}".`);
     } else if (['unidad', 'unidades', 'unid'].includes(baseUnit)) {
       if (['unidad', 'unidades', 'unid'].includes(pUnit)) conversionMultiplier = 1;
       else if (['docena', 'docenas'].includes(pUnit)) conversionMultiplier = 12;
@@ -6008,7 +6024,7 @@ app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, async (
     } else if (Number.isFinite(inputUnitCost) && inputUnitCost >= 0) {
       newFinalTotalCost = rawQty * inputUnitCost;
     } else {
-      throw new Error('Debes indicar el costo total o el costo unitario de la compra.');
+      throw httpError(400, 'Debes indicar el costo total o el costo unitario de la compra.');
     }
 
     const newUnitCostBase = Math.round((newFinalTotalCost / newConvertedQty) * 10000) / 10000;
@@ -6024,7 +6040,7 @@ app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, async (
 
     // Validación de seguridad física
     if (newStock < 0) {
-      throw new Error(`No es posible reducir la compra a ${newConvertedQty} ${baseUnit}: el insumo ya fue consumido y el stock actual (${currentStock} ${baseUnit}) quedaría negativo (${newStock} ${baseUnit}).`);
+      throw httpError(400, `No es posible reducir la compra a ${newConvertedQty} ${baseUnit}: el insumo ya fue consumido y el stock actual (${currentStock} ${baseUnit}) quedaría negativo (${newStock} ${baseUnit}).`);
     }
 
     // Recálculo seguro de costo promedio ponderado
@@ -6139,8 +6155,8 @@ app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, async (
       average_cost: newAvgCost
     });
   } catch (error) {
-    await client.query('ROLLBACK');
-    res.status(400).json({ status: 'error', error: error.message });
+    await client.query('ROLLBACK').catch(() => {});
+    return sendInternalError(res, error, 'No fue posible actualizar la compra de inventario.', { component: 'inventory-purchases' });
   } finally {
     client.release();
   }
@@ -6164,7 +6180,7 @@ app.post('/api/pedidos/admin/inventory-adjustments', authenticateToken, async (r
   try {
     await client.query('BEGIN');
     const { rows: invRows } = await client.query('SELECT id, name, unit, stock FROM pedidos_app_inventory WHERE id::text = $1 FOR UPDATE', [inventory_id]);
-    if (!invRows.length) throw new Error('El insumo no existe.');
+    if (!invRows.length) throw httpError(400, 'El insumo no existe.');
 
     const inv = invRows[0];
     const prevStock = Number(inv.stock) || 0;
@@ -6194,8 +6210,8 @@ app.post('/api/pedidos/admin/inventory-adjustments', authenticateToken, async (r
     await client.query('COMMIT');
     res.json({ status: 'ok', balance_after: newStock, delta: actualDelta });
   } catch (error) {
-    await client.query('ROLLBACK');
-    res.status(400).json({ status: 'error', error: error.message });
+    await client.query('ROLLBACK').catch(() => {});
+    return sendInternalError(res, error, 'No fue posible registrar el ajuste de inventario.', { component: 'inventory-adjustments' });
   } finally {
     client.release();
   }
@@ -6282,8 +6298,11 @@ app.use('/api/pedidos', (req, res) => {
 
 app.use((error, req, res, next) => {
   if (!req.path.startsWith('/api/pedidos')) return next(error);
-  console.error('Error HTTP no controlado:', error.message);
-  return res.status(error.statusCode || 500).json({ error: 'No fue posible procesar la solicitud' });
+  console.error('Error HTTP no controlado:', redactSensitiveText(error?.message || error));
+  if (isClientError(error)) {
+    return res.status(error.statusCode).json({ error: 'Solicitud inválida o mal formada' });
+  }
+  return res.status(500).json({ error: 'No fue posible procesar la solicitud' });
 });
 
 if (!process.env.VERCEL) {

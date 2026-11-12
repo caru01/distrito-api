@@ -411,10 +411,10 @@ class DeliveryOrderService {
     });
   }
 
-  async reserveOrder({ orderId, driverId, actor, idempotencyKey, notes }) {
+  async reserveOrder({ orderId, driverId, actor, idempotencyKey, notes, allowReassign = false }) {
     return this.withOperation({
       operation: 'reserveOrder', key: idempotencyKey, actorId: actor.id, orderId,
-      request: { driverId },
+      request: { driverId, allowReassign: Boolean(allowReassign) },
     }, async (client) => {
       const profile = await this.lockProfile(client, driverId);
       // Asignación directa desde administración: no exigir app activa ni GPS en vivo
@@ -427,9 +427,12 @@ class DeliveryOrderService {
       }
       const { rows: currentRows } = await client.query('SELECT * FROM pedidos_app_orders WHERE id=$1 FOR UPDATE', [orderId]);
       const current = currentRows[0];
-      if (!current || !['Listo', 'En camino'].includes(current.status)
+      if (!current || !['Listo'].includes(current.status)
           || String(current.delivery_type || '').toLowerCase() !== 'domicilio') {
         throw domainError('ORDER_ALREADY_TAKEN', 'El pedido ya no está disponible para asignación.', 409);
+      }
+      if (current.delivery_status !== 'Pendiente' && !allowReassign && Number(current.delivery_user_id) !== Number(driverId)) {
+        throw domainError('ORDER_ALREADY_TAKEN', 'El pedido ya fue aceptado por otro domiciliario.', 409);
       }
       const committed = await this.committedCount(client, driverId);
       const addsCommitment = Number(current.delivery_user_id || 0) !== Number(driverId);
@@ -465,8 +468,8 @@ class DeliveryOrderService {
         UPDATE pedidos_app_orders
         SET delivery_user_id=$1,
             delivery_provider_type=CASE WHEN $3::int IS NOT NULL THEN 'external_manual' ELSE 'own' END,
-            delivery_status=CASE WHEN $3::int IS NOT NULL THEN 'Pendiente' ELSE 'En camino' END,
-            status=CASE WHEN $3::int IS NOT NULL THEN 'Listo' ELSE 'En camino' END,
+            delivery_status=CASE WHEN $3::int IS NOT NULL THEN 'Pendiente' ELSE 'Aceptado' END,
+            status='Listo',
             external_delivery_company_id=$3,
             external_driver_id=$4,
             external_driver_name=$5,
@@ -475,15 +478,16 @@ class DeliveryOrderService {
             external_delivery_cost=$8,
             external_assigned_at=CASE WHEN $3::int IS NOT NULL THEN NOW() ELSE NULL END,
             delivery_accepted_at=CASE WHEN $3::int IS NULL THEN NOW() ELSE NULL END,
-            picked_up_at=CASE WHEN $3::int IS NULL THEN NOW() ELSE NULL END,
-            on_the_way_at=CASE WHEN $3::int IS NULL THEN NOW() ELSE NULL END,
+            picked_up_at=NULL,
+            on_the_way_at=NULL,
             external_delivery_notes=COALESCE($9, external_delivery_notes),
             external_eta_minutes=NULL, external_provider_reference=NULL,
             external_handed_off_at=NULL, accepted_by_device_id=NULL,
             version=version+1, updated_at=NOW()
-        WHERE id=$2 AND (status='Listo' OR status='En camino')
+        WHERE id=$2 AND status='Listo' AND (delivery_status='Pendiente' OR $10 = TRUE)
+          AND (delivery_user_id IS NULL OR delivery_user_id=$1 OR $10 = TRUE)
         RETURNING *
-      `, [driverId, orderId, extCompanyId, extDriverId, extDriverName, extDriverPhone, extVehicleId, extDeliveryCost, notes || null]);
+      `, [driverId, orderId, extCompanyId, extDriverId, extDriverName, extDriverPhone, extVehicleId, extDeliveryCost, notes || null, Boolean(allowReassign)]);
       if (!rows.length) throw domainError('ORDER_ALREADY_TAKEN', 'El pedido ya no está disponible para asignación.', 409);
       await client.query(`
         INSERT INTO pedidos_app_delivery_events

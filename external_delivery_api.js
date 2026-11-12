@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
+const { redactSensitiveText, sendInternalError } = require('./src/http-errors');
 
 const PROVIDER_TYPES = new Set(['external_manual', 'external_api']);
 
@@ -79,7 +80,7 @@ async function checkDriverWhatsAppWindow(pool, rawPhone) {
     `, [cleanPhone]);
     return Boolean(rows[0]?.is_window_open);
   } catch (err) {
-    console.error('[external_delivery] Error checking WhatsApp window:', err);
+    console.error('[external_delivery] Error checking WhatsApp window:', redactSensitiveText(err?.message || err));
     return false;
   }
 }
@@ -139,8 +140,7 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
       if (rows.length === 0) return res.status(403).json({ error: 'No tienes permiso para realizar esta acción' });
       next();
     } catch (e) {
-      console.error('Error verifying permissions:', e);
-      res.status(500).json({ error: 'Error interno verificando permisos' });
+      return sendInternalError(res, e, 'Error interno verificando permisos', { component: 'external-delivery' });
     }
   };
 
@@ -192,8 +192,7 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
       `);
       res.json({ status: 'ok', companies: rows });
     } catch (error) {
-      console.error('Error consultando empresas de domicilios:', error);
-      res.status(500).json({ error: 'No fue posible cargar las empresas de domicilios' });
+      return sendInternalError(res, error, 'No fue posible cargar las empresas de domicilios', { component: 'external-delivery' });
     }
   });
 
@@ -333,8 +332,7 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
       `, [companyId]);
       res.json({ status: 'ok', drivers: rows });
     } catch (error) {
-      console.error('Error fetching company drivers:', error);
-      res.status(500).json({ error: 'No fue posible consultar los mensajeros de la empresa' });
+      return sendInternalError(res, error, 'No fue posible consultar los mensajeros de la empresa', { component: 'external-delivery' });
     }
   });
 
@@ -416,8 +414,10 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
       res.status(201).json({ status: 'ok', driver: rows[0] });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
-      console.error('Error creating company driver:', error);
-      res.status(500).json({ error: error.message || 'No fue posible registrar el mensajero' });
+      if (error?.code === '23505') {
+        return res.status(409).json({ status: 'error', error: 'Ya existe un mensajero o usuario registrado con esos datos' });
+      }
+      return sendInternalError(res, error, 'No fue posible registrar el mensajero', { component: 'external-delivery-api' });
     } finally {
       client.release();
     }
@@ -542,8 +542,10 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
       res.json({ status: 'ok', driver: rows[0] });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
-      console.error('Error updating company driver:', error);
-      res.status(500).json({ error: error.message || 'No fue posible actualizar el mensajero' });
+      if (error?.code === '23505') {
+        return res.status(409).json({ status: 'error', error: 'Ya existe otro usuario o mensajero con esos datos' });
+      }
+      return sendInternalError(res, error, 'No fue posible actualizar el mensajero', { component: 'external-delivery-api' });
     } finally {
       client.release();
     }
@@ -563,8 +565,7 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
       if (!rowCount) return res.status(404).json({ error: 'Mensajero no encontrado' });
       res.json({ status: 'ok', message: 'Mensajero eliminado' });
     } catch (error) {
-      console.error('Error deleting company driver:', error);
-      res.status(500).json({ error: 'No fue posible eliminar el mensajero' });
+      return sendInternalError(res, error, 'No fue posible eliminar el mensajero', { component: 'external-delivery' });
     }
   });
 
@@ -613,8 +614,7 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
 
       res.json({ status: 'ok', orders: rows });
     } catch (error) {
-      console.error('Error consultando pedidos de la empresa:', error);
-      res.status(500).json({ error: 'No fue posible cargar los pedidos de la empresa' });
+      return sendInternalError(res, error, 'No fue posible cargar los pedidos de la empresa', { component: 'external-delivery' });
     }
   });
 
@@ -724,8 +724,7 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
-      console.error('Error asignando operador externo:', error);
-      return res.status(500).json({ error: 'No fue posible asignar la empresa externa' });
+      return sendInternalError(res, error, 'No fue posible asignar la empresa externa', { component: 'external-delivery' });
     } finally {
       client.release();
     }
@@ -746,8 +745,8 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
         whatsappSent = true;
         console.log(`[external_delivery] Mensaje de entrega #${orderId} enviado por WhatsApp a mensajero externo (${driverPhone})`);
       } catch (waErr) {
-        whatsappError = waErr.message;
-        console.error(`[external_delivery] Error enviando WhatsApp al mensajero (${driverPhone}):`, waErr.message);
+        whatsappError = redactSensitiveText(waErr?.message || 'Error enviando WhatsApp');
+        console.error(`[external_delivery] Error enviando WhatsApp al mensajero (${driverPhone}):`, whatsappError);
       }
     }
 
@@ -798,8 +797,7 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
       return res.json({ status: 'ok', order: rows[0] });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
-      console.error('Error cambiando estado de entrega externa:', error);
-      return res.status(500).json({ error: 'No fue posible actualizar la entrega externa' });
+      return sendInternalError(res, error, 'No fue posible actualizar la entrega externa', { component: 'external-delivery' });
     } finally {
       client.release();
     }
@@ -844,8 +842,7 @@ module.exports = function registerExternalDeliveryApi(app, dependencies) {
       res.json({ status: 'ok', order: rows[0] });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
-      console.error('Error confirmando entrega externa:', error);
-      res.status(500).json({ error: error.message || 'No fue posible confirmar la entrega externa' });
+      return sendInternalError(res, error, 'No fue posible confirmar la entrega externa', { component: 'external-delivery-api' });
     } finally {
       client.release();
     }

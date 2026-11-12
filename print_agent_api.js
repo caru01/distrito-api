@@ -12,6 +12,7 @@
 
 const rateLimit = require('express-rate-limit');
 const domain = require('./src/print-agent-domain');
+const { isClientError, redactSensitiveText } = require('./src/http-errors');
 
 const SWEEP_INTERVAL_MS = 30_000;
 const AGENT_POLL_INTERVAL_MS = 2_000;
@@ -100,9 +101,14 @@ module.exports = function registerPrintAgentApi(app, { pool, authenticateToken, 
   }
 
   function sendError(res, error, fallback) {
-    const status = error.statusCode || 500;
-    if (status >= 500) console.error(JSON.stringify({ level: 'error', component: 'print-agent', message: error.message }));
-    res.status(status).json({ error: status >= 500 ? fallback : error.message, ...(error.details ? { details: error.details } : {}) });
+    const clientErr = isClientError(error);
+    const status = clientErr ? error.statusCode : 500;
+    if (!clientErr) console.error(JSON.stringify({ level: 'error', component: 'print-agent', message: redactSensitiveText(error?.message || error) }));
+    if (res.headersSent) return undefined;
+    return res.status(status).json({
+      error: clientErr ? error.message : fallback,
+      ...(clientErr && error.details ? { details: error.details } : {}),
+    });
   }
 
   function httpError(statusCode, message, details) {
@@ -716,7 +722,7 @@ module.exports = function registerPrintAgentApi(app, { pool, authenticateToken, 
       await withTransaction((client) => sweepStaleTargets(client));
     } catch (error) {
       if (!/does not exist/i.test(error.message)) {
-        console.error(JSON.stringify({ level: 'error', component: 'print-agent-sweeper', message: error.message }));
+        console.error(JSON.stringify({ level: 'error', component: 'print-agent-sweeper', message: redactSensitiveText(error?.message || error) }));
       }
     } finally {
       sweeping = false;

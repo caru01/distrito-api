@@ -3,8 +3,33 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { whatsappRecipient } = require('./crm/phone');
 
+function removeInvalidUtf16(value) {
+  let result = '';
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xD800 && code <= 0xDBFF) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xDC00 && next <= 0xDFFF) {
+        result += value[index] + value[index + 1];
+        index += 1;
+      }
+      continue;
+    }
+    if (code >= 0xDC00 && code <= 0xDFFF) continue;
+    result += value[index];
+  }
+  return result;
+}
+
+function normalizeUnicodeText(value) {
+  return removeInvalidUtf16(String(value ?? ''))
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\uFFFD/g, '')
+    .normalize('NFC');
+}
+
 function normalizePayload(value) {
-  if (typeof value === 'string') return value.replace(/[\u200B-\u200D\uFEFF]/g, '');
+  if (typeof value === 'string') return normalizeUnicodeText(value);
   if (Array.isArray(value)) return value.map((item) => normalizePayload(item));
   if (!value || typeof value !== 'object') return value;
   return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, normalizePayload(item)]));

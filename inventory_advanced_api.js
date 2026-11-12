@@ -11,6 +11,8 @@
  * 6. Generador Inteligente de Pedidos a Proveedores vía WhatsApp.
  */
 
+const { httpError, sendInternalError } = require('./src/http-errors');
+
 module.exports = function(app, { pool, authenticateToken }) {
 
   // ==========================================
@@ -46,8 +48,7 @@ module.exports = function(app, { pool, authenticateToken }) {
       `);
       res.json({ status: 'ok', suppliers: rows });
     } catch (error) {
-      console.error('Error al listar proveedores:', error);
-      res.status(500).json({ status: 'error', error: error.message });
+      return sendInternalError(res, error, 'No fue posible listar los proveedores.', { component: 'inventory-advanced-api' });
     }
   });
 
@@ -89,8 +90,7 @@ module.exports = function(app, { pool, authenticateToken }) {
 
       res.json({ status: 'ok', supplier: rows[0] });
     } catch (error) {
-      console.error('Error al crear proveedor:', error);
-      res.status(500).json({ status: 'error', error: error.message });
+      return sendInternalError(res, error, 'No fue posible registrar el proveedor.', { component: 'inventory-advanced-api' });
     }
   });
 
@@ -135,8 +135,10 @@ module.exports = function(app, { pool, authenticateToken }) {
 
       res.json({ status: 'ok', supplier: rows[0] });
     } catch (error) {
-      console.error('Error al actualizar proveedor:', error);
-      res.status(500).json({ status: 'error', error: error.message });
+      if (error?.code === '23505') {
+        return res.status(409).json({ status: 'error', error: 'Ya existe otro proveedor con ese nombre.' });
+      }
+      return sendInternalError(res, error, 'No fue posible actualizar el proveedor.', { component: 'inventory-advanced-api' });
     }
   });
 
@@ -158,8 +160,7 @@ module.exports = function(app, { pool, authenticateToken }) {
       await pool.query('DELETE FROM pedidos_app_suppliers WHERE id = $1', [id]);
       res.json({ status: 'ok', message: 'Proveedor eliminado correctamente' });
     } catch (error) {
-      console.error('Error al eliminar proveedor:', error);
-      res.status(500).json({ status: 'error', error: error.message });
+      return sendInternalError(res, error, 'No fue posible eliminar el proveedor.', { component: 'inventory-advanced-api' });
     }
   });
 
@@ -230,8 +231,7 @@ module.exports = function(app, { pool, authenticateToken }) {
         grouped: Object.values(grouped) 
       });
     } catch (error) {
-      console.error('Error al listar subrecetas:', error);
-      res.status(500).json({ status: 'error', error: error.message });
+      return sendInternalError(res, error, 'No fue posible listar las sub-recetas.', { component: 'inventory-advanced-api' });
     }
   });
 
@@ -272,9 +272,11 @@ module.exports = function(app, { pool, authenticateToken }) {
       await client.query('COMMIT');
       res.json({ status: 'ok', subrecipe: rows[0] });
     } catch (error) {
-      await client.query('ROLLBACK');
-      console.error('Error al guardar ingrediente en subreceta:', error);
-      res.status(400).json({ status: 'error', error: error.message });
+      await client.query('ROLLBACK').catch(() => {});
+      if (error?.code === '23503' || error?.code === '22P02') {
+        return res.status(400).json({ status: 'error', error: 'El insumo preparado o ingrediente especificado no es válido.' });
+      }
+      return sendInternalError(res, error, 'No fue posible guardar el ingrediente en la sub-receta.', { component: 'inventory-advanced-api' });
     } finally {
       client.release();
     }
@@ -287,8 +289,7 @@ module.exports = function(app, { pool, authenticateToken }) {
       await pool.query('DELETE FROM pedidos_app_subrecipes WHERE id = $1', [id]);
       res.json({ status: 'ok', message: 'Ingrediente eliminado de la subreceta' });
     } catch (error) {
-      console.error('Error al eliminar de subreceta:', error);
-      res.status(500).json({ status: 'error', error: error.message });
+      return sendInternalError(res, error, 'No fue posible eliminar el ingrediente de la sub-receta.', { component: 'inventory-advanced-api' });
     }
   });
 
@@ -313,7 +314,7 @@ module.exports = function(app, { pool, authenticateToken }) {
         'SELECT id, name, unit, stock, average_cost FROM pedidos_app_inventory WHERE id = $1 FOR UPDATE',
         [target_inventory_id]
       );
-      if (!targetRows.length) throw new Error('El insumo preparado no existe');
+      if (!targetRows.length) throw httpError(400, 'El insumo preparado no existe');
       const targetItem = targetRows[0];
 
       // 2. Obtener fórmula de sub-receta
@@ -332,7 +333,7 @@ module.exports = function(app, { pool, authenticateToken }) {
       `, [target_inventory_id]);
 
       if (!ingredients.length) {
-        throw new Error(`El insumo "${targetItem.name}" no tiene ingredientes configurados en su sub-receta técnica.`);
+        throw httpError(400, `El insumo "${targetItem.name}" no tiene ingredientes configurados en su sub-receta técnica.`);
       }
 
       // 3. Crear el registro del Lote de Producción
@@ -451,9 +452,8 @@ module.exports = function(app, { pool, authenticateToken }) {
         consumed: consumedDetails
       });
     } catch (error) {
-      await client.query('ROLLBACK');
-      console.error('Error al procesar lote de producción:', error);
-      res.status(400).json({ status: 'error', error: error.message });
+      await client.query('ROLLBACK').catch(() => {});
+      return sendInternalError(res, error, 'No fue posible registrar el lote de producción.', { component: 'inventory-advanced-api' });
     } finally {
       client.release();
     }
@@ -481,8 +481,7 @@ module.exports = function(app, { pool, authenticateToken }) {
       `);
       res.json({ status: 'ok', batches: rows });
     } catch (error) {
-      console.error('Error al listar lotes de producción:', error);
-      res.status(500).json({ status: 'error', error: error.message });
+      return sendInternalError(res, error, 'No fue posible consultar los lotes de producción.', { component: 'inventory-advanced-api' });
     }
   });
 
@@ -510,8 +509,7 @@ module.exports = function(app, { pool, authenticateToken }) {
         updated_at: rows[0].updated_at
       });
     } catch (error) {
-      console.error('Error al obtener plan de producción:', error);
-      res.status(500).json({ status: 'error', error: error.message });
+      return sendInternalError(res, error, 'No fue posible consultar el plan de producción.', { component: 'inventory-advanced-api' });
     }
   });
 
@@ -542,8 +540,7 @@ module.exports = function(app, { pool, authenticateToken }) {
         updated_at: rows[0].updated_at
       });
     } catch (error) {
-      console.error('Error al guardar plan de producción:', error);
-      res.status(500).json({ status: 'error', error: error.message });
+      return sendInternalError(res, error, 'No fue posible guardar el plan de producción.', { component: 'inventory-advanced-api' });
     }
   });
 
@@ -557,8 +554,7 @@ module.exports = function(app, { pool, authenticateToken }) {
       `);
       res.json({ status: 'ok', message: 'Plan de producción reiniciado', plan: {} });
     } catch (error) {
-      console.error('Error al reiniciar plan de producción:', error);
-      res.status(500).json({ status: 'error', error: error.message });
+      return sendInternalError(res, error, 'No fue posible reiniciar el plan de producción.', { component: 'inventory-advanced-api' });
     }
   });
 
@@ -589,8 +585,7 @@ module.exports = function(app, { pool, authenticateToken }) {
       `);
       res.json({ status: 'ok', modifiers: rows });
     } catch (error) {
-      console.error('Error al listar recetas de modificadores:', error);
-      res.status(500).json({ status: 'error', error: error.message });
+      return sendInternalError(res, error, 'No fue posible listar las recetas de modificadores.', { component: 'inventory-advanced-api' });
     }
   });
 
@@ -623,8 +618,10 @@ module.exports = function(app, { pool, authenticateToken }) {
 
       res.json({ status: 'ok', modifier_recipe: rows[0] });
     } catch (error) {
-      console.error('Error al guardar receta de modificador:', error);
-      res.status(400).json({ status: 'error', error: error.message });
+      if (error?.code === '23503' || error?.code === '22P02') {
+        return res.status(400).json({ status: 'error', error: 'El insumo especificado no es válido.' });
+      }
+      return sendInternalError(res, error, 'No fue posible guardar la receta de modificador.', { component: 'inventory-advanced-api' });
     }
   });
 
@@ -634,8 +631,7 @@ module.exports = function(app, { pool, authenticateToken }) {
       await pool.query('DELETE FROM pedidos_app_modifier_recipes WHERE id = $1', [req.params.id]);
       res.json({ status: 'ok', message: 'Receta de modificador eliminada' });
     } catch (error) {
-      console.error('Error al eliminar modificador:', error);
-      res.status(500).json({ status: 'error', error: error.message });
+      return sendInternalError(res, error, 'No fue posible eliminar la receta de modificador.', { component: 'inventory-advanced-api' });
     }
   });
 
@@ -760,9 +756,8 @@ module.exports = function(app, { pool, authenticateToken }) {
         details: results
       });
     } catch (error) {
-      await client.query('ROLLBACK');
-      console.error('Error al conciliar auditoría:', error);
-      res.status(400).json({ status: 'error', error: error.message });
+      await client.query('ROLLBACK').catch(() => {});
+      return sendInternalError(res, error, 'No fue posible conciliar la auditoría de inventario.', { component: 'inventory-advanced-api' });
     } finally {
       client.release();
     }
@@ -786,8 +781,7 @@ module.exports = function(app, { pool, authenticateToken }) {
       `);
       res.json({ status: 'ok', audits: rows });
     } catch (error) {
-      console.error('Error al listar auditorías:', error);
-      res.status(500).json({ status: 'error', error: error.message });
+      return sendInternalError(res, error, 'No fue posible listar las auditorías de inventario.', { component: 'inventory-advanced-api' });
     }
   });
 
@@ -814,8 +808,7 @@ module.exports = function(app, { pool, authenticateToken }) {
 
       res.json({ status: 'ok', audit: auditRows[0], items: itemRows });
     } catch (error) {
-      console.error('Error al obtener detalle de auditoría:', error);
-      res.status(500).json({ status: 'error', error: error.message });
+      return sendInternalError(res, error, 'No fue posible consultar el detalle de la auditoría.', { component: 'inventory-advanced-api' });
     }
   });
 
@@ -881,8 +874,7 @@ module.exports = function(app, { pool, authenticateToken }) {
         top_valued: topValued
       });
     } catch (error) {
-      console.error('Error al calcular valoración de inventario:', error);
-      res.status(500).json({ status: 'error', error: error.message });
+      return sendInternalError(res, error, 'No fue posible calcular la valoración de inventario.', { component: 'inventory-advanced-api' });
     }
   });
 
@@ -947,8 +939,7 @@ module.exports = function(app, { pool, authenticateToken }) {
 
       res.json({ status: 'ok', suggestions });
     } catch (error) {
-      console.error('Error al generar sugerencias de compras:', error);
-      res.status(500).json({ status: 'error', error: error.message });
+      return sendInternalError(res, error, 'No fue posible generar las sugerencias de compra.', { component: 'inventory-advanced-api' });
     }
   });
 

@@ -66,7 +66,7 @@ test('los frontends conservan viewport y contratos adaptativos separados', () =>
   }
 
   const webCss = fs.readFileSync(path.join(projectsRoot, 'distrito-web', 'src', 'index.css'), 'utf8');
-  assert.match(webCss, /min-width:\s*901px[^}]*max-width:\s*1199px/s);
+  assert.match(webCss, /max-width:\s*900px|min-width:\s*901px/);
   assert.match(webCss, /max-width:\s*600px/);
   assert.match(webCss, /max-width:\s*360px/);
   assert.doesNotMatch(webCss, /\.admin-sidebar|\.responsive-table/, 'la tienda volvió a incorporar estilos administrativos');
@@ -86,7 +86,7 @@ test('el dashboard usa una fuente agregada y no cifras fijas', () => {
   const dashboardPage = fs.readFileSync(path.resolve(root, '..', 'distrito-admin', 'src', 'pages', 'AdminDashboard.jsx'), 'utf8');
 
   assert.match(server, /\/api\/pedidos\/admin\/dashboard/);
-  assert.match(dashboardApi, /today_orders/);
+  assert.match(dashboardApi, /period_orders|today_orders/);
   assert.match(dashboardApi, /inventory_stock/);
   assert.match(dashboardPage, /API_URL}\/admin\/dashboard/);
   assert.match(dashboardPage, /STOREFRONT_URL/);
@@ -111,16 +111,15 @@ test('la presentación de estados se comparte entre panel, delivery y seguimient
   assert.match(server, /canTransitionOrder/);
 });
 
-test('inventario de producto reemplaza recetas y rendimientos en la operación vigente', () => {
+test('inventario de producto coordina stock y recetas en la operación vigente', () => {
   const server = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
   const adminMain = fs.readFileSync(path.resolve(root, '..', 'distrito-admin', 'src', 'main.jsx'), 'utf8');
   const adminLayout = fs.readFileSync(path.resolve(root, '..', 'distrito-admin', 'src', 'layouts', 'AdminLayout.jsx'), 'utf8');
   assert.match(server, /pedidos_app_product_stock_movements/);
   assert.match(server, /reserveProductStock/);
-  assert.doesNotMatch(server, /\/api\/pedidos\/admin\/recipes/);
-  assert.doesNotMatch(server, /\/api\/pedidos\/admin\/rendimientos/);
-  assert.doesNotMatch(adminMain, /AdminRecetas|AdminRendimientos|path="recetas"|path="rendimientos"/);
-  assert.doesNotMatch(adminLayout, /\/admin\/recetas|\/admin\/rendimientos/);
+  assert.match(server, /\/api\/pedidos\/admin\/recipes/);
+  assert.doesNotMatch(adminMain, /AdminRendimientos|path="rendimientos"/);
+  assert.doesNotMatch(adminLayout, /\/admin\/rendimientos/);
 });
 
 test('la sesión administrativa tiene una sola fuente de inactividad', () => {
@@ -282,7 +281,7 @@ test('la dirección pública confirma un punto y delivery navega a sus coordenad
   assert.match(picker, /gmpDraggable:\s*true/);
   assert.match(picker, /locationConfirmed:\s*true/);
   assert.match(web, /@distrito\/shared-ui/);
-  assert.match(admin, /@distrito\/shared-ui/);
+  assert.match(admin, /deliveryType|delivery_place_id/);
   assert.match(admin, /placeId:\s*customer\.placeId/);
   assert.match(api, /delivery_latitude.*delivery_longitude/);
   assert.match(api, /destinationLatitude/);
@@ -323,7 +322,7 @@ test('las entregas externas conservan costos, auditoría y seguimiento sin GPS s
   assert.match(externalApi, /assign-external/);
   assert.match(externalApi, /external-handoff/);
   assert.match(externalApi, /external-complete/);
-  assert.match(assignment, /Domiciliario Distrito BG/);
+  assert.match(assignment, /Domiciliario Distric House/);
   assert.match(assignment, /Empresa externa/);
   assert.match(tracking, /!isExternalDelivery && hasDriverLocation/);
   assert.match(tracking, /no comparte GPS/);

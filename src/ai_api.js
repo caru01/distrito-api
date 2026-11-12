@@ -4,6 +4,7 @@
 
 const rateLimit = require('express-rate-limit');
 const { geminiService } = require('./services/geminiService');
+const { isClientError, sendInternalError } = require('./http-errors');
 
 // Rate limiting específico para AI (evita saturación y cuotas)
 const aiLimiter = rateLimit({
@@ -124,11 +125,23 @@ module.exports = function(app, { pool, authenticateToken, requirePermission }) {
       });
 
     } catch (err) {
-      const statusCode = err.statusCode || (err.code === 'MISSING_API_KEY' ? 503 : 500);
-      return res.status(statusCode).json({
-        error: err.message || 'Error al procesar la solicitud con Bony',
-        code: err.code || 'AI_ERROR'
-      });
+      const KNOWN_AI_CODES = new Set([
+        'MISSING_API_KEY',
+        'TIMEOUT',
+        'CREDITS_DEPLETED',
+        'RATE_LIMIT_EXCEEDED',
+        'MODEL_NOT_FOUND',
+        'PROVIDER_ERROR',
+      ]);
+      if (isClientError(err) || KNOWN_AI_CODES.has(err?.code)) {
+        const statusCode = err.statusCode || (err.code === 'MISSING_API_KEY' ? 503 : 502);
+        return res.status(statusCode).json({
+          status: 'error',
+          error: err.code === 'MISSING_API_KEY' ? 'La configuración de IA no está disponible en el servidor.' : err.message,
+          code: err.code || 'AI_ERROR'
+        });
+      }
+      return sendInternalError(res, err, 'Error al procesar la solicitud con Bony', { component: 'ai-api', code: 'AI_ERROR' });
     }
   });
 
@@ -166,7 +179,7 @@ module.exports = function(app, { pool, authenticateToken, requirePermission }) {
         }
       });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      return sendInternalError(res, err, 'No fue posible procesar la solicitud en Bony.', { component: 'ai-api' });
     }
   });
 
@@ -214,7 +227,7 @@ module.exports = function(app, { pool, authenticateToken, requirePermission }) {
         alerts
       });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      return sendInternalError(res, err, 'No fue posible procesar la solicitud en Bony.', { component: 'ai-api' });
     }
   });
 
@@ -235,7 +248,7 @@ module.exports = function(app, { pool, authenticateToken, requirePermission }) {
 
       res.json({ status: 'ok', conversations: rows });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      return sendInternalError(res, err, 'No fue posible procesar la solicitud en Bony.', { component: 'ai-api' });
     }
   });
 
@@ -253,7 +266,7 @@ module.exports = function(app, { pool, authenticateToken, requirePermission }) {
 
       res.status(201).json({ status: 'ok', conversation: convRes.rows[0] });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      return sendInternalError(res, err, 'No fue posible procesar la solicitud en Bony.', { component: 'ai-api' });
     }
   });
 
@@ -290,7 +303,7 @@ module.exports = function(app, { pool, authenticateToken, requirePermission }) {
 
       res.json({ status: 'ok', conversation: conv.rows[0], messages: messages.rows });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      return sendInternalError(res, err, 'No fue posible procesar la solicitud en Bony.', { component: 'ai-api' });
     }
   });
 
@@ -342,7 +355,7 @@ module.exports = function(app, { pool, authenticateToken, requirePermission }) {
         conversation: updateRes.rows[0]
       });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      return sendInternalError(res, err, 'No fue posible procesar la solicitud en Bony.', { component: 'ai-api' });
     }
   });
 
@@ -360,7 +373,7 @@ module.exports = function(app, { pool, authenticateToken, requirePermission }) {
 
       res.json({ status: 'ok', message: 'Conversación eliminada' });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      return sendInternalError(res, err, 'No fue posible procesar la solicitud en Bony.', { component: 'ai-api' });
     }
   });
 
@@ -377,7 +390,7 @@ module.exports = function(app, { pool, authenticateToken, requirePermission }) {
 
       res.json({ status: 'ok', actions: rows });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      return sendInternalError(res, err, 'No fue posible procesar la solicitud en Bony.', { component: 'ai-api' });
     }
   });
 
@@ -441,8 +454,8 @@ module.exports = function(app, { pool, authenticateToken, requirePermission }) {
       res.json({ status: 'ok', result: executionResult });
 
     } catch (err) {
-      await client.query('ROLLBACK');
-      res.status(500).json({ error: err.message });
+      await client.query('ROLLBACK').catch(() => {});
+      return sendInternalError(res, err, 'No fue posible aprobar y ejecutar la acción.', { component: 'ai-api' });
     } finally {
       client.release();
     }
@@ -459,7 +472,7 @@ module.exports = function(app, { pool, authenticateToken, requirePermission }) {
 
       res.json({ status: 'ok', message: 'Acción cancelada' });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      return sendInternalError(res, err, 'No fue posible procesar la solicitud en Bony.', { component: 'ai-api' });
     }
   });
 
@@ -509,7 +522,7 @@ module.exports = function(app, { pool, authenticateToken, requirePermission }) {
 
       res.json({ status: 'ok', automations: rows });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      return sendInternalError(res, err, 'No fue posible procesar la solicitud en Bony.', { component: 'ai-api' });
     }
   });
 
@@ -541,7 +554,7 @@ module.exports = function(app, { pool, authenticateToken, requirePermission }) {
         }
       });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      return sendInternalError(res, err, 'No fue posible procesar la solicitud en Bony.', { component: 'ai-api' });
     }
   });
 };

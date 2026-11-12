@@ -1,6 +1,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const path = require('path');
 const { createPool } = require('../src/db');
+
+const root = path.resolve(__dirname, '..');
 
 const requiredColumns = {
   pedidos_app_orders: [
@@ -84,30 +88,10 @@ test('todas las migraciones versionadas están registradas', async () => {
   const pool = createPool({ max: 1 });
   try {
     const { rows } = await pool.query('SELECT name FROM pedidos_app_schema_migrations ORDER BY name');
-    assert.deepEqual(rows.map((row) => row.name), [
-      '001_align_schema.sql',
-      '002_compact_order_cart.sql',
-      '003_align_administrator_permissions.sql',
-      '004_robust_ordering.sql',
-      '005_announcement_campaigns.sql',
-      '006_delivery_operations.sql',
-      '007_delivery_guards_and_retention.sql',
-      '008_order_delivery_geolocation.sql',
-      '009_restaurant_geolocation.sql',
-      '010_delivery_capacity_and_kitchen.sql',
-      '011_delivery_completion_geofence.sql',
-      '012_notification_preferences.sql',
-      '013_branding_campaigns_customers_closures.sql',
-      '014_external_delivery_companies.sql',
-      '015_delivery_professional_core.sql',
-      '016_delivery_runtime_settings.sql',
-      '017_delivery_native_bootstrap.sql',
-      '018_crm_foundation.sql',
-      '019_crm_commercial.sql',
-      '020_crm_normalization_and_integrity.sql',
-      '021_crm_search_indexes.sql',
-      '022_crm_acquisition_source.sql',
-    ]);
+    const diskMigrations = fs.readdirSync(path.join(root, 'migrations'))
+      .filter((file) => file.endsWith('.sql') && !file.startsWith('rollback_'))
+      .sort();
+    assert.deepEqual(rows.map((row) => row.name), diskMigrations);
   } finally {
     await pool.end();
   }

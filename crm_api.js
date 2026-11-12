@@ -13,6 +13,7 @@ const {
   registerWhatsAppWebhook,
 } = require('./src/crm-service');
 const { validateWebhookSignature, describeWebhookSignature } = require('./src/whatsapp-cloud');
+const { isClientError, redactSensitiveText } = require('./src/http-errors');
 
 const CONTACT_STATUSES = new Set([
   'NUEVO_CONTACTO','PROSPECTO','CLIENTE_NUEVO','CLIENTE_RECURRENTE',
@@ -73,10 +74,23 @@ const CONTACT_FILTER_SQL = `
 `;
 
 function respondError(res, error) {
-  const known = error.statusCode || (error.code === '23505' ? 409 : 500);
-  const code = error.code === '23505' ? 'CRM_DUPLICATE' : (error.code || 'CRM_INTERNAL_ERROR');
-  if (known >= 500) console.error(JSON.stringify({ level: 'error', component: 'crm-api', code, message: error.message }));
-  return res.status(known).json({ code, error: known >= 500 && code === 'CRM_INTERNAL_ERROR' ? 'No fue posible procesar la operación CRM.' : error.message });
+  const clientErr = isClientError(error);
+  const known = clientErr ? error.statusCode : (error?.code === '23505' ? 409 : 500);
+  const code = error?.code === '23505' ? 'CRM_DUPLICATE' : (known >= 500 ? 'CRM_INTERNAL_ERROR' : (error?.code || 'CRM_ERROR'));
+  if (known >= 500) {
+    console.error(JSON.stringify({
+      level: 'error',
+      component: 'crm-api',
+      code,
+      pg_code: error?.code || null,
+      message: redactSensitiveText(error?.message || error),
+    }));
+  }
+  if (res.headersSent) return undefined;
+  const publicError = known >= 500
+    ? 'No fue posible procesar la operación CRM.'
+    : (error?.code === '23505' && !clientErr ? 'Ya existe un registro duplicado.' : error.message);
+  return res.status(known).json({ code, error: publicError });
 }
 
 async function audit(client, req, action, entity, entityId, metadata = {}) {

@@ -14,6 +14,7 @@
 
 const express = require('express');
 const crypto = require('crypto');
+const { redactSensitiveText, sendInternalError } = require('./src/http-errors');
 
 module.exports = function(app, { pool, authenticateToken, deliveryOrderService }) {
   const router = express.Router();
@@ -80,8 +81,7 @@ module.exports = function(app, { pool, authenticateToken, deliveryOrderService }
         stats: stats[0] || { total_rappi_orders: 0, today_rappi_orders: 0, total_rappi_sales: 0 }
       });
     } catch (err) {
-      console.error('Error fetching Rappi config:', err);
-      res.status(500).json({ status: 'error', error: err.message });
+      return sendInternalError(res, err, 'No fue posible consultar la configuración de Rappi.', { component: 'rappi-api' });
     }
   });
 
@@ -155,8 +155,7 @@ module.exports = function(app, { pool, authenticateToken, deliveryOrderService }
         }
       });
     } catch (err) {
-      console.error('Error saving Rappi config:', err);
-      res.status(500).json({ status: 'error', error: err.message });
+      return sendInternalError(res, err, 'No fue posible guardar la configuración de Rappi.', { component: 'rappi-api' });
     }
   });
 
@@ -230,11 +229,7 @@ module.exports = function(app, { pool, authenticateToken, deliveryOrderService }
         });
       }
     } catch (err) {
-      console.error('Error testing Rappi connection:', err);
-      res.status(500).json({
-        status: 'error',
-        error: `Error al conectar con Rappi API: ${err.message}`
-      });
+      return sendInternalError(res, err, 'No fue posible conectar con Rappi API. Verifica credenciales e intenta nuevamente.', { component: 'rappi-api' });
     }
   });
 
@@ -252,8 +247,7 @@ module.exports = function(app, { pool, authenticateToken, deliveryOrderService }
       `);
       res.json({ status: 'ok', logs: rows });
     } catch (err) {
-      console.error('Error fetching Rappi logs:', err);
-      res.status(500).json({ status: 'error', error: err.message });
+      return sendInternalError(res, err, 'No fue posible consultar los registros de Rappi.', { component: 'rappi-api' });
     }
   });
 
@@ -356,8 +350,7 @@ module.exports = function(app, { pool, authenticateToken, deliveryOrderService }
         live_sound_triggered: true
       });
     } catch (err) {
-      console.error('Error simulating Rappi order:', err);
-      res.status(500).json({ status: 'error', error: err.message });
+      return sendInternalError(res, err, 'No fue posible simular el pedido de Rappi.', { component: 'rappi-api' });
     }
   });
 
@@ -404,7 +397,7 @@ module.exports = function(app, { pool, authenticateToken, deliveryOrderService }
         rappi_order_id: result.rappi_order_id
       });
     } catch (err) {
-      console.error('[Rappi Webhook] Error procesando webhook:', err);
+      console.error('[Rappi Webhook] Error procesando webhook:', redactSensitiveText(err?.message || err));
       await pool.query(`
         INSERT INTO pedidos_app_rappi_logs 
           (event_type, rappi_order_id, payload, response_status, error_message)
@@ -419,7 +412,7 @@ module.exports = function(app, { pool, authenticateToken, deliveryOrderService }
 
       await pool.query('UPDATE pedidos_app_rappi_config SET last_error = $1 WHERE id = 1', [err.message]).catch(() => {});
 
-      res.status(500).json({ status: 'error', error: err.message });
+      return sendInternalError(res, err, 'No fue posible procesar el webhook de Rappi.', { component: 'rappi-api' });
     }
   });
 

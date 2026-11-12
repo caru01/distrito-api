@@ -8,6 +8,7 @@ const {
 } = require('./src/delivery-rules');
 const { buildArrivalStatus } = require('./src/delivery-geo');
 const { createDeliveryLocationService } = require('./src/delivery-location-service');
+const { isClientError, redactSensitiveText, sendInternalError } = require('./src/http-errors');
 
 function normalizePhone(value) {
   return String(value || '').replace(/\D/g, '');
@@ -251,7 +252,7 @@ async function checkDriverWhatsAppWindow(pool, rawPhone) {
     `, [cleanPhone]);
     return Boolean(rows[0]?.is_window_open);
   } catch (err) {
-    console.error('[delivery] Error checking WhatsApp window:', err);
+    console.error('[delivery] Error checking WhatsApp window:', redactSensitiveText(err?.message || err));
     return false;
   }
 }
@@ -318,8 +319,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
       req.deliveryUser = rows[0];
       next();
     } catch (error) {
-      console.error('Error validando domiciliario:', error);
-      res.status(500).json({ error: 'No fue posible validar el perfil de entrega' });
+      return sendInternalError(res, error, 'No fue posible validar el perfil de entrega', { component: 'delivery-api' });
     }
   };
 
@@ -345,7 +345,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
         if (error.statusCode === 404 || error.statusCode === 410) {
           await pool.query('DELETE FROM pedidos_app_push_subscriptions WHERE endpoint = $1', [row.endpoint]);
         } else {
-          console.error('No fue posible enviar una notificación delivery:', error.message);
+          console.error('No fue posible enviar una notificación delivery:', redactSensitiveText(error?.message || error));
         }
       }
     }));
@@ -356,15 +356,20 @@ module.exports = function registerDeliveryApi(app, dependencies) {
   ).trim().slice(0, 100);
 
   const sendDomainError = (res, error, fallback = 'No fue posible completar la operación') => {
+    const clientError = isClientError(error);
     console.error(JSON.stringify({
-      level: error.statusCode && error.statusCode < 500 ? 'warn' : 'error',
-      component: 'delivery-api', code: error.code || 'UNEXPECTED_ERROR', message: error.message,
+      level: clientError ? 'warn' : 'error',
+      component: 'delivery-api',
+      code: clientError ? (error.code || 'DELIVERY_CLIENT_ERROR') : 'DELIVERY_INTERNAL_ERROR',
+      message: redactSensitiveText(error?.message || error),
     }));
-    return res.status(error.statusCode || 500).json({
+    if (res.headersSent) return undefined;
+    const statusCode = clientError ? error.statusCode : 500;
+    return res.status(statusCode).json({
       status: 'error',
-      code: error.code || 'DELIVERY_OPERATION_FAILED',
-      error: error.statusCode ? error.message : fallback,
-      details: error.details,
+      code: error?.code || 'DELIVERY_OPERATION_FAILED',
+      error: clientError ? error.message : fallback,
+      ...(clientError && error?.details !== undefined ? { details: error.details } : {}),
     });
   };
 
@@ -489,8 +494,8 @@ module.exports = function registerDeliveryApi(app, dependencies) {
         },
       });
     } catch (error) {
-      console.error('Error abriendo seguimiento en vivo:', error);
-      res.status(error.statusCode || 500).end();
+      console.error('Error abriendo seguimiento en vivo:', redactSensitiveText(error?.message || error));
+      res.status(isClientError(error) ? error.statusCode : 500).end();
     }
   });
 
@@ -546,8 +551,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
         operation: settingsResult.rows[0] || {},
       });
     } catch (error) {
-      console.error('Error cargando perfil delivery:', error);
-      res.status(500).json({ error: 'No fue posible cargar el perfil' });
+      return sendInternalError(res, error, 'No fue posible cargar el perfil', { component: 'delivery-api' });
     }
   });
 
@@ -589,8 +593,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
       res.json({ status: 'ok' });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
-      console.error('Error actualizando perfil delivery:', error);
-      res.status(500).json({ error: 'No fue posible guardar el perfil' });
+      return sendInternalError(res, error, 'No fue posible guardar el perfil', { component: 'delivery-api' });
     } finally {
       client.release();
     }
@@ -778,8 +781,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
         orders: rows.map(formatAvailableOrder),
       });
     } catch (error) {
-      console.error('Error cargando pedidos disponibles:', error);
-      res.status(500).json({ error: 'No fue posible cargar los pedidos disponibles' });
+      return sendInternalError(res, error, 'No fue posible cargar los pedidos disponibles', { component: 'delivery-api' });
     }
   });
 
@@ -1090,9 +1092,10 @@ module.exports = function registerDeliveryApi(app, dependencies) {
         orderId, driverId: userId, actor: req.user,
         idempotencyKey: req.headers['idempotency-key'] || req.body.operationId,
         notes,
+        allowReassign: Boolean(req.body.allowReassign || req.body.reassign),
       });
       sendPush({ userId, title: 'Nuevo pedido asignado', body: `Tienes asignado el pedido #${orderId}`, url: `/pedidos/${orderId}` })
-        .catch((error) => console.error('Error enviando push de asignación:', error));
+        .catch((error) => console.error('Error enviando push de asignación:', redactSensitiveText(error?.message || error)));
 
       // Notificación automática interna por WhatsApp al domiciliario (sin enlace externo a Google Maps)
       let whatsappSent = false;
@@ -1126,13 +1129,13 @@ module.exports = function registerDeliveryApi(app, dependencies) {
               whatsappSent = true;
               console.log(`[delivery] Mensaje de entrega #${orderId} enviado automáticamente por WhatsApp al domiciliario (${driverPhone})`);
             } catch (waErr) {
-              whatsappError = waErr.message;
-              console.error(`[delivery] Error enviando WhatsApp al domiciliario (${driverPhone}):`, waErr.message);
+              whatsappError = redactSensitiveText(waErr?.message || 'Error enviando WhatsApp');
+              console.error(`[delivery] Error enviando WhatsApp al domiciliario (${driverPhone}):`, whatsappError);
             }
           }
         }
       } catch (genErr) {
-        console.error('[delivery] Error preparando mensaje de WhatsApp para el domiciliario:', genErr);
+        console.error('[delivery] Error preparando mensaje de WhatsApp para el domiciliario:', redactSensitiveText(genErr?.message || genErr));
       }
 
       res.json({
@@ -1195,8 +1198,7 @@ module.exports = function registerDeliveryApi(app, dependencies) {
           : 'Ventana de 24h de WhatsApp inactiva (el domiciliario debe escribir "Hola" al restaurante)'
       });
     } catch (err) {
-      console.error('[delivery] Error notificando al domiciliario:', err);
-      res.status(500).json({ error: err.message || 'No fue posible enviar el mensaje al domiciliario' });
+      return sendInternalError(res, err, 'No fue posible enviar el mensaje al domiciliario', { component: 'delivery-api' });
     }
   });
 
