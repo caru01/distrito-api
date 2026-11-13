@@ -4220,7 +4220,27 @@ function buildReportData(orderRows, purchaseRows, orderCostsRows = [], expenseRo
     const reportDate = order.report_date;
     customers.add(clientKey);
     salesByDate[reportDate] = (salesByDate[reportDate] || 0) + total;
-    salesByPayment[order.payment_method || 'Otro'] = (salesByPayment[order.payment_method || 'Otro'] || 0) + total;
+    const rawMethod = String(order.payment_method || 'Efectivo').trim();
+    if (rawMethod.toLowerCase() === 'compartido') {
+      let ef = 0;
+      let tr = 0;
+      if (order.notes) {
+        const efMatch = order.notes.match(/\$([\d.,]+)\s*efectivo/i);
+        const trMatch = order.notes.match(/\$([\d.,]+)\s*transferencia/i);
+        if (efMatch) ef = parseInt(efMatch[1].replace(/[.,]/g, ''), 10);
+        if (trMatch) tr = parseInt(trMatch[1].replace(/[.,]/g, ''), 10);
+      }
+      if (ef + tr > 0) {
+        salesByPayment['Efectivo'] = (salesByPayment['Efectivo'] || 0) + ef;
+        salesByPayment['Transferencia'] = (salesByPayment['Transferencia'] || 0) + tr;
+      } else {
+        salesByPayment['Efectivo'] = (salesByPayment['Efectivo'] || 0) + Math.round(total / 2);
+        salesByPayment['Transferencia'] = (salesByPayment['Transferencia'] || 0) + (total - Math.round(total / 2));
+      }
+    } else {
+      const displayMethod = rawMethod.toLowerCase() === 'transferencia' ? 'Transferencia' : (rawMethod.toLowerCase() === 'efectivo' ? 'Efectivo' : rawMethod);
+      salesByPayment[displayMethod] = (salesByPayment[displayMethod] || 0) + total;
+    }
 
     if (!topCustomers[clientKey]) {
       topCustomers[clientKey] = { name, phone, total: 0, count: 0, products: {}, orderHistory: [] };
@@ -4672,8 +4692,27 @@ async function buildClosurePreview(startDate, endDate, db = pool) {
     orderIds.push(order.id);
     const total = Number(order.total || 0);
     totalVentas += total;
-    const method = String(order.payment_method || 'Efectivo').trim();
-    metodosPago[method] = (metodosPago[method] || 0) + total;
+    const rawMethod = String(order.payment_method || 'Efectivo').trim();
+    if (rawMethod.toLowerCase() === 'compartido') {
+      let ef = 0;
+      let tr = 0;
+      if (order.notes) {
+        const efMatch = order.notes.match(/\$([\d.,]+)\s*efectivo/i);
+        const trMatch = order.notes.match(/\$([\d.,]+)\s*transferencia/i);
+        if (efMatch) ef = parseInt(efMatch[1].replace(/[.,]/g, ''), 10);
+        if (trMatch) tr = parseInt(trMatch[1].replace(/[.,]/g, ''), 10);
+      }
+      if (ef + tr > 0) {
+        metodosPago['Efectivo'] = (metodosPago['Efectivo'] || 0) + ef;
+        metodosPago['Transferencia'] = (metodosPago['Transferencia'] || 0) + tr;
+      } else {
+        metodosPago['Efectivo'] = (metodosPago['Efectivo'] || 0) + Math.round(total / 2);
+        metodosPago['Transferencia'] = (metodosPago['Transferencia'] || 0) + (total - Math.round(total / 2));
+      }
+    } else {
+      const displayMethod = rawMethod.toLowerCase() === 'transferencia' ? 'Transferencia' : (rawMethod.toLowerCase() === 'efectivo' ? 'Efectivo' : rawMethod);
+      metodosPago[displayMethod] = (metodosPago[displayMethod] || 0) + total;
+    }
     const cart = Array.isArray(order.cart_json) ? order.cart_json : [];
     for (const item of cart) {
       const quantity = Math.max(0, Number(item.quantity || item.qty || 1));
