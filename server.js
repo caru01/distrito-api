@@ -840,7 +840,7 @@ app.get('/api/pedidos/init', async (req, res) => {
     const { rows: products } = await pool.query(`
       SELECT id, title, description, price, category, status, is_active, is_featured,
              stock, track_stock, low_stock_threshold, inventory_unit, barcode,
-             rating_sum, rating_count, created_at, updated_at, sort_order, adicionales_ids, image IS NOT NULL AS has_image
+             rating_sum, rating_count, created_at, updated_at, sort_order, adicionales_ids, units_count, image IS NOT NULL AS has_image
       FROM pedidos_app_products
       WHERE status = 'Activo'
       ORDER BY sort_order ASC, created_at DESC, id DESC
@@ -3052,7 +3052,7 @@ app.get('/api/pedidos/admin/products', authenticateToken, async (req, res) => {
     const { rows } = await pool.query(`
       SELECT id, title, description, price, category, status, is_active, is_featured,
              stock, barcode, track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost,
-             rating_sum, rating_count, created_at, updated_at, sort_order, adicionales_ids, image IS NOT NULL AS has_image
+             rating_sum, rating_count, created_at, updated_at, sort_order, adicionales_ids, units_count, image IS NOT NULL AS has_image
       FROM pedidos_app_products ORDER BY sort_order ASC, id DESC
     `);
     res.json({ status: 'ok', products: rows.map((product) => productForResponse(req, product)) });
@@ -3096,19 +3096,21 @@ app.put('/api/pedidos/admin/products/reorder', authenticateToken, async (req, re
 app.post('/api/pedidos/admin/products', authenticateToken, async (req, res) => {
   try {
     const { title, description, price, category, image, status, is_featured, stock,
-      barcode, track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost, adicionales_ids } = req.body;
+      barcode, track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost, adicionales_ids, units_count } = req.body;
     if (!title?.trim() || !Number.isFinite(Number(price)) || Number(price) < 0) {
       return res.status(400).json({ error: 'Nombre y precio válido son obligatorios' });
     }
+    const safeUnits = Math.max(0, parseInt(units_count, 10) || 1);
     const { rows } = await pool.query(
       `INSERT INTO pedidos_app_products
        (title, description, price, category, image, status, is_featured, stock, barcode,
-        track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost, adicionales_ids, sort_order)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+        track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost, adicionales_ids, units_count, sort_order)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
                COALESCE((SELECT MAX(sort_order) FROM pedidos_app_products WHERE category = $4), 0) + 1) RETURNING *`,
       [title.trim(), description, Number(price), category, image, status || 'Activo', Boolean(is_featured),
         Number(stock) || 0, barcode?.trim() || null, Boolean(track_stock), Number(low_stock_threshold) || 5,
-        inventory_unit || 'unidad', Number(inventory_unit_cost) || 0, Array.isArray(adicionales_ids) ? adicionales_ids : []]
+        inventory_unit || 'unidad', Number(inventory_unit_cost) || 0, Array.isArray(adicionales_ids) ? adicionales_ids : [],
+        safeUnits]
     );
     res.status(201).json({ status: 'ok', product: productForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image) }) });
   } catch (error) {
@@ -3122,29 +3124,30 @@ app.put('/api/pedidos/admin/products/:id', authenticateToken, async (req, res) =
   try {
     const { id } = req.params;
     const { title, description, price, category, image, status, is_featured, stock,
-      barcode, track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost, adicionales_ids } = req.body;
+      barcode, track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost, adicionales_ids, units_count } = req.body;
     const keepStoredImage = isManagedMediaUrl(image, 'products', id);
     const safeAdicionales = Array.isArray(adicionales_ids) ? adicionales_ids : [];
+    const safeUnits = Math.max(0, parseInt(units_count, 10) || 1);
     const { rows } = keepStoredImage
       ? await pool.query(
         `UPDATE pedidos_app_products
          SET title=$1, description=$2, price=$3, category=$4, status=$5,
              is_featured=$6, stock=$7, barcode=$8, track_stock=$9,
-             low_stock_threshold=$10, inventory_unit=$11, inventory_unit_cost=$12, adicionales_ids=$13, updated_at=NOW()
-         WHERE id::text=$14 RETURNING *`,
+             low_stock_threshold=$10, inventory_unit=$11, inventory_unit_cost=$12, adicionales_ids=$13, units_count=$14, updated_at=NOW()
+         WHERE id::text=$15 RETURNING *`,
         [title, description, price, category, status, is_featured, Number(stock) || 0,
           barcode?.trim() || null, Boolean(track_stock), Number(low_stock_threshold) || 5,
-          inventory_unit || 'unidad', Number(inventory_unit_cost) || 0, safeAdicionales, id]
+          inventory_unit || 'unidad', Number(inventory_unit_cost) || 0, safeAdicionales, safeUnits, id]
       )
       : await pool.query(
         `UPDATE pedidos_app_products
          SET title=$1, description=$2, price=$3, category=$4, image=$5, status=$6,
              is_featured=$7, stock=$8, barcode=$9, track_stock=$10,
-             low_stock_threshold=$11, inventory_unit=$12, inventory_unit_cost=$13, adicionales_ids=$14, updated_at=NOW()
-         WHERE id::text=$15 RETURNING *`,
+             low_stock_threshold=$11, inventory_unit=$12, inventory_unit_cost=$13, adicionales_ids=$14, units_count=$15, updated_at=NOW()
+         WHERE id::text=$16 RETURNING *`,
         [title, description, price, category, image, status, is_featured, Number(stock) || 0,
           barcode?.trim() || null, Boolean(track_stock), Number(low_stock_threshold) || 5,
-          inventory_unit || 'unidad', Number(inventory_unit_cost) || 0, safeAdicionales, id]
+          inventory_unit || 'unidad', Number(inventory_unit_cost) || 0, safeAdicionales, safeUnits, id]
       );
     if (!rows.length) return res.status(404).json({ status: 'error', error: 'Producto no encontrado' });
     res.json({ status: 'ok', product: productForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image) }) });
