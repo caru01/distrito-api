@@ -2625,30 +2625,32 @@ app.get('/api/pedidos/admin/orders', authenticateToken, async (req, res) => {
     const requestedLimit = Number.parseInt(req.query.limit, 10) || 300;
     const limit = Math.min(Math.max(requestedLimit, 1), 500);
     const { rows } = await pool.query(`
-      SELECT id, customer_name, customer_phone, address, barrio, delivery_type,
-             payment_method, total, status, source, notes, cart_json,
-             voucher_reference, created_at, updated_at, delivered_at,
-             delivery_user_id, delivery_status, delivery_fee, delivery_reference,
-             delivery_latitude, delivery_longitude, delivery_place_id,
-             delivery_location_adjusted, delivery_apartment, delivery_tower, delivery_floor,
-             change_required, delivery_accepted_at, picked_up_at, on_the_way_at,
-             delivery_completed_at, delivery_distance_km, delivery_duration_seconds,
-             tracking_sent_at, delivery_provider_type, external_delivery_company_id,
-             external_driver_name, external_driver_phone, external_vehicle_id,
-             external_delivery_cost, external_delivery_notes, external_eta_minutes,
-             external_assigned_at, external_handed_off_at, external_delivery_confirmed_at,
-             external_delivery_confirmed_by_name, external_delivery_confirmation_notes,
-             external_provider_reference,
-              crm_contact_id,
-              (SELECT bsuid FROM pedidos_app_crm_contacts WHERE id = pedidos_app_orders.crm_contact_id) AS crm_bsuid,
-              (SELECT username FROM pedidos_app_crm_contacts WHERE id = pedidos_app_orders.crm_contact_id) AS crm_username,
-             (SELECT TRIM(CONCAT(name, ' ', last_name)) FROM pedidos_app_users WHERE id = pedidos_app_orders.delivery_user_id) AS delivery_driver_name,
-             (SELECT phone FROM pedidos_app_users WHERE id = pedidos_app_orders.delivery_user_id) AS delivery_driver_phone,
-             (SELECT name FROM pedidos_app_delivery_companies company
-              WHERE company.id = external_delivery_company_id) AS external_company_name,
-             (delivery_fee - external_delivery_cost) AS logistics_margin
-      FROM pedidos_app_orders
-      ORDER BY created_at DESC
+      SELECT o.id, o.customer_name, o.customer_phone, o.address, o.barrio, o.delivery_type,
+             o.payment_method, o.total, o.status, o.source, o.notes, o.cart_json,
+             o.voucher_reference, o.created_at, o.updated_at, o.delivered_at,
+             o.delivery_user_id, o.delivery_status, o.delivery_fee, o.delivery_reference,
+             o.delivery_latitude, o.delivery_longitude, o.delivery_place_id,
+             o.delivery_location_adjusted, o.delivery_apartment, o.delivery_tower, o.delivery_floor,
+             o.change_required, o.delivery_accepted_at, o.picked_up_at, o.on_the_way_at,
+             o.delivery_completed_at, o.delivery_distance_km, o.delivery_duration_seconds,
+             o.tracking_sent_at, o.delivery_provider_type, o.external_delivery_company_id,
+             o.external_driver_name, o.external_driver_phone, o.external_vehicle_id,
+             o.external_delivery_cost, o.external_delivery_notes, o.external_eta_minutes,
+             o.external_assigned_at, o.external_handed_off_at, o.external_delivery_confirmed_at,
+             o.external_delivery_confirmed_by_name, o.external_delivery_confirmation_notes,
+             o.external_provider_reference,
+             o.crm_contact_id,
+             crm.bsuid AS crm_bsuid,
+             crm.username AS crm_username,
+             TRIM(CONCAT(u.name, ' ', u.last_name)) AS delivery_driver_name,
+             u.phone AS delivery_driver_phone,
+             dc.name AS external_company_name,
+             (o.delivery_fee - o.external_delivery_cost) AS logistics_margin
+      FROM pedidos_app_orders o
+      LEFT JOIN pedidos_app_crm_contacts crm ON crm.id = o.crm_contact_id
+      LEFT JOIN pedidos_app_users u ON u.id = o.delivery_user_id
+      LEFT JOIN pedidos_app_delivery_companies dc ON dc.id = o.external_delivery_company_id
+      ORDER BY o.created_at DESC
       LIMIT $1
     `, [limit]);
     res.json({ status: 'ok', orders: rows });
