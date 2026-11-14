@@ -3314,7 +3314,9 @@ const SETTINGS_FIELDS = new Set([
   , 'default_max_driver_capacity', 'sse_reconnect_initial_ms', 'sse_reconnect_max_ms',
   'crm_inactive_days', 'crm_frequent_orders', 'crm_vip_orders', 'crm_vip_spend',
   'crm_attribution_days', 'crm_campaign_frequency_days', 'crm_campaign_start_time',
-  'crm_campaign_end_time'
+  'crm_campaign_end_time',
+  'printer_mode', 'printer_primary_name', 'printer_secondary_name',
+  'printer_paper_width', 'print_agent_id', 'print_job_expiry_minutes'
 ]);
 
 const COLOR_SETTING_FIELDS = new Set([...SETTINGS_FIELDS].filter((key) => key.endsWith('_color')));
@@ -3345,7 +3347,8 @@ app.put('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
     const requestedKeys = Object.keys(data).filter(k => k !== 'id' && k !== 'updated_at');
     const invalidKeys = requestedKeys.filter(k => !SETTINGS_FIELDS.has(k));
     if (invalidKeys.length) {
-      return res.status(400).json({ status: 'error', error: 'La configuración contiene campos no permitidos.' });
+      console.warn('Configuracion rejected due to invalid keys:', invalidKeys);
+      return res.status(400).json({ status: 'error', error: `La configuración contiene campos no permitidos: ${invalidKeys.join(', ')}` });
     }
     const invalidColors = requestedKeys.filter((key) => COLOR_SETTING_FIELDS.has(key) && !/^#[0-9A-Fa-f]{6}$/.test(String(data[key] || '')));
     if (invalidColors.length) return res.status(400).json({ status: 'error', error: 'Los colores deben usar formato hexadecimal #RRGGBB.' });
