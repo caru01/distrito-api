@@ -63,9 +63,9 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
         const formattedPhone = normalizePhone(cleanPhone);
         const cleanPhoneDigits = formattedPhone.replace(/\D/g, '').slice(-10);
 
-        // 1. Verificar si el teléfono ya existe en pedidos_app_customer_accounts
+        // 1. Verificar si el teléfono ya existe en appmobile_customer_accounts
         const existingPhone = await client.query(
-          `SELECT id FROM pedidos_app_customer_accounts 
+          `SELECT id FROM appmobile_customer_accounts 
            WHERE phone = $1 
               OR ($2 <> '' AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') LIKE '%' || $2)
            LIMIT 1`,
@@ -79,9 +79,9 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
           });
         }
 
-        // 2. Verificar si el correo ya existe en pedidos_app_customer_accounts
+        // 2. Verificar si el correo ya existe en appmobile_customer_accounts
         const existing = await client.query(
-          'SELECT id FROM pedidos_app_customer_accounts WHERE LOWER(email) = $1',
+          'SELECT id FROM appmobile_customer_accounts WHERE LOWER(email) = $1',
           [cleanEmail]
         );
         if (existing.rows.length > 0) {
@@ -95,7 +95,7 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
 
         // Insertar en la tabla de cuentas de clientes
         const insertRes = await client.query(
-          `INSERT INTO pedidos_app_customer_accounts 
+          `INSERT INTO appmobile_customer_accounts 
            (name, phone, email, password_hash, default_address, default_barrio, email_verified, created_at, updated_at)
            VALUES ($1, $2, $3, $4, $5, $6, TRUE, NOW(), NOW())
            RETURNING id, name, phone, email, default_address, default_barrio, created_at`,
@@ -176,7 +176,7 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
       const cleanPhoneDigits = rawDigits.length >= 7 ? rawDigits.slice(-10) : '';
 
       const { rows } = await pool.query(
-        `SELECT * FROM pedidos_app_customer_accounts 
+        `SELECT * FROM appmobile_customer_accounts 
          WHERE LOWER(email) = $1 
             OR ($2 <> '' AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') LIKE '%' || $2)
          LIMIT 1`,
@@ -194,7 +194,7 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
       }
 
       // Actualizar fecha de última actividad
-      pool.query('UPDATE pedidos_app_customer_accounts SET updated_at = NOW() WHERE id = $1', [user.id]).catch(() => {});
+      pool.query('UPDATE appmobile_customer_accounts SET updated_at = NOW() WHERE id = $1', [user.id]).catch(() => {});
 
       const token = jwt.sign(
         {
@@ -231,7 +231,7 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
   app.get('/api/pedidos/customer/me', authenticateCustomerToken, async (req, res) => {
     try {
       const { rows } = await pool.query(
-        'SELECT id, name, phone, email, default_address, default_barrio, created_at FROM pedidos_app_customer_accounts WHERE id = $1 LIMIT 1',
+        'SELECT id, name, phone, email, default_address, default_barrio, created_at FROM appmobile_customer_accounts WHERE id = $1 LIMIT 1',
         [req.customer.id]
       );
       if (rows.length === 0) {
@@ -263,7 +263,7 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
       const cleanPhone = String(phone || '').trim();
 
       const { rows } = await pool.query(
-        `UPDATE pedidos_app_customer_accounts
+        `UPDATE appmobile_customer_accounts
          SET name = COALESCE(NULLIF($1, ''), name),
              phone = COALESCE(NULLIF($2, ''), phone),
              default_address = COALESCE($3, default_address),
@@ -351,7 +351,7 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
 
       const { rows } = await pool.query(
         `SELECT id, name, phone, email 
-         FROM pedidos_app_customer_accounts 
+         FROM appmobile_customer_accounts 
          WHERE LOWER(email) = $1 
             OR ($2 <> '' AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') LIKE '%' || $2)
          LIMIT 1`,
@@ -374,7 +374,7 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
       const resetExpiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hora de validez
 
       await pool.query(
-        'UPDATE pedidos_app_customer_accounts SET reset_token = $1, reset_token_expiry = $2 WHERE id = $3',
+        'UPDATE appmobile_customer_accounts SET reset_token = $1, reset_token_expiry = $2 WHERE id = $3',
         [resetCode, resetExpiry, account.id]
       );
 
@@ -413,7 +413,7 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
 
       const { rows } = await pool.query(
         `SELECT id, reset_token_expiry 
-         FROM pedidos_app_customer_accounts 
+         FROM appmobile_customer_accounts 
          WHERE (LOWER(email) = $1 OR ($2 <> '' AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') LIKE '%' || $2))
            AND reset_token = $3
          LIMIT 1`,
@@ -433,7 +433,7 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
       const passwordHash = await bcrypt.hash(rawPassword, salt);
 
       await pool.query(
-        'UPDATE pedidos_app_customer_accounts SET password_hash = $1, reset_token = NULL, reset_token_expiry = NULL, updated_at = NOW() WHERE id = $2',
+        'UPDATE appmobile_customer_accounts SET password_hash = $1, reset_token = NULL, reset_token_expiry = NULL, updated_at = NOW() WHERE id = $2',
         [passwordHash, account.id]
       );
 
