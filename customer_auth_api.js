@@ -275,13 +275,20 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET, transpo
       );
 
       if (rows.length === 0) {
-        return res.status(401).json({ status: 'error', error: 'Teléfono/correo o contraseña incorrectos' });
+        return res.status(404).json({
+          status: 'error',
+          not_registered: true,
+          error: 'Esta cuenta no se encuentra registrada en Distric House. ¡Te invitamos a crear tu cuenta para disfrutar de nuestros pedidos!',
+        });
       }
 
       const user = rows[0];
       const valid = await bcrypt.compare(rawPassword, user.password_hash);
       if (!valid) {
-        return res.status(401).json({ status: 'error', error: 'Correo o contraseña incorrectos' });
+        return res.status(401).json({
+          status: 'error',
+          error: 'La contraseña ingresada es incorrecta. Por favor verifica tus datos o restablece tu contraseña.',
+        });
       }
 
       // Actualizar fecha de última actividad
