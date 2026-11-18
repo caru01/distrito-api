@@ -14,19 +14,68 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET, transpo
     throw new Error('configureCustomerAuth requiere pool y JWT_SECRET');
   }
 
+  async function sendSmsViaYCloud(phoneE164, text) {
+    const ycloudKey = process.env.YCLOUD_API_KEY || '06f4e525b00cd3af5732167f3d750472';
+    if (!ycloudKey) return;
+    const target = phoneE164.startsWith('+') ? phoneE164 : '+' + phoneE164;
+    const payload = JSON.stringify({ to: target, text: text });
+    return new Promise((resolve) => {
+      const https = require('https');
+      const req = https.request({
+        hostname: 'api.ycloud.com',
+        port: 443,
+        path: '/v2/sms',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': ycloudKey,
+          'Content-Length': Buffer.byteLength(payload)
+        },
+        timeout: 8000
+      }, (res) => {
+        let body = '';
+        res.on('data', d => body += d);
+        res.on('end', () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            console.log(`[customer_auth] SMS de texto enviado exitosamente a ${target}:`, body);
+          } else {
+            console.warn(`[customer_auth] YCloud SMS status (${res.statusCode}):`, body);
+          }
+          resolve();
+        });
+      });
+      req.on('error', (err) => {
+        console.error(`[customer_auth] Error enviando SMS a ${target}:`, err.message);
+        resolve();
+      });
+      req.write(payload);
+      req.end();
+    });
+  }
+
   async function dispatchVerificationCode({ destination, channel, code, name }) {
     const isPhone = channel === 'celular' || channel === 'phone' || /^\+?\d{7,15}$/.test(destination);
     if (isPhone) {
+      const phone = normalizePhone(destination);
+      const textMessage = `Distric House: Tu codigo de verificacion es ${code}. Valido por 15 minutos.`;
+
+      // 1. Envío prioritario por Mensaje de Texto (SMS)
+      try {
+        await sendSmsViaYCloud(phone, textMessage);
+      } catch (err) {
+        console.error(`[customer_auth] Error en despacho SMS:`, err.message);
+      }
+
+      // 2. Envío de respaldo por WhatsApp si el cliente está conectado
       if (whatsappClient && typeof whatsappClient.sendText === 'function') {
-        const phone = normalizePhone(destination);
         try {
           await whatsappClient.sendText({
             to: phone,
-            body: `🍔 *Distric House*\n\nHola ${name || 'Cliente'}, tu código de verificación es:\n\n*${code}*\n\nEste código vence en 1 hora. Úsalo en la app para continuar.`,
+            body: `🍔 *Distric House*\n\nHola ${name || 'Cliente'}, tu código de verificación es:\n\n*${code}*\n\nEste código vence en 15 minutos. Úsalo en la app para continuar.`,
           });
           console.log(`[customer_auth] WhatsApp enviado exitosamente a ${phone}`);
         } catch (e) {
-          console.error(`[customer_auth] Error enviando WhatsApp a ${phone}:`, e.message);
+          console.warn(`[customer_auth] Envío WhatsApp secundario a ${phone}:`, e.message);
         }
       }
     } else {
@@ -436,7 +485,7 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET, transpo
         channel: targetMedium,
         destination: targetMedium === 'celular' ? account.phone : account.email,
         message: targetMedium === 'celular'
-            ? `Código enviado al celular ${account.phone}`
+            ? `Código SMS enviado al celular ${account.phone}`
             : `Código enviado al correo ${account.email}`,
         debugCode: resetCode,
       });
@@ -542,7 +591,7 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET, transpo
 
       res.json({
         status: 'ok',
-        message: `Código enviado a ${cleanPhone}`,
+        message: `Código SMS enviado a ${cleanPhone}`,
         debugCode: code,
       });
     } catch (e) {
