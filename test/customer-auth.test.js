@@ -15,6 +15,7 @@ test('Customer Auth API - Flujo completo de registro, login, me, profile y logou
 
   const request = supertest(app);
   const testEmail = `test.client.${Date.now()}@distritohouse.app`;
+  const testPhone = '300' + Math.floor(1000000 + Math.random() * 9000000);
   const testPassword = 'Password123!';
 
   try {
@@ -23,7 +24,7 @@ test('Customer Auth API - Flujo completo de registro, login, me, profile y logou
       .post('/api/pedidos/customer/register')
       .send({
         name: 'Cliente Prueba Móvil',
-        phone: '3001234567',
+        phone: testPhone,
         email: testEmail,
         password: testPassword,
         default_address: 'Cra 15 # 22-10',

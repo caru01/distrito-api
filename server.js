@@ -863,7 +863,7 @@ app.get('/api/pedidos/init', async (req, res) => {
     try {
       const { rows: announcements } = await pool.query(`
         SELECT id, title, body, cta_label, cta_url, starts_at, ends_at,
-               display_frequency, campaign_type, audience, priority, coupon_code,
+               display_frequency, campaign_type, popup_style, audience, priority, coupon_code,
                views_count, clicks_count, is_active, updated_at, image_url IS NOT NULL AS has_image
         FROM pedidos_app_announcements
         WHERE is_active = TRUE
@@ -3977,7 +3977,7 @@ app.get('/api/pedidos/announcement', async (req, res) => {
     const audience = req.query.returning === '1' ? 'returning' : 'new';
     const { rows } = await pool.query(`
       SELECT id, title, body, cta_label, cta_url, starts_at, ends_at,
-             display_frequency, campaign_type, audience, priority, coupon_code,
+             display_frequency, campaign_type, popup_style, audience, priority, coupon_code,
              views_count, clicks_count, is_active, updated_at, image_url IS NOT NULL AS has_image
       FROM pedidos_app_announcements
       WHERE is_active = TRUE
@@ -4025,11 +4025,15 @@ function parseCampaignInput(body = {}) {
     ends_at: body.ends_at || null, is_active: Boolean(body.is_active),
     display_frequency: ['always', 'session', 'daily'].includes(body.display_frequency) ? body.display_frequency : 'session',
     campaign_type: ['modal', 'banner', 'promo_card'].includes(body.campaign_type) ? body.campaign_type : 'modal',
+    popup_style: ['modern_card', 'poster_full', 'dark_street'].includes(body.popup_style) ? body.popup_style : 'modern_card',
     audience: ['all', 'new', 'returning'].includes(body.audience) ? body.audience : 'all',
     priority: Number.isInteger(Number(body.priority)) ? Number(body.priority) : 0,
     coupon_code: String(body.coupon_code || '').trim().slice(0, 50) || null,
   };
-  if (!campaign.title || campaign.title.length > 255) return { error: 'El título es obligatorio y admite hasta 255 caracteres' };
+  if (campaign.title && campaign.title.length > 255) return { error: 'El título admite hasta 255 caracteres' };
+  if (!campaign.title && !campaign.image_url && !campaign.body) {
+    return { error: 'Debes incluir al menos un título, una imagen o un mensaje' };
+  }
   if (campaign.body.length > 4000) return { error: 'El mensaje admite hasta 4000 caracteres' };
   if (!campaign.cta_label || campaign.cta_label.length > 80) return { error: 'El texto del botón admite hasta 80 caracteres' };
   if (campaign.cta_url && !campaign.cta_url.startsWith('/') && !/^https:\/\//i.test(campaign.cta_url)) return { error: 'El enlace debe iniciar con / o usar HTTPS' };
@@ -4044,7 +4048,7 @@ app.get('/api/pedidos/admin/announcements', authenticateToken, async (req, res) 
   try {
     const { rows } = await pool.query(`
       SELECT id, title, body, cta_label, cta_url, starts_at, ends_at, display_frequency,
-             campaign_type, audience, priority, coupon_code, views_count, clicks_count,
+             campaign_type, popup_style, audience, priority, coupon_code, views_count, clicks_count,
              published_at, is_active, updated_at, image_url IS NOT NULL AS has_image
       FROM pedidos_app_announcements ORDER BY updated_at DESC, id DESC
     `);
@@ -4060,11 +4064,11 @@ app.post('/api/pedidos/admin/announcements', authenticateToken, async (req, res)
     const { rows } = await pool.query(`
       INSERT INTO pedidos_app_announcements
         (title, image_url, body, cta_label, cta_url, starts_at, ends_at, display_frequency,
-         campaign_type, audience, priority, coupon_code, is_active, published_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,CASE WHEN $13 THEN NOW() ELSE NULL END)
+         campaign_type, popup_style, audience, priority, coupon_code, is_active, published_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,CASE WHEN $14 THEN NOW() ELSE NULL END)
       RETURNING *
     `, [c.title, c.image_url, c.body, c.cta_label, c.cta_url, c.starts_at, c.ends_at,
-      c.display_frequency, c.campaign_type, c.audience, c.priority, c.coupon_code, c.is_active]);
+      c.display_frequency, c.campaign_type, c.popup_style, c.audience, c.priority, c.coupon_code, c.is_active]);
     res.status(201).json({ status: 'ok', announcement: announcementForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image_url) }) });
   } catch (error) { sendInternalError(res, error); }
 });
@@ -4080,12 +4084,12 @@ app.put('/api/pedidos/admin/announcements/:id', authenticateToken, async (req, r
     const { rows } = await pool.query(`
       UPDATE pedidos_app_announcements SET title=$1, image_url=$2, body=$3, cta_label=$4,
         cta_url=$5, starts_at=$6, ends_at=$7, display_frequency=$8, campaign_type=$9,
-        audience=$10, priority=$11, coupon_code=$12, is_active=$13,
-        published_at=CASE WHEN $13 AND published_at IS NULL THEN NOW() ELSE published_at END,
+        popup_style=$10, audience=$11, priority=$12, coupon_code=$13, is_active=$14,
+        published_at=CASE WHEN $14 AND published_at IS NULL THEN NOW() ELSE published_at END,
         updated_at=NOW()
-      WHERE id=$14 RETURNING *
+      WHERE id=$15 RETURNING *
     `, [c.title, imageUrl, c.body, c.cta_label, c.cta_url, c.starts_at, c.ends_at,
-      c.display_frequency, c.campaign_type, c.audience, c.priority, c.coupon_code, c.is_active, req.params.id]);
+      c.display_frequency, c.campaign_type, c.popup_style, c.audience, c.priority, c.coupon_code, c.is_active, req.params.id]);
     res.json({ status: 'ok', announcement: announcementForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image_url) }) });
   } catch (error) { sendInternalError(res, error); }
 });
@@ -4117,7 +4121,7 @@ app.get('/api/pedidos/admin/announcement', authenticateToken, async (req, res) =
   try {
     const { rows } = await pool.query(`
       SELECT id, title, body, cta_label, cta_url, starts_at, ends_at,
-             display_frequency, is_active, updated_at, image_url IS NOT NULL AS has_image
+             display_frequency, popup_style, is_active, updated_at, image_url IS NOT NULL AS has_image
       FROM pedidos_app_announcements ORDER BY updated_at DESC, id DESC LIMIT 1
     `);
     res.json({ status: 'ok', announcement: rows.length ? announcementForResponse(req, rows[0]) : null });
@@ -4138,7 +4142,10 @@ app.put('/api/pedidos/admin/announcement', authenticateToken, async (req, res) =
     ? req.body.display_frequency
     : 'session';
 
-  if (!title || title.length > 255) return res.status(400).json({ error: 'El título es obligatorio y admite hasta 255 caracteres' });
+  if (title && title.length > 255) return res.status(400).json({ error: 'El título admite hasta 255 caracteres' });
+  if (!title && !imageUrl && !body) {
+    return res.status(400).json({ error: 'Debes incluir al menos un título, una imagen o un mensaje' });
+  }
   if (body.length > 1000) return res.status(400).json({ error: 'El mensaje admite hasta 1000 caracteres' });
   if (!ctaLabel || ctaLabel.length > 80) return res.status(400).json({ error: 'El texto del botón admite hasta 80 caracteres' });
   if (ctaUrl && !ctaUrl.startsWith('/') && !/^https:\/\//i.test(ctaUrl)) {
@@ -4621,10 +4628,15 @@ app.post('/api/pedidos/admin/expenses', authenticateToken, async (req, res) => {
       parsedItems = items;
     }
 
+    const cleanAmount = Number(amount) || 0;
+    const cleanSubtotal = Number(subtotal) || 0;
+    const cleanIva = Number(iva) || 0;
+    const cleanIvaPercentage = Number(iva_percentage) || 0;
+
     const { rows } = await client.query(
       `INSERT INTO pedidos_app_expenses (category, description, amount, subtotal, iva, iva_percentage, expense_date, payment_method, receipt_url, items, provider) 
        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, CURRENT_DATE), COALESCE($8, 'Efectivo'), $9, $10, $11) RETURNING *`,
-      [category, description, amount, subtotal || 0, iva || 0, iva_percentage || 0, expense_date || null, payment_method || 'Efectivo', receipt_url || null, JSON.stringify(parsedItems), provider || null]
+      [category, description, cleanAmount, cleanSubtotal, cleanIva, cleanIvaPercentage, expense_date || null, payment_method || 'Efectivo', receipt_url || null, JSON.stringify(parsedItems), provider || null]
     );
     const expense = rows[0];
 
@@ -4643,9 +4655,13 @@ app.put('/api/pedidos/admin/expenses/:id', authenticateToken, async (req, res) =
   try {
     const { id } = req.params;
     const { category, description, amount, subtotal, iva, iva_percentage, expense_date, payment_method, receipt_url, items, provider } = req.body;
+    const cleanAmount = Number(amount) || 0;
+    const cleanSubtotal = Number(subtotal) || 0;
+    const cleanIva = Number(iva) || 0;
+    const cleanIvaPercentage = Number(iva_percentage) || 0;
     const { rows } = await pool.query(
       `UPDATE pedidos_app_expenses SET category = $1, description = $2, amount = $3, subtotal = $4, iva = $5, iva_percentage = $6, expense_date = COALESCE($7, CURRENT_DATE), payment_method = COALESCE($8, 'Efectivo'), receipt_url = $9, items = $10, provider = $11 WHERE id = $12 RETURNING *`,
-      [category, description, amount, subtotal || 0, iva || 0, iva_percentage || 0, expense_date || null, payment_method || 'Efectivo', receipt_url || null, items ? (typeof items === 'string' ? items : JSON.stringify(items)) : '[]', provider || null, id]
+      [category, description, cleanAmount, cleanSubtotal, cleanIva, cleanIvaPercentage, expense_date || null, payment_method || 'Efectivo', receipt_url || null, items ? (typeof items === 'string' ? items : JSON.stringify(items)) : '[]', provider || null, id]
     );
     res.json({ status: 'ok', data: rows[0] });
   } catch (err) {

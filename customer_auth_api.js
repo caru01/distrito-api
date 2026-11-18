@@ -60,7 +60,26 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
       try {
         await client.query('BEGIN');
 
-        // Verificar si el correo ya existe en pedidos_app_customer_accounts
+        const formattedPhone = normalizePhone(cleanPhone);
+        const cleanPhoneDigits = formattedPhone.replace(/\D/g, '').slice(-10);
+
+        // 1. Verificar si el teléfono ya existe en pedidos_app_customer_accounts
+        const existingPhone = await client.query(
+          `SELECT id FROM pedidos_app_customer_accounts 
+           WHERE phone = $1 
+              OR ($2 <> '' AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') LIKE '%' || $2)
+           LIMIT 1`,
+          [formattedPhone, cleanPhoneDigits]
+        );
+        if (existingPhone.rows.length > 0) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({ 
+            status: 'error', 
+            error: 'Este número de teléfono ya tiene una cuenta registrada. Por favor inicia sesión.' 
+          });
+        }
+
+        // 2. Verificar si el correo ya existe en pedidos_app_customer_accounts
         const existing = await client.query(
           'SELECT id FROM pedidos_app_customer_accounts WHERE LOWER(email) = $1',
           [cleanEmail]
@@ -73,7 +92,6 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
         // Hashing seguro con bcryptjs
         const salt = await bcrypt.genSalt(10);
         const passwordHash = await bcrypt.hash(rawPassword, salt);
-        const formattedPhone = normalizePhone(cleanPhone);
 
         // Insertar en la tabla de cuentas de clientes
         const insertRes = await client.query(
@@ -143,24 +161,30 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
     }
   });
 
-  // 2. Inicio de sesión
+  // 2. Inicio de sesión (Soporta teléfono o correo)
   app.post('/api/pedidos/customer/login', async (req, res) => {
     try {
-      const { email, password } = req.body;
-      const cleanEmail = String(email || '').toLowerCase().trim();
-      const rawPassword = String(password || '');
+      const identifier = String(req.body.phone || req.body.email || req.body.identifier || '').trim();
+      const rawPassword = String(req.body.password || '');
 
-      if (!cleanEmail || !rawPassword) {
-        return res.status(400).json({ status: 'error', error: 'Ingresa correo y contraseña' });
+      if (!identifier || !rawPassword) {
+        return res.status(400).json({ status: 'error', error: 'Ingresa tu número de teléfono (o correo) y contraseña' });
       }
 
+      const cleanEmail = identifier.toLowerCase();
+      const rawDigits = identifier.replace(/\D/g, '');
+      const cleanPhoneDigits = rawDigits.length >= 7 ? rawDigits.slice(-10) : '';
+
       const { rows } = await pool.query(
-        'SELECT * FROM pedidos_app_customer_accounts WHERE LOWER(email) = $1 LIMIT 1',
-        [cleanEmail]
+        `SELECT * FROM pedidos_app_customer_accounts 
+         WHERE LOWER(email) = $1 
+            OR ($2 <> '' AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') LIKE '%' || $2)
+         LIMIT 1`,
+        [cleanEmail, cleanPhoneDigits]
       );
 
       if (rows.length === 0) {
-        return res.status(401).json({ status: 'error', error: 'Correo o contraseña incorrectos' });
+        return res.status(401).json({ status: 'error', error: 'Teléfono/correo o contraseña incorrectos' });
       }
 
       const user = rows[0];
@@ -312,44 +336,58 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
     }
   });
 
-  // 6. Recuperación de contraseña (solicitud de código / token)
+  // 6. Recuperación de contraseña (solicitud de código / token por Correo o por Celular)
   app.post('/api/pedidos/customer/forgot-password', async (req, res) => {
     try {
-      const { email } = req.body;
-      const cleanEmail = String(email || '').toLowerCase().trim();
-      if (!cleanEmail) {
-        return res.status(400).json({ status: 'error', error: 'Ingresa tu correo electrónico' });
+      const { email, phone, identifier, channel } = req.body;
+      const targetIdentifier = String(phone || email || identifier || '').trim();
+      const cleanEmail = targetIdentifier.toLowerCase();
+      const rawDigits = targetIdentifier.replace(/\D/g, '');
+      const cleanPhoneDigits = rawDigits.length >= 7 ? rawDigits.slice(-10) : '';
+
+      if (!targetIdentifier) {
+        return res.status(400).json({ status: 'error', error: 'Ingresa tu número de celular o correo' });
       }
 
       const { rows } = await pool.query(
-        'SELECT id, name FROM pedidos_app_customer_accounts WHERE LOWER(email) = $1',
-        [cleanEmail]
+        `SELECT id, name, phone, email 
+         FROM pedidos_app_customer_accounts 
+         WHERE LOWER(email) = $1 
+            OR ($2 <> '' AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') LIKE '%' || $2)
+         LIMIT 1`,
+        [cleanEmail, cleanPhoneDigits]
       );
 
-      // Por seguridad, si el correo no existe, responder afirmativo sin exponer existencia
+      // Si no existe la cuenta, responder de forma segura
       if (rows.length === 0) {
         return res.json({
           status: 'ok',
-          message: 'Si el correo está registrado, recibirás un código de recuperación.',
+          message: 'Si los datos están registrados, recibirás un código de recuperación.',
         });
       }
+
+      const account = rows[0];
 
       // Generar código numérico de 6 dígitos seguro
       const crypto = require('crypto');
       const resetCode = String(crypto.randomInt(100000, 999999));
-      const resetExpiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hora
+      const resetExpiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hora de validez
 
       await pool.query(
         'UPDATE pedidos_app_customer_accounts SET reset_token = $1, reset_token_expiry = $2 WHERE id = $3',
-        [resetCode, resetExpiry, rows[0].id]
+        [resetCode, resetExpiry, account.id]
       );
 
-      console.log(`[customer_auth] Código de recuperación generado para ${cleanEmail}: ${resetCode}`);
+      const targetMedium = (channel === 'phone' || cleanPhoneDigits.length >= 7) ? 'celular' : 'correo';
+      console.log(`[customer_auth] Código de recuperación generado para ${account.phone || account.email} (${targetMedium}): ${resetCode}`);
 
       return res.json({
         status: 'ok',
-        message: 'Código de recuperación generado exitosamente',
-        // En entorno de desarrollo o integración inicial devolvemos el código de prueba para validación rápida
+        channel: targetMedium,
+        destination: targetMedium === 'celular' ? account.phone : account.email,
+        message: targetMedium === 'celular'
+            ? `Código enviado al celular ${account.phone}`
+            : `Código enviado al correo ${account.email}`,
         debugCode: resetCode,
       });
     } catch (error) {
@@ -358,23 +396,28 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
     }
   });
 
-  // 7. Restablecimiento de contraseña con código
+  // 7. Restablecimiento de contraseña con código (acepta correo o teléfono)
   app.post('/api/pedidos/customer/reset-password', async (req, res) => {
     try {
-      const { email, code, new_password } = req.body;
-      const cleanEmail = String(email || '').toLowerCase().trim();
+      const { email, phone, identifier, code, new_password } = req.body;
+      const targetIdentifier = String(phone || email || identifier || '').trim();
+      const cleanEmail = targetIdentifier.toLowerCase();
+      const rawDigits = targetIdentifier.replace(/\D/g, '');
+      const cleanPhoneDigits = rawDigits.length >= 7 ? rawDigits.slice(-10) : '';
       const cleanCode = String(code || '').trim();
       const rawPassword = String(new_password || '');
 
-      if (!cleanEmail || !cleanCode || !rawPassword || rawPassword.length < 6) {
+      if (!targetIdentifier || !cleanCode || !rawPassword || rawPassword.length < 6) {
         return res.status(400).json({ status: 'error', error: 'Datos incompletos o contraseña menor a 6 caracteres' });
       }
 
       const { rows } = await pool.query(
         `SELECT id, reset_token_expiry 
          FROM pedidos_app_customer_accounts 
-         WHERE LOWER(email) = $1 AND reset_token = $2`,
-        [cleanEmail, cleanCode]
+         WHERE (LOWER(email) = $1 OR ($2 <> '' AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') LIKE '%' || $2))
+           AND reset_token = $3
+         LIMIT 1`,
+        [cleanEmail, cleanPhoneDigits, cleanCode]
       );
 
       if (rows.length === 0) {
@@ -396,7 +439,7 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
 
       return res.json({
         status: 'ok',
-        message: 'Contraseña actualizada con éxito. Ya puedes iniciar sesión.',
+        message: 'Contraseña actualizada con éxito. Ya puedes iniciar sesión con tu nueva contraseña.',
       });
     } catch (error) {
       console.error('[customer_auth] Error en reset-password:', error);
