@@ -5416,6 +5416,8 @@ require('./print_agent_api')(app, {
 require('./customer_auth_api')(app, {
   pool,
   JWT_SECRET,
+  transporter,
+  whatsappClient,
 });
 
 const deliveryOutbox = createOutboxDispatcher({

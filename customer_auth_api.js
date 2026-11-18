@@ -9,9 +9,51 @@ function normalizePhone(rawPhone) {
   return clean;
 }
 
-module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
+module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET, transporter, whatsappClient }) {
   if (!pool || !JWT_SECRET) {
     throw new Error('configureCustomerAuth requiere pool y JWT_SECRET');
+  }
+
+  async function dispatchVerificationCode({ destination, channel, code, name }) {
+    const isPhone = channel === 'celular' || channel === 'phone' || /^\+?\d{7,15}$/.test(destination);
+    if (isPhone) {
+      if (whatsappClient && typeof whatsappClient.sendText === 'function') {
+        const phone = normalizePhone(destination);
+        try {
+          await whatsappClient.sendText({
+            to: phone,
+            body: `🍔 *Distric House*\n\nHola ${name || 'Cliente'}, tu código de verificación es:\n\n*${code}*\n\nEste código vence en 1 hora. Úsalo en la app para continuar.`,
+          });
+          console.log(`[customer_auth] WhatsApp enviado exitosamente a ${phone}`);
+        } catch (e) {
+          console.error(`[customer_auth] Error enviando WhatsApp a ${phone}:`, e.message);
+        }
+      }
+    } else {
+      if (transporter && typeof transporter.sendMail === 'function') {
+        try {
+          await transporter.sendMail({
+            from: '"Distric House" <' + (process.env.EMAIL_USER || 'info@distritobg.app') + '>',
+            to: destination,
+            subject: `Tu código de verificación Distric House: ${code}`,
+            html: `
+              <div style="font-family: Arial, sans-serif; padding: 24px; max-width: 480px; margin: 0 auto; border: 1px solid #E5E7EB; border-radius: 12px; background: #FFFFFF;">
+                <h2 style="color: #B30401; margin-top: 0; font-size: 22px;">Distric House</h2>
+                <p style="font-size: 15px; color: #111827;">Hola <b>${name || 'Cliente'}</b>,</p>
+                <p style="font-size: 14px; color: #4B5563;">Tu código de verificación es:</p>
+                <div style="text-align: center; margin: 24px 0;">
+                  <span style="font-size: 32px; font-weight: bold; letter-spacing: 6px; color: #B30401; background: #FEF2F2; padding: 12px 24px; border-radius: 8px; border: 1px dashed #B30401; display: inline-block;">${code}</span>
+                </div>
+                <p style="font-size: 12px; color: #9CA3AF;">Válido por 1 hora. Si no lo solicitaste, puedes ignorar este correo.</p>
+              </div>
+            `,
+          });
+          console.log(`[customer_auth] Correo enviado exitosamente a ${destination}`);
+        } catch (e) {
+          console.error(`[customer_auth] Error enviando correo a ${destination}:`, e.message);
+        }
+      }
+    }
   }
 
   // Middleware de autenticación para clientes de la App Móvil
@@ -381,6 +423,14 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
       const targetMedium = (channel === 'phone' || cleanPhoneDigits.length >= 7) ? 'celular' : 'correo';
       console.log(`[customer_auth] Código de recuperación generado para ${account.phone || account.email} (${targetMedium}): ${resetCode}`);
 
+      // Envío real por WhatsApp o por Correo según el canal elegido
+      await dispatchVerificationCode({
+        destination: targetMedium === 'celular' ? (account.phone || targetIdentifier) : account.email,
+        channel: targetMedium,
+        code: resetCode,
+        name: account.name,
+      });
+
       return res.json({
         status: 'ok',
         channel: targetMedium,
@@ -447,7 +497,162 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET }) {
     }
   });
 
-  // 8. Cierre de sesión (invalidación lógica en cliente)
+  // 8. Enviar código de verificación por WhatsApp para registro
+  app.post('/api/pedidos/customer/send-phone-code', async (req, res) => {
+    try {
+      const { phone } = req.body;
+      const cleanPhone = String(phone || '').trim();
+      const formattedPhone = normalizePhone(cleanPhone);
+      const cleanPhoneDigits = formattedPhone.replace(/\D/g, '').slice(-10);
+
+      if (!cleanPhone || cleanPhoneDigits.length < 7) {
+        return res.status(400).json({ status: 'error', error: 'Ingresa un número de celular válido' });
+      }
+
+      // Verificar si ya existe registrado
+      const existing = await pool.query(
+        `SELECT id FROM appmobile_customer_accounts 
+         WHERE phone = $1 
+            OR ($2 <> '' AND regexp_replace(COALESCE(phone, ''), '\\D', '', 'g') LIKE '%' || $2)
+         LIMIT 1`,
+        [formattedPhone, cleanPhoneDigits]
+      );
+      if (existing.rows.length > 0) {
+        return res.status(409).json({ 
+          status: 'error', 
+          error: 'Este número de teléfono ya tiene una cuenta registrada. Por favor inicia sesión.' 
+        });
+      }
+
+      const crypto = require('crypto');
+      const code = String(crypto.randomInt(100000, 999999));
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutos
+
+      await pool.query(
+        'INSERT INTO appmobile_phone_verifications (phone, code, expires_at) VALUES ($1, $2, $3)',
+        [cleanPhoneDigits, code, expiresAt]
+      );
+
+      await dispatchVerificationCode({
+        destination: formattedPhone,
+        channel: 'celular',
+        code: code,
+        name: 'Cliente',
+      });
+
+      res.json({
+        status: 'ok',
+        message: `Código enviado a ${cleanPhone}`,
+        debugCode: code,
+      });
+    } catch (e) {
+      console.error('[customer_auth] Error enviando código celular:', e);
+      res.status(500).json({ status: 'error', error: 'No se pudo enviar el código' });
+    }
+  });
+
+  // 9. Validar código de verificación telefónico para registro
+  app.post('/api/pedidos/customer/verify-phone-code', async (req, res) => {
+    try {
+      const { phone, code } = req.body;
+      const cleanPhoneDigits = String(phone || '').replace(/\D/g, '').slice(-10);
+      const cleanCode = String(code || '').trim();
+
+      if (!cleanPhoneDigits || !cleanCode) {
+        return res.status(400).json({ status: 'error', error: 'Ingresa el teléfono y el código de 6 dígitos' });
+      }
+
+      const { rows } = await pool.query(
+        `SELECT id, expires_at FROM appmobile_phone_verifications 
+         WHERE phone = $1 AND code = $2 AND verified = FALSE 
+         ORDER BY id DESC LIMIT 1`,
+        [cleanPhoneDigits, cleanCode]
+      );
+
+      if (rows.length === 0) {
+        return res.status(400).json({ status: 'error', error: 'Código de verificación incorrecto' });
+      }
+
+      if (new Date() > new Date(rows[0].expires_at)) {
+        return res.status(400).json({ status: 'error', error: 'El código ha expirado. Solicita uno nuevo.' });
+      }
+
+      await pool.query('UPDATE appmobile_phone_verifications SET verified = TRUE WHERE id = $1', [rows[0].id]);
+
+      res.json({ status: 'ok', verified: true, message: 'Número de teléfono verificado exitosamente' });
+    } catch (e) {
+      console.error('[customer_auth] Error verificando código celular:', e);
+      res.status(500).json({ status: 'error', error: 'Error al verificar el código' });
+    }
+  });
+
+  // 10. Autenticación con Google
+  app.post('/api/pedidos/customer/google-auth', async (req, res) => {
+    try {
+      const { email, name, google_id } = req.body;
+      const cleanEmail = String(email || '').toLowerCase().trim();
+      const cleanName = String(name || '').trim();
+
+      if (!cleanEmail) {
+        return res.status(400).json({ status: 'error', error: 'Correo de Google no válido' });
+      }
+
+      let { rows } = await pool.query(
+        'SELECT * FROM appmobile_customer_accounts WHERE LOWER(email) = $1 LIMIT 1',
+        [cleanEmail]
+      );
+
+      let user;
+      if (rows.length === 0) {
+        const crypto = require('crypto');
+        const randPass = crypto.randomBytes(16).toString('hex');
+        const salt = await bcrypt.genSalt(10);
+        const passwordHash = await bcrypt.hash(randPass, salt);
+
+        const insertRes = await pool.query(
+          `INSERT INTO appmobile_customer_accounts 
+           (name, email, password_hash, email_verified, created_at, updated_at)
+           VALUES ($1, $2, $3, TRUE, NOW(), NOW())
+           RETURNING id, name, phone, email, default_address, default_barrio`,
+          [cleanName || 'Cliente Google', cleanEmail, passwordHash]
+        );
+        user = insertRes.rows[0];
+      } else {
+        user = rows[0];
+      }
+
+      const token = jwt.sign(
+        {
+          id: user.id,
+          role: 'customer',
+          email: user.email,
+          name: user.name,
+          phone: user.phone,
+        },
+        JWT_SECRET,
+        { expiresIn: '30d' }
+      );
+
+      res.json({
+        status: 'ok',
+        message: 'Acceso exitoso con Google',
+        token,
+        customer: {
+          id: user.id,
+          name: user.name,
+          phone: user.phone || '',
+          email: user.email,
+          address: user.default_address || '',
+          barrio: user.default_barrio || '',
+        },
+      });
+    } catch (e) {
+      console.error('[customer_auth] Error en Google Auth:', e);
+      res.status(500).json({ status: 'error', error: 'Error al iniciar con Google' });
+    }
+  });
+
+  // 11. Cierre de sesión (invalidación lógica en cliente)
   app.post('/api/pedidos/customer/logout', authenticateCustomerToken, (req, res) => {
     res.json({ status: 'ok', message: 'Sesión cerrada exitosamente' });
   });
