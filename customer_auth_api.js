@@ -1,5 +1,6 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { getSmsGateway } = require('./src/sms-gateway');
 
 function normalizePhone(rawPhone) {
   if (!rawPhone) return '';
@@ -14,56 +15,27 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET, transpo
     throw new Error('configureCustomerAuth requiere pool y JWT_SECRET');
   }
 
-  async function sendSmsViaYCloud(phoneE164, text) {
-    const ycloudKey = process.env.YCLOUD_API_KEY || '06f4e525b00cd3af5732167f3d750472';
-    if (!ycloudKey) return;
-    const target = phoneE164.startsWith('+') ? phoneE164 : '+' + phoneE164;
-    const payload = JSON.stringify({ to: target, text: text });
-    return new Promise((resolve) => {
-      const https = require('https');
-      const req = https.request({
-        hostname: 'api.ycloud.com',
-        port: 443,
-        path: '/v2/sms',
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-API-Key': ycloudKey,
-          'Content-Length': Buffer.byteLength(payload)
-        },
-        timeout: 8000
-      }, (res) => {
-        let body = '';
-        res.on('data', d => body += d);
-        res.on('end', () => {
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            console.log(`[customer_auth] SMS de texto enviado exitosamente a ${target}:`, body);
-          } else {
-            console.warn(`[customer_auth] YCloud SMS status (${res.statusCode}):`, body);
-          }
-          resolve();
-        });
-      });
-      req.on('error', (err) => {
-        console.error(`[customer_auth] Error enviando SMS a ${target}:`, err.message);
-        resolve();
-      });
-      req.write(payload);
-      req.end();
-    });
-  }
-
   async function dispatchVerificationCode({ destination, channel, code, name }) {
     const isPhone = channel === 'celular' || channel === 'phone' || /^\+?\d{7,15}$/.test(destination);
     if (isPhone) {
       const phone = normalizePhone(destination);
       const textMessage = `Distric House: Tu codigo de verificacion es ${code}. Valido por 15 minutos.`;
 
-      // 1. Envío prioritario por Mensaje de Texto (SMS)
+      // 1. Envío prioritario mediante el Gateway SMS Externo
       try {
-        await sendSmsViaYCloud(phone, textMessage);
+        const smsGateway = getSmsGateway();
+        const smsResult = await smsGateway.sendSms({
+          to: phone,
+          message: textMessage,
+          code: code,
+        });
+        if (smsResult.success) {
+          console.log(`[customer_auth] SMS entregado al gateway exitosamente (${smsResult.provider}) para ${phone}`);
+        } else {
+          console.warn(`[customer_auth] Gateway SMS (${smsResult.provider}):`, smsResult.error || smsResult.message);
+        }
       } catch (err) {
-        console.error(`[customer_auth] Error en despacho SMS:`, err.message);
+        console.error(`[customer_auth] Error en Gateway SMS:`, err.message);
       }
 
       // 2. Envío de respaldo por WhatsApp si el cliente está conectado
