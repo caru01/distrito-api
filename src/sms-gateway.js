@@ -75,34 +75,64 @@ class SmsGateway {
   }
 
   /**
-   * 1. Hablame Colombia API v3
+   * 1. Hablame Colombia API (v5 moderna con fallback a v3)
    * Documentación: https://hablame.co
    */
   async _sendHablame({ phone, message }) {
+    const apiKey = this.env.HABLAME_API_KEY || this.env.HABLAME_KEY;
     const account = this.env.HABLAME_ACCOUNT;
-    const apiKey = this.env.HABLAME_API_KEY;
     const token = this.env.HABLAME_TOKEN;
 
     if (!apiKey && !account) {
-      throw new Error('Hablame requiere HABLAME_ACCOUNT y HABLAME_API_KEY en variables de entorno');
+      throw new Error('Hablame requiere HABLAME_API_KEY en variables de entorno');
     }
 
-    const payload = JSON.stringify({
+    // 1.1 Intentar API v5 moderna (recomendada)
+    if (apiKey) {
+      const payloadV5 = JSON.stringify({
+        priority: true,
+        messages: [
+          {
+            to: phone,
+            text: message,
+          },
+        ],
+      });
+
+      const headersV5 = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-Hablame-Key': apiKey.trim(),
+        'Content-Length': Buffer.byteLength(payloadV5),
+      };
+
+      try {
+        const resV5 = await this._postJson('https://www.hablame.co/api/sms/v5/send', payloadV5, headersV5, 'Hablame v5');
+        if (resV5.success) {
+          return resV5;
+        }
+      } catch (err) {
+        console.warn('[sms_gateway] Hablame v5 fallo, intentando v3 legacy:', err.message);
+      }
+    }
+
+    // 1.2 Fallback API v3 legacy
+    const payloadV3 = JSON.stringify({
       toNumber: phone,
       sms: message,
       flash: '0',
       sc: this.env.HABLAME_SC || '89003',
     });
 
-    const headers = {
+    const headersV3 = {
       'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(payload),
+      'Content-Length': Buffer.byteLength(payloadV3),
     };
-    if (account) headers['account'] = account;
-    if (apiKey) headers['apiKey'] = apiKey;
-    if (token) headers['token'] = token;
+    if (account) headersV3['account'] = account;
+    if (apiKey) headersV3['apiKey'] = apiKey;
+    if (token) headersV3['token'] = token;
 
-    return this._postJson('https://api103.hablame.co/api/sms/v3/send/priority', payload, headers, 'Hablame');
+    return this._postJson('https://api103.hablame.co/api/sms/v3/send/priority', payloadV3, headersV3, 'Hablame v3');
   }
 
   /**
