@@ -326,7 +326,7 @@ function settingsForResponse(req, settings) {
   if (data.logo) {
     data.logo = `${absoluteApiUrl(req, '/media/settings-logo')}${version ? `?v=${version}` : ''}`;
   }
-  ['web', 'admin', 'delivery'].forEach((surface) => {
+  ['web', 'admin', 'delivery', 'app'].forEach((surface) => {
     const key = `${surface}_logo`;
     if (data[key]) data[key] = `${absoluteApiUrl(req, `/media/settings-logo/${surface}`)}${version ? `?v=${version}` : ''}`;
   });
@@ -339,7 +339,7 @@ function isManagedMediaUrl(value, resource, id) {
 
 function sendStoredMedia(res, value) {
   if (!value) return res.status(404).end();
-  res.set('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
+  res.set('Cache-Control', 'public, max-age=604800, stale-while-revalidate=86400');
   if (/^https?:\/\//i.test(value)) return res.redirect(302, value);
 
   const match = /^data:([^;,]+);base64,(.+)$/s.exec(value);
@@ -350,6 +350,54 @@ function sendStoredMedia(res, value) {
   return res.send(buffer);
 }
 
+const CHEF_INGREDIENTS_CATALOG = {
+  // Bases
+  base_brioche: { id: 'base_brioche', name: 'Pan Brioche Dorado', group: 'base', price: 4500, max: 1 },
+  base_papa: { id: 'base_papa', name: 'Pan Artesanal de Papa', group: 'base', price: 4500, max: 1 },
+  base_perro: { id: 'base_perro', name: 'Pan Perro Extra Suave', group: 'base', price: 4000, max: 1 },
+  base_plato: { id: 'base_plato', name: 'Base al Plato (Keto / Fit)', group: 'base', price: 4000, max: 1 },
+  // Proteínas
+  prot_res_120: { id: 'prot_res_120', name: 'Carne Artesanal 120g', group: 'protein', price: 7000, max: 4 },
+  prot_angus_150: { id: 'prot_angus_150', name: 'Carne Angus Premium 150g', group: 'protein', price: 9500, max: 3 },
+  prot_pollo_crispy: { id: 'prot_pollo_crispy', name: 'Filete de Pollo Crispy', group: 'protein', price: 7500, max: 3 },
+  prot_salchicha: { id: 'prot_salchicha', name: 'Salchicha Americana Premium', group: 'protein', price: 6000, max: 3 },
+  prot_chorizo: { id: 'prot_chorizo', name: 'Chorizo Artesanal', group: 'protein', price: 6500, max: 3 },
+  // Quesos
+  cheese_cheddar: { id: 'cheese_cheddar', name: 'Queso Cheddar Fundido', group: 'cheese', price: 3000, max: 4 },
+  cheese_mozzarella: { id: 'cheese_mozzarella', name: 'Queso Mozzarella Doble Crema', group: 'cheese', price: 3000, max: 4 },
+  cheese_costeno: { id: 'cheese_costeno', name: 'Queso Costeño Asado', group: 'cheese', price: 4000, max: 3 },
+  // Complementos / Toppings
+  top_tocineta: { id: 'top_tocineta', name: 'Tocineta Ahumada Crocante', group: 'topping', price: 4000, max: 4 },
+  top_cebolla_caram: { id: 'top_cebolla_caram', name: 'Cebolla Caramelizada', group: 'topping', price: 2500, max: 3 },
+  top_vegetales: { id: 'top_vegetales', name: 'Lechuga Crespa y Tomate', group: 'topping', price: 2000, max: 2 },
+  top_pepinillos: { id: 'top_pepinillos', name: 'Pepinillos Agridulces', group: 'topping', price: 2500, max: 3 },
+  top_huevo: { id: 'top_huevo', name: 'Huevo Frito a la Plancha', group: 'topping', price: 3000, max: 2 },
+  top_maicitos: { id: 'top_maicitos', name: 'Maicitos Tiernos', group: 'topping', price: 3000, max: 3 },
+  top_papas_angel: { id: 'top_papas_angel', name: 'Papas Cabello de Ángel', group: 'topping', price: 2000, max: 3 },
+  top_jalapenos: { id: 'top_jalapenos', name: 'Jalapeños Picantes', group: 'topping', price: 2500, max: 3 },
+  // Salsas
+  sauce_lena: { id: 'sauce_lena', name: 'Salsa Distric Leña', group: 'sauce', price: 1500, max: 2 },
+  sauce_casa: { id: 'sauce_casa', name: 'Salsa Especial de la Casa', group: 'sauce', price: 1000, max: 2 },
+  sauce_cheddar_liq: { id: 'sauce_cheddar_liq', name: 'Salsa de Queso Cheddar', group: 'sauce', price: 3000, max: 2 },
+  sauce_bbq: { id: 'sauce_bbq', name: 'Salsa BBQ Artesanal', group: 'sauce', price: 1500, max: 2 },
+  sauce_pina: { id: 'sauce_pina', name: 'Salsa Dulce de Piña', group: 'sauce', price: 1500, max: 2 },
+  sauce_ajo: { id: 'sauce_ajo', name: 'Mayonesa de Ajo Rostizado', group: 'sauce', price: 1500, max: 2 },
+};
+
+const CUSTOM_BURGER_MASTER_ID = '00000000-0000-4000-8000-000000000001';
+
+function isCustomBurgerItem(item) {
+  if (!item) return false;
+  const idStr = String(item.id || item.product_id || '');
+  const catStr = String(item.category || '').toLowerCase();
+  return idStr.startsWith('custom_') ||
+         idStr === CUSTOM_BURGER_MASTER_ID ||
+         item.is_custom === true ||
+         item.isCustom === true ||
+         catStr.includes('manera') ||
+         catStr.includes('chef');
+}
+
 async function normalizeOrderCart(client, rawCart, { activeOnly = true } = {}) {
   if (!Array.isArray(rawCart) || rawCart.length === 0 || rawCart.length > 100) {
     const error = new Error('El pedido debe contener entre 1 y 100 productos.');
@@ -357,30 +405,40 @@ async function normalizeOrderCart(client, rawCart, { activeOnly = true } = {}) {
     throw error;
   }
 
-  const ids = [...new Set(rawCart.map((item) => String(item.id || item.product_id || '')).filter(Boolean))];
-  const { rows } = await client.query(
-    `SELECT id, title, price, category
-     FROM pedidos_app_products
-     WHERE id::text = ANY($1::text[]) AND ($2::boolean = FALSE OR status = 'Activo')`,
-    [ids, activeOnly]
-  );
-  const products = new Map(rows.map((product) => [String(product.id), product]));
+  const standardIds = [...new Set(
+    rawCart
+      .filter((item) => !isCustomBurgerItem(item))
+      .map((item) => String(item.id || item.product_id || ''))
+      .filter(Boolean)
+  )];
+  const products = new Map();
+  if (standardIds.length > 0) {
+    const { rows } = await client.query(
+      `SELECT id, title, price, category
+       FROM pedidos_app_products
+       WHERE id::text = ANY($1::text[]) AND ($2::boolean = FALSE OR status = 'Activo')`,
+      [standardIds, activeOnly]
+    );
+    rows.forEach((product) => products.set(String(product.id), product));
+  }
 
   // Check combos
-  const { rows: comboRows } = await client.query(
-    `SELECT cc.combo_product_id, cc.component_product_id, cc.quantity AS component_qty, p.title AS component_title
-     FROM pedidos_app_combo_components cc
-     JOIN pedidos_app_products p ON p.id = cc.component_product_id
-     WHERE cc.combo_product_id::text = ANY($1::text[])`,
-    [ids]
-  );
   const comboMap = new Map();
-  const allProductIds = new Set(ids);
-  for (const row of comboRows) {
-    const key = String(row.combo_product_id);
-    if (!comboMap.has(key)) comboMap.set(key, []);
-    comboMap.get(key).push(row);
-    allProductIds.add(String(row.component_product_id));
+  const allProductIds = new Set(standardIds);
+  if (standardIds.length > 0) {
+    const { rows: comboRows } = await client.query(
+      `SELECT cc.combo_product_id, cc.component_product_id, cc.quantity AS component_qty, p.title AS component_title
+       FROM pedidos_app_combo_components cc
+       JOIN pedidos_app_products p ON p.id = cc.component_product_id
+       WHERE cc.combo_product_id::text = ANY($1::text[])`,
+      [standardIds]
+    );
+    for (const row of comboRows) {
+      const key = String(row.combo_product_id);
+      if (!comboMap.has(key)) comboMap.set(key, []);
+      comboMap.get(key).push(row);
+      allProductIds.add(String(row.component_product_id));
+    }
   }
 
   // Fetch recipes for all products involved (direct or via combo)
@@ -418,10 +476,84 @@ async function normalizeOrderCart(client, rawCart, { activeOnly = true } = {}) {
   }
 
   const cart = rawCart.map((item) => {
+    const quantity = Number(item.quantity || item.qty || 1);
+    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 50) {
+      const error = new Error('El carrito contiene un producto o cantidad inválida.');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    if (isCustomBurgerItem(item)) {
+      // 🍔 Procesamiento y validación estricta del Modo Chef desde el servidor
+      const additions = Array.isArray(item.adiciones) ? item.adiciones : (Array.isArray(item.modifiers) ? item.modifiers : []);
+      let basePrice = 4500; // precio base por defecto (Pan Brioche Dorado)
+      let baseName = 'Pan Brioche Dorado';
+      let additionsTotal = 0;
+      const validatedModifiers = [];
+      const ingredientNames = [];
+
+      for (const rawAdd of additions) {
+        const rawId = String(rawAdd.id || rawAdd.key || '').trim();
+        const rawTitle = String(rawAdd.title || rawAdd.name || '').trim().toLowerCase();
+        const addQty = Math.max(1, Math.min(Number(rawAdd.quantity || rawAdd.qty || 1), 5));
+
+        // Buscar en catálogo de ingredientes por ID o coincidencia de nombre
+        let ing = CHEF_INGREDIENTS_CATALOG[rawId];
+        if (!ing) {
+          ing = Object.values(CHEF_INGREDIENTS_CATALOG).find(
+            (c) => c.name.toLowerCase() === rawTitle || rawTitle.includes(c.name.toLowerCase())
+          );
+        }
+
+        if (ing) {
+          if (ing.group === 'base') {
+            basePrice = ing.price;
+            baseName = ing.name;
+          } else {
+            const linePrice = ing.price * addQty;
+            additionsTotal += linePrice;
+            validatedModifiers.push({
+              id: ing.id,
+              name: ing.name,
+              title: ing.name,
+              price: ing.price,
+              quantity: addQty,
+              total: linePrice,
+              group: ing.group,
+            });
+            ingredientNames.push(addQty > 1 ? `${addQty}x ${ing.name}` : ing.name);
+          }
+        }
+      }
+
+      const authoritativePrice = basePrice + additionsTotal;
+      const customTitle = String(item.title || item.name || 'Hamburguesa Modo Chef').trim();
+      const userNotes = String(item.notes || item.observations || item.observaciones || '').trim();
+      const recipeSummary = `Base: ${baseName}${ingredientNames.length ? ' | ' + ingredientNames.join(', ') : ''}`;
+      const finalNotes = userNotes ? `${userNotes} (${recipeSummary})` : recipeSummary;
+
+      return {
+        id: CUSTOM_BURGER_MASTER_ID,
+        custom_id: String(item.id || item.product_id || `custom_${Date.now()}`),
+        is_custom: true,
+        title: customTitle.startsWith('👨‍🍳') ? customTitle : `👨‍🍳 ${customTitle}`,
+        price: authoritativePrice,
+        category: 'Modo Chef',
+        quantity,
+        notes: finalNotes.slice(0, 500),
+        modifiers: validatedModifiers,
+        recipe_details: {
+          base: { name: baseName, price: basePrice },
+          ingredients: validatedModifiers,
+          server_calculated_price: authoritativePrice,
+          created_at: new Date().toISOString(),
+        },
+      };
+    }
+
     const id = String(item.id || item.product_id || '');
     const product = products.get(id);
-    const quantity = Number(item.quantity || item.qty || 1);
-    if (!product || !Number.isInteger(quantity) || quantity < 1 || quantity > 50) {
+    if (!product) {
       const error = new Error('El carrito contiene un producto o cantidad inválida.');
       error.statusCode = 400;
       throw error;
@@ -814,7 +946,7 @@ app.get('/api/pedidos/media/settings-logo', async (req, res) => {
 });
 
 app.get('/api/pedidos/media/settings-logo/:surface', async (req, res) => {
-  const fields = { web: 'web_logo', admin: 'admin_logo', delivery: 'delivery_logo' };
+  const fields = { web: 'web_logo', admin: 'admin_logo', delivery: 'delivery_logo', app: 'app_logo' };
   const field = fields[req.params.surface];
   if (!field) return res.status(404).end();
   try {
@@ -838,12 +970,23 @@ app.get('/api/pedidos/init', async (req, res) => {
     }
 
     const { rows: products } = await pool.query(`
-      SELECT id, title, description, price, category, status, is_active, is_featured,
-             stock, track_stock, low_stock_threshold, inventory_unit, barcode,
-             rating_sum, rating_count, created_at, updated_at, sort_order, adicionales_ids, units_count, image IS NOT NULL AS has_image
-      FROM pedidos_app_products
-      WHERE status = 'Activo'
-      ORDER BY sort_order ASC, created_at DESC, id DESC
+      SELECT p.id, p.title, p.description, p.price, p.category, p.status, p.is_active, p.is_featured,
+             p.stock, p.track_stock, p.low_stock_threshold, p.inventory_unit, p.barcode,
+             p.rating_sum, p.rating_count, p.created_at, p.updated_at, p.sort_order, p.adicionales_ids, p.units_count,
+             p.image IS NOT NULL AS has_image,
+             COALESCE(sales.total_sold, 0)::int AS sales_count
+      FROM pedidos_app_products p
+      LEFT JOIN (
+        SELECT 
+          item->>'id' AS prod_id,
+          SUM(COALESCE((item->>'quantity')::numeric, (item->>'qty')::numeric, 1)) AS total_sold
+        FROM pedidos_app_orders o,
+        jsonb_array_elements(o.cart_json) AS item
+        WHERE o.status != 'Cancelado'
+        GROUP BY item->>'id'
+      ) sales ON sales.prod_id = p.id::text
+      WHERE p.status = 'Activo'
+      ORDER BY p.sort_order ASC, p.created_at DESC, p.id DESC
     `);
     const { rows: categories } = await pool.query("SELECT * FROM pedidos_app_categories WHERE status = 'Activa' ORDER BY sort_order ASC, id ASC");
 
@@ -1231,6 +1374,8 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
         (() => {
           let src = req.body.source || customer.source || (resolvedCrmContactId ? 'WhatsApp' : 'Web');
           if (src === 'WhatsApp CRM' || String(src).toLowerCase().includes('whatsapp')) return 'WhatsApp';
+          const s = String(src).toLowerCase().trim();
+          if (s === 'app' || s === 'mobile' || s.includes('app') || s.includes('movil') || s.includes('móvil')) return 'APP';
           return src;
         })(),
         customer.notes || customer.comment || '',
@@ -1440,10 +1585,25 @@ app.get('/api/pedidos/track/:id', trackingLimiter, async (req, res) => {
 
   try {
     const id = Number(req.params.id);
+    let trackingPhone = req.query.phone;
+    let trackingToken = req.query.token;
+
+    // Soporte para clientes autenticados en la App Móvil vía Bearer Token
+    if (!trackingPhone && !trackingToken && req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+      try {
+        const cToken = req.headers.authorization.split(' ')[1];
+        const jwt = require('jsonwebtoken');
+        const decoded = jwt.verify(cToken, JWT_SECRET);
+        if (decoded && decoded.phone) {
+          trackingPhone = decoded.phone;
+        }
+      } catch (_) {}
+    }
+
     await authorizeTrackingAccess(pool, {
       orderId: id,
-      phone: req.query.phone,
-      token: req.query.token,
+      phone: trackingPhone,
+      token: trackingToken,
       secret: JWT_SECRET,
     });
     const { rows } = await pool.query(`
@@ -2070,7 +2230,7 @@ const requireAdministrativeUser = async (req, res, next) => {
 // autenticación es compartida. El resto del prefijo /admin pertenece al ERP.
 app.use('/api/pedidos/admin', authenticateToken, requireAdministrativeUser);
 
-app.get('/api/pedidos/admin/dashboard', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/dashboard', authenticateToken, requirePermission('Dashboard', 'ver'), async (req, res) => {
   try {
     const { startDate, endDate, date } = req.query;
     let filterStart = null;
@@ -2132,7 +2292,7 @@ function getBogotaPeriodDates(period) {
 }
 
 // GET /api/pedidos/admin/dashboard/profitability?period=15d|weekly|monthly
-app.get('/api/pedidos/admin/dashboard/profitability', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/dashboard/profitability', authenticateToken, requirePermission('Inventario', 'rentabilidad'), async (req, res) => {
   try {
     const period = ['15d', 'weekly', 'monthly'].includes(req.query.period) ? req.query.period : '15d';
     let startDate, endDate, label;
@@ -2269,7 +2429,7 @@ app.get('/api/pedidos/admin/dashboard/profitability', authenticateToken, async (
 });
 
 // Obtener todas las categorías para el panel admin
-app.get('/api/pedidos/admin/categories', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/categories', authenticateToken, requirePermission('Categorias', 'ver'), async (req, res) => {
   try {
     if (!dbUrl) {
       return res.json({ status: 'ok', categories: [] });
@@ -2292,7 +2452,7 @@ app.get('/api/pedidos/admin/categories', authenticateToken, async (req, res) => 
 });
 
 // Reordenar categorías
-app.put('/api/pedidos/admin/categories/reorder', authenticateToken, async (req, res) => {
+app.put('/api/pedidos/admin/categories/reorder', authenticateToken, requirePermission('Categorias', 'editar'), async (req, res) => {
   try {
     const { orderedIds } = req.body;
     if (!Array.isArray(orderedIds) || orderedIds.length === 0) {
@@ -2322,7 +2482,7 @@ app.put('/api/pedidos/admin/categories/reorder', authenticateToken, async (req, 
 });
 
 // Crear categoría
-app.post('/api/pedidos/admin/categories', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/categories', authenticateToken, requirePermission('Categorias', 'crear'), async (req, res) => {
   try {
     const { name, description, image, status } = req.body;
     const { rows } = await pool.query(
@@ -2339,7 +2499,7 @@ app.post('/api/pedidos/admin/categories', authenticateToken, async (req, res) =>
 });
 
 // Actualizar categoría
-app.put('/api/pedidos/admin/categories/:id', authenticateToken, async (req, res) => {
+app.put('/api/pedidos/admin/categories/:id', authenticateToken, requirePermission('Categorias', 'editar'), async (req, res) => {
   try {
     const { id } = req.params;
     const { name, description, image, status } = req.body;
@@ -2355,7 +2515,7 @@ app.put('/api/pedidos/admin/categories/:id', authenticateToken, async (req, res)
 });
 
 // Eliminar categoría
-app.delete('/api/pedidos/admin/categories/:id', authenticateToken, async (req, res) => {
+app.delete('/api/pedidos/admin/categories/:id', authenticateToken, requirePermission('Categorias', 'eliminar'), async (req, res) => {
   try {
     const { id } = req.params;
     await pool.query('DELETE FROM pedidos_app_categories WHERE id = $1', [id]);
@@ -2368,7 +2528,7 @@ app.delete('/api/pedidos/admin/categories/:id', authenticateToken, async (req, r
 
 // Obtener todas las ordenes para admin
 // ── Clientes: Autocompletar por nombre o teléfono ────────────────────────────
-app.get('/api/pedidos/admin/clientes/buscar', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/clientes/buscar', authenticateToken, requirePermission('Clientes', 'ver'), async (req, res) => {
   try {
     const { q } = req.query;
     if (!q || q.length < 1) return res.json({ status: 'ok', clientes: [] });
@@ -2432,7 +2592,7 @@ const CUSTOMER_SEGMENT_SQL = `CASE contact.status
   WHEN 'CLIENTE_NUEVO' THEN 'Nuevo'
   ELSE CASE WHEN contact.id IS NULL THEN 'Sin pedidos' ELSE 'Frecuente' END END`;
 
-app.get('/api/pedidos/admin/customers', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/customers', authenticateToken, requirePermission('Clientes', 'ver'), async (req, res) => {
   try {
     const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(10, Number.parseInt(req.query.limit, 10) || 25));
@@ -2475,7 +2635,7 @@ app.get('/api/pedidos/admin/customers', authenticateToken, async (req, res) => {
   } catch (error) { sendInternalError(res, error); }
 });
 
-app.get('/api/pedidos/admin/customers/:id', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/customers/:id', authenticateToken, requirePermission('Clientes', 'ver'), async (req, res) => {
   try {
     const customer = await pool.query(`
       SELECT customer.*,contact.id AS crm_contact_id,contact.status AS crm_status,contact.source AS crm_source,
@@ -2520,7 +2680,7 @@ async function syncCustomerMarketingConsent(client, customerId, granted, actorUs
   await client.query('SELECT pedidos_app_crm_refresh_contact($1)', [contact.rows[0].id]);
 }
 
-app.post('/api/pedidos/admin/customers', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/customers', authenticateToken, requirePermission('Clientes', 'crear'), async (req, res) => {
   const normalizedPhone = normalizePhoneE164(req.body.phone);
   const phone = normalizedPhone?.slice(1) || '';
   const name = String(req.body.name || '').trim();
@@ -2545,7 +2705,7 @@ app.post('/api/pedidos/admin/customers', authenticateToken, async (req, res) => 
   } finally { client.release(); }
 });
 
-app.put('/api/pedidos/admin/customers/:id', authenticateToken, async (req, res) => {
+app.put('/api/pedidos/admin/customers/:id', authenticateToken, requirePermission('Clientes', 'editar'), async (req, res) => {
   const normalizedPhone = normalizePhoneE164(req.body.phone);
   const phone = normalizedPhone?.slice(1) || '';
   const name = String(req.body.name || '').trim();
@@ -2580,7 +2740,7 @@ app.put('/api/pedidos/admin/customers/:id', authenticateToken, async (req, res) 
   } finally { client.release(); }
 });
 
-app.post('/api/pedidos/admin/customers/:id/contact', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/customers/:id/contact', authenticateToken, requirePermission('Clientes', 'editar'), async (req, res) => {
   try {
     const { rows } = await pool.query('UPDATE pedidos_app_customers SET last_contact_at=NOW(), updated_at=NOW() WHERE id=$1 RETURNING last_contact_at', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'Cliente no encontrado' });
@@ -2589,7 +2749,7 @@ app.post('/api/pedidos/admin/customers/:id/contact', authenticateToken, async (r
 });
 
 // ================= ESTADÍSTICAS LIGERAS =================
-app.get('/api/pedidos/admin/stats/live', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/stats/live', authenticateToken, requirePermission('Pedidos', 'ver'), async (req, res) => {
   try {
     if (!dbUrl) return res.json({ status: 'ok', stats: { inKitchen: 0, preparing: 0, ready: 0, todaySales: 0 } });
     
@@ -2619,7 +2779,7 @@ app.get('/api/pedidos/admin/stats/live', authenticateToken, async (req, res) => 
   }
 });
 
-app.get('/api/pedidos/admin/orders', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/orders', authenticateToken, requirePermission('Pedidos', 'ver'), async (req, res) => {
   try {
     if (!dbUrl) return res.json({ status: 'ok', orders: [] });
     const requestedLimit = Number.parseInt(req.query.limit, 10) || 300;
@@ -2660,7 +2820,7 @@ app.get('/api/pedidos/admin/orders', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/pedidos/admin/orders/:id/tracking-token', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/orders/:id/tracking-token', authenticateToken, requirePermission('Pedidos', 'editar'), async (req, res) => {
   try {
     const orderId = Number(req.params.id);
     if (!Number.isInteger(orderId) || orderId < 1) return res.status(400).json({ error: 'Pedido inválido' });
@@ -2678,7 +2838,7 @@ app.post('/api/pedidos/admin/orders/:id/tracking-token', authenticateToken, asyn
 });
 
 
-app.post('/api/pedidos/admin/orders/:id/notify-whatsapp', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/orders/:id/notify-whatsapp', authenticateToken, requirePermission('Pedidos', 'editar'), async (req, res) => {
   try {
     const orderId = Number(req.params.id);
     if (!Number.isInteger(orderId) || orderId < 1) return res.status(400).json({ error: 'Pedido inválido' });
@@ -2714,7 +2874,7 @@ app.post('/api/pedidos/admin/orders/:id/notify-whatsapp', authenticateToken, asy
     sendInternalError(res, error);
   }
 });
-app.post('/api/pedidos/admin/orders/:id/tracking-sent', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/orders/:id/tracking-sent', authenticateToken, requirePermission('Pedidos', 'editar'), async (req, res) => {
   try {
     const orderId = Number(req.params.id);
     if (!Number.isInteger(orderId) || orderId < 1) return res.status(400).json({ error: 'Pedido inválido' });
@@ -2726,7 +2886,7 @@ app.post('/api/pedidos/admin/orders/:id/tracking-sent', authenticateToken, async
 });
 
 // Actualizar estado de orden
-app.put('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => {
+app.put('/api/pedidos/admin/orders/:id', authenticateToken, requirePermission('Pedidos', 'editar'), async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
@@ -2910,7 +3070,7 @@ app.put('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => 
 });
 
 // Editar pedido completo (carrito, total, cliente)
-app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res) => {
+app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, requirePermission('Pedidos', 'editar'), async (req, res) => {
   const client = await pool.connect();
   try {
     const { id } = req.params;
@@ -2998,6 +3158,8 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
         (() => {
           let src = req.body.source || customer.source || currentOrder.source || (targetCrmContactId ? 'WhatsApp' : 'Web');
           if (src === 'WhatsApp CRM' || String(src).toLowerCase().includes('whatsapp')) return 'WhatsApp';
+          const s = String(src).toLowerCase().trim();
+          if (s === 'app' || s === 'mobile' || s.includes('app') || s.includes('movil') || s.includes('móvil')) return 'APP';
           return src;
         })(), customDate, id, customer.notes || '',
         customer.voucher_reference || '',
@@ -3025,7 +3187,7 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, async (req, res
 });
 
 // Eliminar orden
-app.delete('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) => {
+app.delete('/api/pedidos/admin/orders/:id', authenticateToken, requirePermission('Pedidos', 'eliminar'), async (req, res) => {
   const client = await pool.connect();
   try {
     const { id } = req.params;
@@ -3048,7 +3210,7 @@ app.delete('/api/pedidos/admin/orders/:id', authenticateToken, async (req, res) 
 
 // ================= PRODUCTOS =================
 // Obtener todos los productos admin
-app.get('/api/pedidos/admin/products', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/products', authenticateToken, requirePermission('Productos', 'ver'), async (req, res) => {
   try {
     if (!dbUrl) return res.json({ status: 'ok', products: [] });
     const { rows } = await pool.query(`
@@ -3065,7 +3227,7 @@ app.get('/api/pedidos/admin/products', authenticateToken, async (req, res) => {
 });
 
 // Reordenar productos
-app.put('/api/pedidos/admin/products/reorder', authenticateToken, async (req, res) => {
+app.put('/api/pedidos/admin/products/reorder', authenticateToken, requirePermission('Productos', 'editar'), async (req, res) => {
   try {
     const { orderedIds } = req.body;
     if (!Array.isArray(orderedIds) || orderedIds.length === 0) {
@@ -3095,7 +3257,7 @@ app.put('/api/pedidos/admin/products/reorder', authenticateToken, async (req, re
 });
 
 // Crear producto
-app.post('/api/pedidos/admin/products', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/products', authenticateToken, requirePermission('Productos', 'crear'), async (req, res) => {
   try {
     const { title, description, price, category, image, status, is_featured, stock,
       barcode, track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost, adicionales_ids, units_count } = req.body;
@@ -3122,7 +3284,7 @@ app.post('/api/pedidos/admin/products', authenticateToken, async (req, res) => {
 });
 
 // Actualizar producto
-app.put('/api/pedidos/admin/products/:id', authenticateToken, async (req, res) => {
+app.put('/api/pedidos/admin/products/:id', authenticateToken, requirePermission('Productos', 'editar'), async (req, res) => {
   try {
     const { id } = req.params;
     const { title, description, price, category, image, status, is_featured, stock,
@@ -3160,7 +3322,7 @@ app.put('/api/pedidos/admin/products/:id', authenticateToken, async (req, res) =
 });
 
 // Eliminar producto
-app.delete('/api/pedidos/admin/products/:id', authenticateToken, async (req, res) => {
+app.delete('/api/pedidos/admin/products/:id', authenticateToken, requirePermission('Productos', 'eliminar'), async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -3188,7 +3350,7 @@ app.delete('/api/pedidos/admin/products/:id', authenticateToken, async (req, res
 });
 
 const barcodeLookupCache = new Map();
-app.get('/api/pedidos/admin/products/lookup-barcode/:code', authenticateToken, inventoryLookupLimiter, async (req, res) => {
+app.get('/api/pedidos/admin/products/lookup-barcode/:code', authenticateToken, requirePermission('Productos', 'ver'), inventoryLookupLimiter, async (req, res) => {
   const code = String(req.params.code || '').replace(/\D/g, '');
   if (!/^\d{8,14}$/.test(code)) return res.status(400).json({ error: 'El código debe contener entre 8 y 14 dígitos' });
   const cached = barcodeLookupCache.get(code);
@@ -3316,12 +3478,49 @@ const SETTINGS_FIELDS = new Set([
   'crm_attribution_days', 'crm_campaign_frequency_days', 'crm_campaign_start_time',
   'crm_campaign_end_time',
   'printer_mode', 'printer_primary_name', 'printer_secondary_name',
-  'printer_paper_width', 'print_agent_id', 'print_job_expiry_minutes'
+  'printer_paper_width', 'print_agent_id', 'print_job_expiry_minutes',
+  'app_logo', 'app_name', 'app_page_title', 'app_hero_title', 'app_hero_subtitle',
+  'app_primary_color', 'app_background_color', 'app_surface_color', 'app_text_color',
+  'app_font_family', 'app_card_style', 'app_is_active', 'app_maintenance_message',
+  'app_min_order', 'app_delivery_cost', 'app_min_version', 'app_current_version',
+  'app_download_url', 'app_support_phone', 'app_show_chef_3d', 'app_welcome_discount_enabled',
+  'app_welcome_discount_text', 'app_allow_cash', 'app_allow_nequi', 'app_allow_transfer'
 ]);
 
 const COLOR_SETTING_FIELDS = new Set([...SETTINGS_FIELDS].filter((key) => key.endsWith('_color')));
 
-app.get('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/app/metrics', authenticateToken, requirePermission('Dashboard', 'ver'), async (req, res) => {
+  try {
+    const metricsRes = await pool.query(`
+      SELECT 
+        COUNT(*) as total_orders,
+        COALESCE(SUM(total - COALESCE(delivery_fee, 0)), 0) as total_revenue,
+        COUNT(DISTINCT customer_phone) as total_customers,
+        COUNT(CASE WHEN status != 'Cancelado' AND status != 'Pendiente Pago' THEN 1 END) as completed_orders
+      FROM pedidos_app_orders
+      WHERE source = 'APP' OR source ILIKE '%mobile%'
+    `);
+
+    const recentRes = await pool.query(`
+      SELECT id, customer_name, customer_phone, total, delivery_fee, status, created_at, payment_method
+      FROM pedidos_app_orders
+      WHERE source = 'APP' OR source ILIKE '%mobile%'
+      ORDER BY created_at DESC
+      LIMIT 5
+    `);
+
+    res.json({
+      status: 'ok',
+      metrics: metricsRes.rows[0],
+      recent_orders: recentRes.rows
+    });
+  } catch (error) {
+    console.error('Error fetching app metrics:', error);
+    sendInternalError(res, error);
+  }
+});
+
+app.get('/api/pedidos/admin/settings', authenticateToken, requirePermission('Configuracion', 'ver'), async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM pedidos_app_settings WHERE id = 1');
     if (rows.length === 0) {
@@ -3336,11 +3535,11 @@ app.get('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
   }
 });
 
-app.put('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
+app.put('/api/pedidos/admin/settings', authenticateToken, requirePermission('Configuracion', 'editar'), async (req, res) => {
   try {
     const data = { ...req.body };
     if (typeof data.logo === 'string' && data.logo.includes('/api/pedidos/media/settings-logo')) delete data.logo;
-    ['web', 'admin', 'delivery'].forEach((surface) => {
+    ['web', 'admin', 'delivery', 'app'].forEach((surface) => {
       const key = `${surface}_logo`;
       if (typeof data[key] === 'string' && data[key].includes(`/api/pedidos/media/settings-logo/${surface}`)) delete data[key];
     });
@@ -3401,12 +3600,13 @@ app.put('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
         && !['es-CO', 'es-MX', 'es-ES', 'en-US', 'pt-BR'].includes(data.notification_language)) {
       return res.status(400).json({ status: 'error', error: 'El idioma de las alertas no es válido.' });
     }
-    const fontKeys = ['web_font_family', 'admin_font_family', 'delivery_font_family'];
+    const fontKeys = ['web_font_family', 'admin_font_family', 'delivery_font_family', 'app_font_family'];
     if (requestedKeys.some((key) => fontKeys.includes(key) && !['modern', 'friendly', 'classic', 'system'].includes(data[key]))) {
       return res.status(400).json({ status: 'error', error: 'La familia tipográfica seleccionada no es válida.' });
     }
     if ((requestedKeys.includes('web_card_style') && !['rounded', 'compact', 'outlined'].includes(data.web_card_style))
-        || (requestedKeys.includes('delivery_card_style') && !['rounded', 'compact', 'outlined'].includes(data.delivery_card_style))) {
+        || (requestedKeys.includes('delivery_card_style') && !['rounded', 'compact', 'outlined'].includes(data.delivery_card_style))
+        || (requestedKeys.includes('app_card_style') && !['rounded', 'compact', 'outlined'].includes(data.app_card_style))) {
       return res.status(400).json({ status: 'error', error: 'El estilo de tarjetas no es válido.' });
     }
     if (requestedKeys.includes('admin_density') && !['comfortable', 'compact'].includes(data.admin_density)) {
@@ -3416,6 +3616,9 @@ app.put('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
       web_page_title: 120, web_hero_title: 160, web_hero_subtitle: 300,
       admin_page_title: 120, admin_sidebar_title: 120,
       delivery_page_title: 120, delivery_heading: 160, delivery_subtitle: 300,
+      app_name: 120, app_page_title: 120, app_hero_title: 160, app_hero_subtitle: 300,
+      app_maintenance_message: 500, app_min_version: 50, app_current_version: 50,
+      app_download_url: 500, app_support_phone: 50, app_welcome_discount_text: 200,
     };
     const invalidText = requestedKeys.find((key) => textLimits[key] && String(data[key] || '').trim().length > textLimits[key]);
     if (invalidText) return res.status(400).json({ status: 'error', error: `El campo ${invalidText} supera el máximo permitido.` });
@@ -3465,7 +3668,7 @@ app.put('/api/pedidos/admin/settings', authenticateToken, async (req, res) => {
 
 // ================= INVENTARIO =================
 
-app.get('/api/pedidos/admin/inventory', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/inventory', authenticateToken, requirePermission('Inventario', 'ver'), async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT 
@@ -3495,7 +3698,7 @@ app.get('/api/pedidos/admin/inventory', authenticateToken, async (req, res) => {
 });
 
 // Obtener insumos con alertas activas (Agotados, Críticos, Stock Bajo)
-app.get('/api/pedidos/admin/inventory/alerts', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/inventory/alerts', authenticateToken, requirePermission('Inventario', 'ver'), async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT 
@@ -3542,7 +3745,7 @@ app.get('/api/pedidos/admin/inventory/alerts', authenticateToken, async (req, re
   }
 });
 
-app.post('/api/pedidos/admin/inventory', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/inventory', authenticateToken, requirePermission('Inventario', 'crear'), async (req, res) => {
   const client = await pool.connect();
   try {
     const { name, unit, min_stock, track_stock, sku, category, status, is_prepared, purchase_unit, conversion_factor } = req.body;
@@ -3590,7 +3793,7 @@ app.post('/api/pedidos/admin/inventory', authenticateToken, async (req, res) => 
   }
 });
 
-app.put('/api/pedidos/admin/inventory/:id', authenticateToken, async (req, res) => {
+app.put('/api/pedidos/admin/inventory/:id', authenticateToken, requirePermission('Inventario', 'editar'), async (req, res) => {
   const client = await pool.connect();
   try {
     const { id } = req.params;
@@ -3651,7 +3854,7 @@ app.put('/api/pedidos/admin/inventory/:id', authenticateToken, async (req, res) 
   }
 });
 
-app.delete('/api/pedidos/admin/inventory/:id', authenticateToken, async (req, res) => {
+app.delete('/api/pedidos/admin/inventory/:id', authenticateToken, requirePermission('Inventario', 'eliminar'), async (req, res) => {
   try {
     const { id } = req.params;
     await pool.query('DELETE FROM pedidos_app_inventory WHERE id = $1', [id]);
@@ -3661,7 +3864,7 @@ app.delete('/api/pedidos/admin/inventory/:id', authenticateToken, async (req, re
   }
 });
 
-app.post('/api/pedidos/admin/inventory/:id/movement', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/inventory/:id/movement', authenticateToken, requirePermission('Inventario', 'ajustar_stock'), async (req, res) => {
   try {
     const { id } = req.params;
     const { movement_type, quantity, notes, unit_cost } = req.body;
@@ -3721,7 +3924,7 @@ app.post('/api/pedidos/admin/inventory/:id/movement', authenticateToken, async (
   }
 });
 
-app.get('/api/pedidos/admin/inventory/:id/movements', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/inventory/:id/movements', authenticateToken, requirePermission('Inventario', 'kardex'), async (req, res) => {
   try {
     const { id } = req.params;
     const { rows } = await pool.query('SELECT * FROM pedidos_app_inventory_movements WHERE inventory_id = $1 ORDER BY created_at DESC', [id]);
@@ -3731,7 +3934,7 @@ app.get('/api/pedidos/admin/inventory/:id/movements', authenticateToken, async (
   }
 });
 // ================= COMPRAS =================
-app.get('/api/pedidos/admin/purchases', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/purchases', authenticateToken, requirePermission('Inventario', 'compras'), async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM pedidos_app_purchases ORDER BY created_at DESC');
     res.json({ status: 'ok', purchases: rows });
@@ -3740,7 +3943,7 @@ app.get('/api/pedidos/admin/purchases', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/pedidos/admin/purchases', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/purchases', authenticateToken, requirePermission('Inventario', 'compras'), async (req, res) => {
   const { invoice_number, supplier, purchase_date, total_amount, iva_amount, notes, items } = req.body;
   const client = await pool.connect();
 
@@ -3806,7 +4009,7 @@ app.post('/api/pedidos/admin/purchases', authenticateToken, async (req, res) => 
   }
 });
 
-app.get('/api/pedidos/admin/purchases/:id/items', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/purchases/:id/items', authenticateToken, requirePermission('Inventario', 'compras'), async (req, res) => {
   try {
     const { id } = req.params;
     const { rows } = await pool.query(
@@ -3822,7 +4025,7 @@ app.get('/api/pedidos/admin/purchases/:id/items', authenticateToken, async (req,
   }
 });
 
-app.put('/api/pedidos/admin/purchases/:id', authenticateToken, async (req, res) => {
+app.put('/api/pedidos/admin/purchases/:id', authenticateToken, requirePermission('Inventario', 'compras'), async (req, res) => {
   return res.status(409).json({
     status: 'error',
     error: 'Las compras contabilizadas no se editan. Registra un ajuste o una compra de corrección para conservar el Kardex.'
@@ -3932,7 +4135,7 @@ app.post('/api/pedidos/push/subscribe', async (req, res) => {
   }
 });
 
-app.get('/api/pedidos/admin/push/subscriptions/count', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/push/subscriptions/count', authenticateToken, requirePermission('Anuncios', 'ver'), async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT 
@@ -3947,7 +4150,7 @@ app.get('/api/pedidos/admin/push/subscriptions/count', authenticateToken, async 
   }
 });
 
-app.post('/api/pedidos/admin/push/send', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/push/send', authenticateToken, requirePermission('Anuncios', 'crear'), async (req, res) => {
   try {
     const { title, message, url } = req.body;
     const { rows } = await pool.query('SELECT subscription_json FROM pedidos_app_push_subscriptions');
@@ -4044,7 +4247,7 @@ function parseCampaignInput(body = {}) {
   return { campaign };
 }
 
-app.get('/api/pedidos/admin/announcements', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/announcements', authenticateToken, requirePermission('Anuncios', 'ver'), async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT id, title, body, cta_label, cta_url, starts_at, ends_at, display_frequency,
@@ -4056,7 +4259,7 @@ app.get('/api/pedidos/admin/announcements', authenticateToken, async (req, res) 
   } catch (error) { sendInternalError(res, error); }
 });
 
-app.post('/api/pedidos/admin/announcements', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/announcements', authenticateToken, requirePermission('Anuncios', 'crear'), async (req, res) => {
   const parsed = parseCampaignInput(req.body);
   if (parsed.error) return res.status(400).json({ error: parsed.error });
   const c = parsed.campaign;
@@ -4073,7 +4276,7 @@ app.post('/api/pedidos/admin/announcements', authenticateToken, async (req, res)
   } catch (error) { sendInternalError(res, error); }
 });
 
-app.put('/api/pedidos/admin/announcements/:id', authenticateToken, async (req, res) => {
+app.put('/api/pedidos/admin/announcements/:id', authenticateToken, requirePermission('Anuncios', 'editar'), async (req, res) => {
   const parsed = parseCampaignInput(req.body);
   if (parsed.error) return res.status(400).json({ error: parsed.error });
   const c = parsed.campaign;
@@ -4094,7 +4297,7 @@ app.put('/api/pedidos/admin/announcements/:id', authenticateToken, async (req, r
   } catch (error) { sendInternalError(res, error); }
 });
 
-app.delete('/api/pedidos/admin/announcements/:id', authenticateToken, async (req, res) => {
+app.delete('/api/pedidos/admin/announcements/:id', authenticateToken, requirePermission('Anuncios', 'eliminar'), async (req, res) => {
   try {
     const { rowCount } = await pool.query('DELETE FROM pedidos_app_announcements WHERE id = $1', [req.params.id]);
     if (!rowCount) return res.status(404).json({ error: 'Campaña no encontrada' });
@@ -4102,7 +4305,7 @@ app.delete('/api/pedidos/admin/announcements/:id', authenticateToken, async (req
   } catch (error) { sendInternalError(res, error); }
 });
 
-app.patch('/api/pedidos/admin/announcements/:id/toggle', authenticateToken, async (req, res) => {
+app.patch('/api/pedidos/admin/announcements/:id/toggle', authenticateToken, requirePermission('Anuncios', 'editar'), async (req, res) => {
   try {
     const { rows } = await pool.query(`
       UPDATE pedidos_app_announcements
@@ -4117,7 +4320,7 @@ app.patch('/api/pedidos/admin/announcements/:id/toggle', authenticateToken, asyn
   } catch (error) { sendInternalError(res, error); }
 });
 
-app.get('/api/pedidos/admin/announcement', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/announcement', authenticateToken, requirePermission('Anuncios', 'ver'), async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT id, title, body, cta_label, cta_url, starts_at, ends_at,
@@ -4130,7 +4333,7 @@ app.get('/api/pedidos/admin/announcement', authenticateToken, async (req, res) =
   }
 });
 
-app.put('/api/pedidos/admin/announcement', authenticateToken, async (req, res) => {
+app.put('/api/pedidos/admin/announcement', authenticateToken, requirePermission('Anuncios', 'editar'), async (req, res) => {
   const title = String(req.body.title || '').trim();
   const imageUrl = String(req.body.image_url || '');
   const body = String(req.body.body || '').trim();
@@ -4510,7 +4713,7 @@ function buildReportData(orderRows, purchaseRows, orderCostsRows = [], expenseRo
   };
 }
 
-app.get('/api/pedidos/admin/reports', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/reports', authenticateToken, requirePermission('Reportes', 'ver'), async (req, res) => {
   try {
     const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Bogota' }).format(new Date());
     const from = String(req.query.from || shiftIsoDate(today, -29));
@@ -4606,7 +4809,7 @@ app.get('/api/pedidos/admin/reports', authenticateToken, async (req, res) => {
 });
 
 // ================= GASTOS =================
-app.get('/api/pedidos/admin/expenses', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/expenses', authenticateToken, requirePermission('Gastos', 'ver'), async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM pedidos_app_expenses ORDER BY expense_date DESC, id DESC');
     res.json({ status: 'ok', data: rows });
@@ -4615,7 +4818,7 @@ app.get('/api/pedidos/admin/expenses', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/pedidos/admin/expenses', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/expenses', authenticateToken, requirePermission('Gastos', 'crear'), async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -4651,7 +4854,7 @@ app.post('/api/pedidos/admin/expenses', authenticateToken, async (req, res) => {
   }
 });
 
-app.put('/api/pedidos/admin/expenses/:id', authenticateToken, async (req, res) => {
+app.put('/api/pedidos/admin/expenses/:id', authenticateToken, requirePermission('Gastos', 'editar'), async (req, res) => {
   try {
     const { id } = req.params;
     const { category, description, amount, subtotal, iva, iva_percentage, expense_date, payment_method, receipt_url, items, provider } = req.body;
@@ -4669,7 +4872,7 @@ app.put('/api/pedidos/admin/expenses/:id', authenticateToken, async (req, res) =
   }
 });
 
-app.delete('/api/pedidos/admin/expenses/:id', authenticateToken, async (req, res) => {
+app.delete('/api/pedidos/admin/expenses/:id', authenticateToken, requirePermission('Gastos', 'eliminar'), async (req, res) => {
   try {
     const { id } = req.params;
     await pool.query('DELETE FROM pedidos_app_expenses WHERE id = $1', [id]);
@@ -4873,7 +5076,7 @@ async function buildClosurePreview(startDate, endDate, db = pool) {
   };
 }
 
-app.get('/api/pedidos/admin/closures/preview', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/closures/preview', authenticateToken, requirePermission('Cierre Contable', 'ver'), async (req, res) => {
   const { startDate, endDate } = req.query;
   const invalid = validateClosurePeriod(startDate, endDate);
   if (invalid) return res.status(400).json({ error: invalid });
@@ -4881,7 +5084,7 @@ app.get('/api/pedidos/admin/closures/preview', authenticateToken, async (req, re
   catch (err) { return sendInternalError(res, err, 'No fue posible generar la vista previa del cierre.', { component: 'closures' }); }
 });
 
-app.post('/api/pedidos/admin/closures', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/closures', authenticateToken, requirePermission('Cierre Contable', 'cerrar_caja'), async (req, res) => {
   const { startDate, endDate } = req.body;
   const invalid = validateClosurePeriod(startDate, endDate);
   if (invalid) return res.status(400).json({ error: invalid });
@@ -4920,7 +5123,7 @@ app.post('/api/pedidos/admin/closures', authenticateToken, async (req, res) => {
   finally { client.release(); }
 });
 
-app.get('/api/pedidos/admin/closures', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/closures', authenticateToken, requirePermission('Cierre Contable', 'ver'), async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT * FROM pedidos_app_closures ORDER BY id DESC');
     res.json({ status: 'ok', data: rows });
@@ -4929,7 +5132,7 @@ app.get('/api/pedidos/admin/closures', authenticateToken, async (req, res) => {
   }
 });
 
-app.put('/api/pedidos/admin/closures/:id/reopen', authenticateToken, async (req, res) => {
+app.put('/api/pedidos/admin/closures/:id/reopen', authenticateToken, requirePermission('Cierre Contable', 'cerrar_caja'), async (req, res) => {
   const reason = String(req.body.reason || '').trim();
   if (reason.length < 5) return res.status(400).json({ error: 'Indica el motivo de reapertura (mínimo 5 caracteres)' });
   try {
@@ -4977,7 +5180,7 @@ app.put('/api/pedidos/admin/profile/password', authenticateToken, async (req, re
 });
 
 // ================= AUDITORÍA Y SESIONES =================
-app.get('/api/pedidos/admin/audit', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/audit', authenticateToken, requirePermission('Auditoria', 'ver'), async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT a.*, u.username
@@ -4991,7 +5194,7 @@ app.get('/api/pedidos/admin/audit', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/api/pedidos/admin/sessions', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/sessions', authenticateToken, requirePermission('Usuarios', 'ver'), async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT s.*, u.username, r.name as role_name
@@ -5042,7 +5245,7 @@ app.delete('/api/pedidos/admin/profile/sessions/:id', authenticateToken, async (
   }
 });
 
-app.delete('/api/pedidos/admin/sessions/:id', authenticateToken, async (req, res) => {
+app.delete('/api/pedidos/admin/sessions/:id', authenticateToken, requirePermission('Usuarios', 'eliminar'), async (req, res) => {
   try {
     const { id } = req.params;
     await pool.query("UPDATE pedidos_app_sessions SET status = 'Cerrada por administrador' WHERE id = $1", [id]);
@@ -5472,7 +5675,7 @@ crmWorker.start()
 // =========================================================================
 
 // --- COMBOS ---
-app.get('/api/pedidos/admin/combos', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/combos', authenticateToken, requirePermission('Productos', 'ver'), async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT 
@@ -5504,7 +5707,7 @@ app.get('/api/pedidos/admin/combos', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/api/pedidos/admin/combos/:id', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/combos/:id', authenticateToken, requirePermission('Productos', 'ver'), async (req, res) => {
   try {
     const { id } = req.params;
     const { rows } = await pool.query(`
@@ -5529,7 +5732,7 @@ app.get('/api/pedidos/admin/combos/:id', authenticateToken, async (req, res) => 
   }
 });
 
-app.post('/api/pedidos/admin/combos', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/combos', authenticateToken, requirePermission('Productos', 'crear'), async (req, res) => {
   const { combo_product_id, components } = req.body;
 
   if (!combo_product_id) {
@@ -5627,7 +5830,7 @@ app.post('/api/pedidos/admin/combos', authenticateToken, async (req, res) => {
   }
 });
 
-app.delete('/api/pedidos/admin/combos/:id', authenticateToken, async (req, res) => {
+app.delete('/api/pedidos/admin/combos/:id', authenticateToken, requirePermission('Productos', 'eliminar'), async (req, res) => {
   try {
     const { id } = req.params;
     await pool.query('DELETE FROM pedidos_app_combo_components WHERE combo_product_id::text = $1', [id]);
@@ -5641,7 +5844,7 @@ app.delete('/api/pedidos/admin/combos/:id', authenticateToken, async (req, res) 
 
 
 // --- RECETAS ---
-app.get('/api/pedidos/admin/recipes', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/recipes', authenticateToken, requirePermission('Inventario', 'recetas'), async (req, res) => {
   try {
     const { product_id } = req.query;
     let query = `SELECT pr.*, inv.name AS inventory_title, inv.unit AS inventory_unit, COALESCE(inv.average_cost, 0) AS inventory_average_cost 
@@ -5659,7 +5862,7 @@ app.get('/api/pedidos/admin/recipes', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/pedidos/admin/recipes', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/recipes', authenticateToken, requirePermission('Inventario', 'recetas'), async (req, res) => {
   const { product_id, inventory_id, quantity, is_controlled } = req.body;
   try {
     const { rows } = await pool.query(
@@ -5678,7 +5881,7 @@ app.post('/api/pedidos/admin/recipes', authenticateToken, async (req, res) => {
   }
 });
 
-app.delete('/api/pedidos/admin/recipes/:id', authenticateToken, async (req, res) => {
+app.delete('/api/pedidos/admin/recipes/:id', authenticateToken, requirePermission('Inventario', 'recetas'), async (req, res) => {
   try {
     await pool.query('DELETE FROM pedidos_app_product_recipes WHERE id = $1', [req.params.id]);
     res.json({ status: 'ok', message: 'Receta eliminada' });
@@ -5688,7 +5891,7 @@ app.delete('/api/pedidos/admin/recipes/:id', authenticateToken, async (req, res)
 });
 
 // Copiar / Duplicar receta técnica de un producto a otro
-app.post('/api/pedidos/admin/recipes/copy', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/recipes/copy', authenticateToken, requirePermission('Inventario', 'recetas'), async (req, res) => {
   const { source_product_id, target_product_id, mode } = req.body;
   if (!source_product_id || !target_product_id) {
     return res.status(400).json({ status: 'error', error: 'Debes indicar el producto origen y el producto destino.' });
@@ -5750,7 +5953,7 @@ app.post('/api/pedidos/admin/recipes/copy', authenticateToken, async (req, res) 
 
 
 // --- RENTABILIDAD Y COSTOS ---
-app.get('/api/pedidos/admin/profitability', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/profitability', authenticateToken, requirePermission('Inventario', 'rentabilidad'), async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT 
@@ -5843,7 +6046,7 @@ async function getCanonicalSupplierName(clientOrPool, rawSupplier) {
   return clean;
 }
 
-app.get('/api/pedidos/admin/inventory-suppliers', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/inventory-suppliers', authenticateToken, requirePermission('Inventario', 'compras'), async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT TRIM(supplier) AS supplier, COUNT(*)::int AS purchases_count, MAX(purchase_date) AS last_purchase
@@ -5858,7 +6061,7 @@ app.get('/api/pedidos/admin/inventory-suppliers', authenticateToken, async (req,
   }
 });
 
-app.get('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/inventory-purchases', authenticateToken, requirePermission('Inventario', 'compras'), async (req, res) => {
   try {
     const { supplier, inventory_id, date_from, date_to, search, limit = 250 } = req.query;
     const conditions = [];
@@ -5908,7 +6111,7 @@ app.get('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req,
   }
 });
 
-app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, requirePermission('Inventario', 'compras'), async (req, res) => {
   const { inventory_id, quantity, purchase_unit, unit_cost, total_cost, supplier, purchase_date, notes, invoice_url, receipt_url } = req.body;
   const rawQty = Number(quantity);
   if (!Number.isFinite(rawQty) || rawQty <= 0) {
@@ -6029,7 +6232,7 @@ app.post('/api/pedidos/admin/inventory-purchases', authenticateToken, async (req
 });
 
 // --- EDICIÓN SEGURA DE COMPRAS DE INVENTARIO ---
-app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, async (req, res) => {
+app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, requirePermission('Inventario', 'compras'), async (req, res) => {
   const { id } = req.params;
   const { quantity, purchase_unit, unit_cost, total_cost, supplier, purchase_date, notes, edit_reason, invoice_url, receipt_url } = req.body;
   
@@ -6229,7 +6432,7 @@ app.put('/api/pedidos/admin/inventory-purchases/:id', authenticateToken, async (
 });
 
 // --- AJUSTES AUDITABLES DE INVENTARIO (MERMA, DAÑO, VENCIDO, CONTEO FISICO) ---
-app.post('/api/pedidos/admin/inventory-adjustments', authenticateToken, async (req, res) => {
+app.post('/api/pedidos/admin/inventory-adjustments', authenticateToken, requirePermission('Inventario', 'ajustar_stock'), async (req, res) => {
   const { inventory_id, adjustment_type, quantity, reason } = req.body;
   const validTypes = ['MERMA', 'VENCIDO', 'DAÑO', 'PERDIDA', 'CONTEO_FISICO', 'CORRECCION', 'AJUSTE', 'DEVOLUCION'];
   const type = String(adjustment_type || 'AJUSTE').toUpperCase().trim();
@@ -6284,7 +6487,7 @@ app.post('/api/pedidos/admin/inventory-adjustments', authenticateToken, async (r
 });
 
 // --- KARDEX ENRIQUECIDO CON TRAZABILIDAD Y FILTROS ---
-app.get('/api/pedidos/admin/stock-movements', authenticateToken, async (req, res) => {
+app.get('/api/pedidos/admin/stock-movements', authenticateToken, requirePermission('Inventario', 'kardex'), async (req, res) => {
   try {
     const { inventory_id, movement_type, date_from, date_to, search, limit = 150 } = req.query;
     let query = `
@@ -6371,10 +6574,13 @@ app.use((error, req, res, next) => {
   return res.status(500).json({ error: 'No fue posible procesar la solicitud' });
 });
 
-if (!process.env.VERCEL) {
+if (!process.env.VERCEL && require.main === module) {
   app.listen(PORT, () => {
     console.log(`Servidor backend corriendo en http://localhost:${PORT}`);
   });
 }
+
+app.normalizeOrderCart = normalizeOrderCart;
+app.CHEF_INGREDIENTS_CATALOG = CHEF_INGREDIENTS_CATALOG;
 
 module.exports = app;

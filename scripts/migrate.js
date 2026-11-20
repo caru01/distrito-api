@@ -6,7 +6,8 @@ const { createPool } = require('../src/db');
 const migrationsDirectory = path.resolve(__dirname, '..', 'migrations');
 
 function checksum(contents) {
-  return crypto.createHash('sha256').update(contents).digest('hex');
+  // Normalizar saltos de línea para compatibilidad entre Windows (CRLF) y Linux/Git (LF)
+  return crypto.createHash('sha256').update(contents.replace(/\r\n/g, '\n')).digest('hex');
 }
 
 async function migrate() {

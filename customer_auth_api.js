@@ -103,7 +103,8 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET, transpo
       const { name, phone, email, password, default_address, default_barrio } = req.body;
       const cleanName = String(name || '').trim();
       const cleanPhone = String(phone || '').trim();
-      const cleanEmail = String(email || '').toLowerCase().trim();
+      const rawEmail = String(email || '').toLowerCase().trim();
+      const cleanEmail = rawEmail.length > 0 ? rawEmail : null;
       const rawPassword = String(password || '');
 
       if (!cleanName || cleanName.length < 2) {
@@ -112,8 +113,8 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET, transpo
       if (!cleanPhone || cleanPhone.replace(/\D/g, '').length < 7) {
         return res.status(400).json({ status: 'error', error: 'Ingresa un número de teléfono válido' });
       }
-      if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
-        return res.status(400).json({ status: 'error', error: 'Ingresa un correo electrónico válido' });
+      if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+        return res.status(400).json({ status: 'error', error: 'Ingresa un correo electrónico válido o déjalo en blanco' });
       }
       if (!rawPassword || rawPassword.length < 6) {
         return res.status(400).json({ status: 'error', error: 'La contraseña debe tener al menos 6 caracteres' });
@@ -142,14 +143,16 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET, transpo
           });
         }
 
-        // 2. Verificar si el correo ya existe en appmobile_customer_accounts
-        const existing = await client.query(
-          'SELECT id FROM appmobile_customer_accounts WHERE LOWER(email) = $1',
-          [cleanEmail]
-        );
-        if (existing.rows.length > 0) {
-          await client.query('ROLLBACK');
-          return res.status(409).json({ status: 'error', error: 'Ya existe una cuenta con este correo electrónico' });
+        // 2. Verificar si el correo ya existe en appmobile_customer_accounts (solo si se suministró correo)
+        if (cleanEmail) {
+          const existing = await client.query(
+            'SELECT id FROM appmobile_customer_accounts WHERE LOWER(email) = $1',
+            [cleanEmail]
+          );
+          if (existing.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ status: 'error', error: 'Ya existe una cuenta con este correo electrónico' });
+          }
         }
 
         // Hashing seguro con bcryptjs
@@ -365,24 +368,68 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET, transpo
     }
   });
 
-  // 5. Historial de pedidos asociados al cliente
+  // 5. Historial de pedidos asociados al cliente (Protegido contra BOLA/IDOR)
   app.get('/api/pedidos/customer/orders', authenticateCustomerToken, async (req, res) => {
     try {
-      const customerPhone = normalizePhone(req.customer.phone);
-      const rawShortPhone = req.customer.phone.replace(/\D/g, '').slice(-10);
+      if (!req.customer || !req.customer.id) {
+        return res.status(401).json({ status: 'error', error: 'Sesión no autorizada' });
+      }
 
-      const { rows } = await pool.query(
-        `SELECT id, customer_name, customer_phone, delivery_type, payment_method,
-                total, delivery_fee, status, delivery_status, address, barrio,
-                created_at, cart_json
-         FROM pedidos_app_orders
-         WHERE customer_phone = $1 
-            OR customer_phone = $2
-            OR regexp_replace(COALESCE(customer_phone, ''), '\\D', '', 'g') LIKE '%' || $3
-         ORDER BY created_at DESC
-         LIMIT 40`,
-        [customerPhone, req.customer.phone, rawShortPhone]
+      // Obtener datos frescos y autorizados del cliente desde la base de datos
+      const customerRes = await pool.query(
+        'SELECT id, phone, email FROM appmobile_customer_accounts WHERE id = $1 LIMIT 1',
+        [req.customer.id]
       );
+      if (customerRes.rows.length === 0) {
+        return res.status(404).json({ status: 'error', error: 'Cuenta de cliente no encontrada' });
+      }
+
+      const dbCustomer = customerRes.rows[0];
+      const rawPhone = String(dbCustomer.phone || req.customer.phone || '').trim();
+      const digitsOnly = rawPhone.replace(/\D/g, '');
+
+      // Validación estricta: si no existe un teléfono válido o tiene menos de 7 dígitos,
+      // responder de inmediato con lista vacía sin ejecutar búsquedas comodín
+      if (!digitsOnly || digitsOnly.length < 7) {
+        return res.json({
+          status: 'ok',
+          orders: [],
+        });
+      }
+
+      const national10 = digitsOnly.length >= 10 ? digitsOnly.slice(-10) : '';
+
+      let rows = [];
+      if (national10.length === 10) {
+        const queryRes = await pool.query(
+          `SELECT id, customer_name, customer_phone, delivery_type, payment_method,
+                  total, delivery_fee, status, delivery_status, address, barrio,
+                  created_at, cart_json
+           FROM pedidos_app_orders
+           WHERE regexp_replace(COALESCE(customer_phone, ''), '\\D', '', 'g') = $1
+              OR regexp_replace(COALESCE(customer_phone, ''), '\\D', '', 'g') = $2
+              OR (
+                length(regexp_replace(COALESCE(customer_phone, ''), '\\D', '', 'g')) >= 10
+                AND regexp_replace(COALESCE(customer_phone, ''), '\\D', '', 'g') LIKE '%' || $2
+              )
+           ORDER BY created_at DESC
+           LIMIT 40`,
+          [digitsOnly, national10]
+        );
+        rows = queryRes.rows;
+      } else {
+        const queryRes = await pool.query(
+          `SELECT id, customer_name, customer_phone, delivery_type, payment_method,
+                  total, delivery_fee, status, delivery_status, address, barrio,
+                  created_at, cart_json
+           FROM pedidos_app_orders
+           WHERE regexp_replace(COALESCE(customer_phone, ''), '\\D', '', 'g') = $1
+           ORDER BY created_at DESC
+           LIMIT 40`,
+          [digitsOnly]
+        );
+        rows = queryRes.rows;
+      }
 
       res.json({
         status: 'ok',
