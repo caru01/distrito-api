@@ -985,7 +985,8 @@ app.get('/api/pedidos/init', async (req, res) => {
         WHERE o.status != 'Cancelado'
         GROUP BY item->>'id'
       ) sales ON sales.prod_id = p.id::text
-      WHERE p.status = 'Activo'
+      WHERE (p.status = 'Activo' OR p.status IS NULL)
+        AND (p.category IS NULL OR p.category = '' OR p.category IN (SELECT name FROM pedidos_app_categories WHERE status = 'Activa'))
       ORDER BY p.sort_order ASC, p.created_at DESC, p.id DESC
     `);
     const { rows: categories } = await pool.query("SELECT * FROM pedidos_app_categories WHERE status = 'Activa' ORDER BY sort_order ASC, id ASC");
@@ -999,10 +1000,11 @@ app.get('/api/pedidos/init', async (req, res) => {
       console.log('Settings table might not exist yet.');
     }
 
-    // Anuncio
+    // Anuncio y Banners
     let announcementRow = null;
     let promoCardRow = null;
     let promoCardsRows = [];
+    let appBannersRows = [];
     try {
       const { rows: announcements } = await pool.query(`
         SELECT id, title, body, cta_label, cta_url, starts_at, ends_at,
@@ -1012,14 +1014,21 @@ app.get('/api/pedidos/init', async (req, res) => {
         WHERE is_active = TRUE
           AND (starts_at IS NULL OR starts_at <= NOW())
           AND (ends_at IS NULL OR ends_at >= NOW())
-          AND audience = 'all'
+          AND audience IN ('all', 'new', 'returning')
         ORDER BY priority DESC, updated_at DESC, id DESC
       `);
-      announcementRow = announcements.find(r => r.campaign_type === 'modal' || r.campaign_type === 'banner') || null;
+      announcementRow = announcements.find(r => r.campaign_type === 'modal' && !(r.popup_style && r.popup_style.startsWith('app_banner'))) || null;
       promoCardsRows = announcements.filter(r => r.campaign_type === 'promo_card');
       promoCardRow = promoCardsRows[0] || null;
+      appBannersRows = announcements.filter(r => r.popup_style && r.popup_style.startsWith('app_banner'));
     } catch (err) {
       console.log('Announcement table might not exist yet.');
+    }
+
+    let appBannerInterval = 4;
+    if (appBannersRows.length > 0) {
+      const match = String(appBannersRows[0].popup_style || '').match(/interval_(\d+)/);
+      if (match) appBannerInterval = Math.max(2, Math.min(30, parseInt(match[1], 10)));
     }
 
     res.json({
@@ -1029,7 +1038,9 @@ app.get('/api/pedidos/init', async (req, res) => {
       settings: settingsForResponse(req, settingsRow),
       announcement: announcementForResponse(req, announcementRow),
       promoCard: announcementForResponse(req, promoCardRow),
-      promoCards: promoCardsRows.map(r => announcementForResponse(req, r))
+      promoCards: promoCardsRows.map(r => announcementForResponse(req, r)),
+      appBanners: appBannersRows.map(r => announcementForResponse(req, r)),
+      appBannerInterval
     });
   } catch (error) {
     console.error('Error fetching init data:', error);
@@ -2272,7 +2283,10 @@ function getBogotaPeriodDates(period) {
   const fmt = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
   endDate = fmt(bogotaNow);
 
-  if (period === 'weekly') {
+  if (period === 'today' || period === 'daily' || period === 'dia_actual') {
+    startDate = fmt(bogotaNow);
+    label = 'Hoy';
+  } else if (period === 'weekly') {
     const daysFromMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
     const monday = new Date(bogotaNow);
     monday.setDate(day - daysFromMonday);
@@ -2281,20 +2295,23 @@ function getBogotaPeriodDates(period) {
   } else if (period === 'monthly') {
     startDate = `${year}-${String(month+1).padStart(2,'0')}-01`;
     label = 'Este mes';
-  } else { // 15d default
+  } else if (period === '15d') {
     const start = new Date(bogotaNow);
     start.setDate(day - 14);
     startDate = fmt(start);
     label = 'Últimos 15 días';
+  } else {
+    startDate = fmt(bogotaNow);
+    label = 'Hoy';
   }
 
   return { startDate, endDate, label };
 }
 
-// GET /api/pedidos/admin/dashboard/profitability?period=15d|weekly|monthly
+// GET /api/pedidos/admin/dashboard/profitability?period=today|weekly|monthly|15d
 app.get('/api/pedidos/admin/dashboard/profitability', authenticateToken, requirePermission('Inventario', 'rentabilidad'), async (req, res) => {
   try {
-    const period = ['15d', 'weekly', 'monthly'].includes(req.query.period) ? req.query.period : '15d';
+    const period = ['today', 'daily', '15d', 'weekly', 'monthly'].includes(req.query.period) ? req.query.period : 'today';
     let startDate, endDate, label;
     if (req.query.startDate && req.query.endDate) {
       startDate = req.query.startDate;
@@ -4227,9 +4244,9 @@ function parseCampaignInput(body = {}) {
     cta_url: String(body.cta_url || '').trim(), starts_at: body.starts_at || null,
     ends_at: body.ends_at || null, is_active: Boolean(body.is_active),
     display_frequency: ['always', 'session', 'daily'].includes(body.display_frequency) ? body.display_frequency : 'session',
-    campaign_type: ['modal', 'banner', 'promo_card'].includes(body.campaign_type) ? body.campaign_type : 'modal',
-    popup_style: ['modern_card', 'poster_full', 'dark_street'].includes(body.popup_style) ? body.popup_style : 'modern_card',
-    audience: ['all', 'new', 'returning'].includes(body.audience) ? body.audience : 'all',
+    campaign_type: ['modal', 'banner', 'promo_card', 'app_banner'].includes(body.campaign_type) ? body.campaign_type : 'modal',
+    popup_style: String(body.popup_style || 'modern_card').slice(0, 50),
+    audience: ['all', 'new', 'returning', 'app'].includes(body.audience) ? body.audience : 'all',
     priority: Number.isInteger(Number(body.priority)) ? Number(body.priority) : 0,
     coupon_code: String(body.coupon_code || '').trim().slice(0, 50) || null,
   };
@@ -4294,6 +4311,43 @@ app.put('/api/pedidos/admin/announcements/:id', authenticateToken, requirePermis
     `, [c.title, imageUrl, c.body, c.cta_label, c.cta_url, c.starts_at, c.ends_at,
       c.display_frequency, c.campaign_type, c.popup_style, c.audience, c.priority, c.coupon_code, c.is_active, req.params.id]);
     res.json({ status: 'ok', announcement: announcementForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image_url) }) });
+  } catch (error) { sendInternalError(res, error); }
+});
+
+// --- BANNERS EXCLUSIVOS DE LA APP ---
+app.get('/api/pedidos/admin/app-banners', authenticateToken, requirePermission('Anuncios', 'ver'), async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, title, body, cta_label, cta_url, starts_at, ends_at, display_frequency,
+             campaign_type, popup_style, audience, priority, coupon_code, views_count, clicks_count,
+             published_at, is_active, updated_at, image_url IS NOT NULL AS has_image
+      FROM pedidos_app_announcements
+      WHERE popup_style LIKE 'app_banner%'
+      ORDER BY priority DESC, updated_at DESC, id DESC
+    `);
+    res.json({ status: 'ok', banners: rows.map((row) => announcementForResponse(req, row)) });
+  } catch (error) { sendInternalError(res, error); }
+});
+
+app.post('/api/pedidos/admin/app-banners', authenticateToken, requirePermission('Anuncios', 'crear'), async (req, res) => {
+  req.body.campaign_type = 'banner';
+  req.body.audience = 'all';
+  if (!req.body.popup_style || !req.body.popup_style.startsWith('app_banner')) {
+    req.body.popup_style = 'app_banner';
+  }
+  const parsed = parseCampaignInput(req.body);
+  if (parsed.error) return res.status(400).json({ error: parsed.error });
+  const c = parsed.campaign;
+  try {
+    const { rows } = await pool.query(`
+      INSERT INTO pedidos_app_announcements
+        (title, image_url, body, cta_label, cta_url, starts_at, ends_at, display_frequency,
+         campaign_type, popup_style, audience, priority, coupon_code, is_active, published_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,CASE WHEN $14 THEN NOW() ELSE NULL END)
+      RETURNING *
+    `, [c.title, c.image_url, c.body, c.cta_label, c.cta_url, c.starts_at, c.ends_at,
+      c.display_frequency, 'banner', c.popup_style, 'all', c.priority, c.coupon_code, c.is_active]);
+    res.status(201).json({ status: 'ok', banner: announcementForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image_url) }) });
   } catch (error) { sendInternalError(res, error); }
 });
 
