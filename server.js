@@ -1014,7 +1014,7 @@ app.get('/api/pedidos/init', async (req, res) => {
         WHERE is_active = TRUE
           AND (starts_at IS NULL OR starts_at <= NOW())
           AND (ends_at IS NULL OR ends_at >= NOW())
-          AND audience IN ('all', 'new', 'returning')
+          AND audience IN ('all', 'new', 'returning', 'app')
         ORDER BY priority DESC, updated_at DESC, id DESC
       `);
       announcementRow = announcements.find(r => r.campaign_type === 'modal' && !(r.popup_style && r.popup_style.startsWith('app_banner'))) || null;
@@ -4230,6 +4230,7 @@ app.get('/api/pedidos/announcement', async (req, res) => {
         AND (starts_at IS NULL OR starts_at <= NOW())
         AND (ends_at IS NULL OR ends_at >= NOW())
         AND audience IN ('all', $1)
+        AND (popup_style IS NULL OR popup_style NOT LIKE 'app_banner%')
       ORDER BY priority DESC, updated_at DESC, id DESC
     `, [audience]);
 
@@ -4296,7 +4297,9 @@ app.get('/api/pedidos/admin/announcements', authenticateToken, requirePermission
       SELECT id, title, body, cta_label, cta_url, starts_at, ends_at, display_frequency,
              campaign_type, popup_style, audience, priority, coupon_code, views_count, clicks_count,
              published_at, is_active, updated_at, image_url IS NOT NULL AS has_image
-      FROM pedidos_app_announcements ORDER BY updated_at DESC, id DESC
+      FROM pedidos_app_announcements
+      WHERE popup_style IS NULL OR popup_style NOT LIKE 'app_banner%'
+      ORDER BY updated_at DESC, id DESC
     `);
     res.json({ status: 'ok', announcements: rows.map((row) => announcementForResponse(req, row)) });
   } catch (error) { sendInternalError(res, error); }
@@ -4351,15 +4354,30 @@ app.get('/api/pedidos/admin/app-banners', authenticateToken, requirePermission('
       WHERE popup_style LIKE 'app_banner%'
       ORDER BY priority DESC, updated_at DESC, id DESC
     `);
-    res.json({ status: 'ok', banners: rows.map((row) => announcementForResponse(req, row)) });
+    const banners = rows.map((row) => {
+      const banner = announcementForResponse(req, row);
+      return {
+        ...banner,
+        tag: banner.cta_label || 'PROMO APP',
+        cta_link: banner.cta_url || ''
+      };
+    });
+    res.json({ status: 'ok', banners });
   } catch (error) { sendInternalError(res, error); }
 });
 
 app.post('/api/pedidos/admin/app-banners', authenticateToken, requirePermission('Anuncios', 'crear'), async (req, res) => {
   req.body.campaign_type = 'banner';
   req.body.audience = 'all';
+  if (!req.body.cta_url && req.body.cta_link) {
+    req.body.cta_url = req.body.cta_link;
+  }
+  if (!req.body.cta_label && req.body.tag) {
+    req.body.cta_label = req.body.tag;
+  }
   if (!req.body.popup_style || !req.body.popup_style.startsWith('app_banner')) {
-    req.body.popup_style = 'app_banner';
+    const interval = Math.max(2, Math.min(30, parseInt(req.body.slide_interval || 4, 10)));
+    req.body.popup_style = `app_banner_interval_${interval}`;
   }
   const parsed = parseCampaignInput(req.body);
   if (parsed.error) return res.status(400).json({ error: parsed.error });
