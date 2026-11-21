@@ -1365,6 +1365,35 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
       });
     }
 
+    const resolvedOrderSource = (() => {
+      const clientPlatform = String(req.headers['x-client-platform'] || '').toLowerCase().trim();
+      const rawSrc = req.body.source || customer.source;
+
+      // Si viene explícitamente desde la aplicación móvil nativa (Android o iOS)
+      if (clientPlatform === 'android' || clientPlatform === 'ios') {
+        return 'APP';
+      }
+
+      if (rawSrc) {
+        const s = String(rawSrc).toLowerCase().trim();
+        // Si el cliente pide APP, verificar si es nativo o user-agent móvil
+        if (s === 'app' || s === 'mobile' || s.includes('app') || s.includes('movil') || s.includes('móvil')) {
+          const ua = String(req.headers['user-agent'] || '').toLowerCase();
+          const isMobilePlatform = clientPlatform === 'android' || clientPlatform === 'ios' || ua.includes('capacitor') || ua.includes('android') || ua.includes('iphone') || ua.includes('ipad');
+          return isMobilePlatform ? 'APP' : 'Web';
+        }
+        if (s.includes('whatsapp')) return 'WhatsApp';
+        if (s === 'mostrador' || s === 'presencial') return 'Mostrador';
+        if (s.includes('tel') || s === 'telefono') return 'Teléfono';
+        if (s === 'web') return 'Web';
+        if (s.includes('rappi')) return 'Rappi';
+        return rawSrc;
+      }
+
+      // Por defecto para pedidos creados vía web checkout
+      return 'Web';
+    })();
+
     const { rows } = await client.query(
       `INSERT INTO pedidos_app_orders 
        (customer_name, customer_phone, address, barrio, delivery_type, payment_method, total, cart_json, source, notes, voucher_reference, created_at,
@@ -1382,13 +1411,7 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
         paymentCheck.method,
         orderTotal,
         JSON.stringify(normalized.cart),
-        (() => {
-          let src = req.body.source || customer.source || (resolvedCrmContactId ? 'WhatsApp' : 'Web');
-          if (src === 'WhatsApp CRM' || String(src).toLowerCase().includes('whatsapp')) return 'WhatsApp';
-          const s = String(src).toLowerCase().trim();
-          if (s === 'app' || s === 'mobile' || s.includes('app') || s.includes('movil') || s.includes('móvil')) return 'APP';
-          return src;
-        })(),
+        resolvedOrderSource,
         customer.notes || customer.comment || '',
         customer.voucher_reference || '',
         customDate,
@@ -1419,11 +1442,11 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
       }
     }
 
-    await reserveProductStock(client, normalized, rows[0].id, req.body.source || 'Web');
+    await reserveProductStock(client, normalized, rows[0].id, resolvedOrderSource);
     await deliveryOrderService.appendDomainEvent(client, 'order_created', 'order', rows[0].id, {
       orderId: rows[0].id,
       orderStatus: finalStatus,
-      source: req.body.source || customer.source || 'Web',
+      source: resolvedOrderSource,
       deliveryType: customer.deliveryType,
       total: orderTotal,
     });
@@ -3173,10 +3196,13 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, requirePermissi
         cartStr, orderTotal, customer.name, formattedPhone, customer.address,
         normalizedDeliveryType, paymentCheck.method, customer.barrio || '',
         (() => {
-          let src = req.body.source || customer.source || currentOrder.source || (targetCrmContactId ? 'WhatsApp' : 'Web');
+          let src = req.body.source || customer.source || currentOrder.source || 'Web';
           if (src === 'WhatsApp CRM' || String(src).toLowerCase().includes('whatsapp')) return 'WhatsApp';
           const s = String(src).toLowerCase().trim();
           if (s === 'app' || s === 'mobile' || s.includes('app') || s.includes('movil') || s.includes('móvil')) return 'APP';
+          if (s === 'mostrador' || s === 'presencial') return 'Mostrador';
+          if (s.includes('tel') || s === 'telefono') return 'Teléfono';
+          if (s === 'web') return 'Web';
           return src;
         })(), customDate, id, customer.notes || '',
         customer.voucher_reference || '',
