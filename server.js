@@ -1005,6 +1005,7 @@ app.get('/api/pedidos/init', async (req, res) => {
     let promoCardRow = null;
     let promoCardsRows = [];
     let appBannersRows = [];
+    let appSplashAdRow = null;
     try {
       const { rows: announcements } = await pool.query(`
         SELECT id, title, body, cta_label, cta_url, starts_at, ends_at,
@@ -1021,6 +1022,8 @@ app.get('/api/pedidos/init', async (req, res) => {
       promoCardsRows = announcements.filter(r => r.campaign_type === 'promo_card');
       promoCardRow = promoCardsRows[0] || null;
       appBannersRows = announcements.filter(r => r.popup_style && r.popup_style.startsWith('app_banner'));
+      const splashAdRow = announcements.find(r => r.campaign_type === 'splash_ad' || (r.popup_style && r.popup_style.startsWith('app_splash')) || (r.campaign_type === 'modal' && r.id === 5)) || announcementRow || null;
+      appSplashAdRow = splashAdRow;
     } catch (err) {
       console.log('Announcement table might not exist yet.');
     }
@@ -1037,6 +1040,7 @@ app.get('/api/pedidos/init', async (req, res) => {
       categories,
       settings: settingsForResponse(req, settingsRow),
       announcement: announcementForResponse(req, announcementRow),
+      appSplashAd: announcementForResponse(req, appSplashAdRow),
       promoCard: announcementForResponse(req, promoCardRow),
       promoCards: promoCardsRows.map(r => announcementForResponse(req, r)),
       appBanners: appBannersRows.map(r => announcementForResponse(req, r)),
@@ -4340,6 +4344,97 @@ app.put('/api/pedidos/admin/announcements/:id', authenticateToken, requirePermis
     `, [c.title, imageUrl, c.body, c.cta_label, c.cta_url, c.starts_at, c.ends_at,
       c.display_frequency, c.campaign_type, c.popup_style, c.audience, c.priority, c.coupon_code, c.is_active, req.params.id]);
     res.json({ status: 'ok', announcement: announcementForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image_url) }) });
+  } catch (error) { sendInternalError(res, error); }
+});
+
+// --- VENTANA DE ANUNCIO INICIAL / SPLASH AD DE LA APP ---
+app.get('/api/pedidos/admin/app-splash-ad', authenticateToken, requirePermission('Anuncios', 'ver'), async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, title, body, cta_label, cta_url, starts_at, ends_at, display_frequency,
+             campaign_type, popup_style, audience, priority, coupon_code, views_count, clicks_count,
+             published_at, is_active, updated_at, image_url IS NOT NULL AS has_image
+      FROM pedidos_app_announcements
+      WHERE campaign_type = 'splash_ad' OR popup_style LIKE 'app_splash%' OR (campaign_type = 'modal' AND id = 5)
+      ORDER BY id DESC
+      LIMIT 1
+    `);
+    if (rows.length > 0) {
+      const splash = announcementForResponse(req, rows[0]);
+      let duration = 3;
+      const match = String(splash.popup_style || '').match(/interval_(\d+)/);
+      if (match) duration = parseInt(match[1], 10);
+      return res.json({ status: 'ok', splashAd: { ...splash, duration } });
+    }
+    res.json({ status: 'ok', splashAd: null });
+  } catch (error) { sendInternalError(res, error); }
+});
+
+app.post('/api/pedidos/admin/app-splash-ad', authenticateToken, requirePermission('Anuncios', 'editar'), async (req, res) => {
+  try {
+    const { title = '', image_url = '', is_active = true, duration = 3, cta_link = '', cta_url = '' } = req.body;
+    const finalCta = cta_url || cta_link || '';
+    const popup_style = `app_splash_interval_${duration || 3}`;
+
+    const { rows: existing } = await pool.query(`
+      SELECT id, image_url FROM pedidos_app_announcements
+      WHERE campaign_type = 'splash_ad' OR popup_style LIKE 'app_splash%' OR (campaign_type = 'modal' AND id = 5)
+      ORDER BY id DESC
+      LIMIT 1
+    `);
+
+    let resultRow;
+    if (existing.length > 0) {
+      const id = existing[0].id;
+      const keepImage = isManagedMediaUrl(image_url, 'announcements', id) ? existing[0].image_url : image_url;
+      const { rows } = await pool.query(`
+        UPDATE pedidos_app_announcements
+        SET title = $1, image_url = $2, is_active = $3, popup_style = $4,
+            campaign_type = 'splash_ad', cta_url = $5, updated_at = NOW()
+        WHERE id = $6
+        RETURNING *
+      `, [title, keepImage, is_active, popup_style, finalCta, id]);
+      resultRow = rows[0];
+    } else {
+      const { rows } = await pool.query(`
+        INSERT INTO pedidos_app_announcements
+          (title, image_url, is_active, campaign_type, popup_style, audience, priority, cta_url, published_at)
+        VALUES ($1, $2, $3, 'splash_ad', $4, 'all', 100, $5, NOW())
+        RETURNING *
+      `, [title, image_url, is_active, popup_style, finalCta]);
+      resultRow = rows[0];
+    }
+
+    res.json({
+      status: 'ok',
+      splashAd: {
+        ...announcementForResponse(req, { ...resultRow, has_image: Boolean(resultRow.image_url) }),
+        duration: duration || 3
+      }
+    });
+  } catch (error) { sendInternalError(res, error); }
+});
+
+app.get('/api/pedidos/app-splash-ad', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT id, title, body, cta_label, cta_url, starts_at, ends_at,
+             display_frequency, campaign_type, popup_style, audience, priority,
+             is_active, updated_at, image_url IS NOT NULL AS has_image
+      FROM pedidos_app_announcements
+      WHERE is_active = TRUE
+        AND (campaign_type = 'splash_ad' OR popup_style LIKE 'app_splash%' OR (campaign_type = 'modal' AND id = 5))
+      ORDER BY id DESC
+      LIMIT 1
+    `);
+    if (rows.length > 0) {
+      const splash = announcementForResponse(req, rows[0]);
+      let duration = 3;
+      const match = String(splash.popup_style || '').match(/interval_(\d+)/);
+      if (match) duration = parseInt(match[1], 10);
+      return res.json({ status: 'ok', splashAd: { ...splash, duration } });
+    }
+    res.json({ status: 'ok', splashAd: null });
   } catch (error) { sendInternalError(res, error); }
 });
 
