@@ -33,6 +33,12 @@ const { createOutboxDispatcher } = require('./src/outbox');
 const { createWhatsAppClient } = require('./src/whatsapp-cloud');
 const { createCrmWorker, ensureContact } = require('./src/crm-service');
 const { normalizePhoneE164 } = require('./src/crm/phone');
+let sharp;
+try {
+  sharp = require('sharp');
+} catch (e) {
+  // sharp opcional
+}
 const { httpError, isClientError, redactSensitiveText, sendInternalError } = require('./src/http-errors');
 
 const publicVapidKey = process.env.VAPID_PUBLIC_KEY;
@@ -337,16 +343,56 @@ function isManagedMediaUrl(value, resource, id) {
   return typeof value === 'string' && value.includes(`/api/pedidos/media/${resource}/${id}`);
 }
 
+async function optimizeImageBuffer(dataUrl, { maxWidth = 600, maxHeight = 600, quality = 82 } = {}) {
+  if (!sharp || !dataUrl || typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/')) {
+    return dataUrl;
+  }
+  try {
+    const match = /^data:([^;,]+);base64,(.+)$/s.exec(dataUrl);
+    if (!match) return dataUrl;
+    const inBuffer = Buffer.from(match[2], 'base64');
+    if (match[1] === 'image/webp' && inBuffer.length < 80 * 1024) return dataUrl;
+
+    const outBuffer = await sharp(inBuffer)
+      .resize({ width: maxWidth, height: maxHeight, fit: 'inside', withoutEnlargement: true })
+      .webp({ quality, effort: 4 })
+      .toBuffer();
+
+    return `data:image/webp;base64,${outBuffer.toString('base64')}`;
+  } catch (err) {
+    console.error('Error optimizando imagen en servidor:', err.message);
+    return dataUrl;
+  }
+}
+
 function sendStoredMedia(res, value) {
   if (!value) return res.status(404).end();
-  res.set('Cache-Control', 'public, max-age=604800, stale-while-revalidate=86400');
   if (/^https?:\/\//i.test(value)) return res.redirect(302, value);
 
   const match = /^data:([^;,]+);base64,(.+)$/s.exec(value);
   if (!match) return res.status(415).json({ error: 'Formato de imagen no compatible' });
 
   const buffer = Buffer.from(match[2], 'base64');
+  const req = res.req;
+  const isVersioned = Boolean(req?.query?.v);
+
+  // ETag para validación 304 Not Modified ultrarrápida
+  const etag = `"${buffer.length.toString(16)}-${buffer.slice(0, 16).toString('hex')}"`;
+  res.set('ETag', etag);
+
+  if (req?.headers['if-none-match'] === etag) {
+    return res.status(304).end();
+  }
+
+  // Caché inmutable por 1 año si tiene versión (?v=...), o 7 días si es URL estática
+  if (isVersioned) {
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  } else {
+    res.set('Cache-Control', 'public, max-age=604800, stale-while-revalidate=86400');
+  }
+
   res.set('Content-Type', match[1]);
+  res.set('Content-Length', buffer.length);
   return res.send(buffer);
 }
 
@@ -1335,7 +1381,7 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
       validatedDiscount = Math.min(normalized.total + deliveryFee, requestedDiscount);
     }
 
-    const orderTotal = Math.max(0, normalized.total + deliveryFee - validatedDiscount);
+    const orderTotal = normalized.total + deliveryFee - validatedDiscount;
 
     const rawPaymentMethod = customer.paymentMethod || customer.payment_method || req.body.payment_method;
     let resolvedCashSplit = customer.cash_split !== undefined ? customer.cash_split : (customer.cashSplit !== undefined ? customer.cashSplit : req.body.cash_split);
@@ -3576,13 +3622,14 @@ app.post('/api/pedidos/admin/products', authenticateToken, requirePermission('Pr
       return res.status(400).json({ error: 'Nombre y precio válido son obligatorios' });
     }
     const safeUnits = Math.max(0, parseInt(units_count, 10) || 1);
+    const safeImage = await optimizeImageBuffer(image);
     const { rows } = await pool.query(
       `INSERT INTO pedidos_app_products
        (title, description, price, category, image, status, is_featured, stock, barcode,
         track_stock, low_stock_threshold, inventory_unit, inventory_unit_cost, adicionales_ids, units_count, sort_order)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
                COALESCE((SELECT MAX(sort_order) FROM pedidos_app_products WHERE category = $4), 0) + 1) RETURNING *`,
-      [title.trim(), description, Number(price), category, image, status || 'Activo', Boolean(is_featured),
+      [title.trim(), description, Number(price), category, safeImage, status || 'Activo', Boolean(is_featured),
         Number(stock) || 0, barcode?.trim() || null, Boolean(track_stock), Number(low_stock_threshold) || 5,
         inventory_unit || 'unidad', Number(inventory_unit_cost) || 0, Array.isArray(adicionales_ids) ? adicionales_ids : [],
         safeUnits]
@@ -3603,6 +3650,7 @@ app.put('/api/pedidos/admin/products/:id', authenticateToken, requirePermission(
     const keepStoredImage = isManagedMediaUrl(image, 'products', id);
     const safeAdicionales = Array.isArray(adicionales_ids) ? adicionales_ids : [];
     const safeUnits = Math.max(0, parseInt(units_count, 10) || 1);
+    const safeImage = keepStoredImage ? null : await optimizeImageBuffer(image);
     const { rows } = keepStoredImage
       ? await pool.query(
         `UPDATE pedidos_app_products
@@ -3620,7 +3668,7 @@ app.put('/api/pedidos/admin/products/:id', authenticateToken, requirePermission(
              is_featured=$7, stock=$8, barcode=$9, track_stock=$10,
              low_stock_threshold=$11, inventory_unit=$12, inventory_unit_cost=$13, adicionales_ids=$14, units_count=$15, updated_at=NOW()
          WHERE id::text=$16 RETURNING *`,
-        [title, description, price, category, image, status, is_featured, Number(stock) || 0,
+        [title, description, price, category, safeImage, status, is_featured, Number(stock) || 0,
           barcode?.trim() || null, Boolean(track_stock), Number(low_stock_threshold) || 5,
           inventory_unit || 'unidad', Number(inventory_unit_cost) || 0, safeAdicionales, safeUnits, id]
       );
