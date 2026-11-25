@@ -1234,41 +1234,102 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
 
     // Validación autoritativa y cálculo seguro de cupones / descuentos
     const rawCouponCode = String(req.body.coupon_code || customer.coupon_code || '').trim().toUpperCase();
+    const customerAccountId = req.body.customer_account_id || customer.account_id || customer.customer_account_id || null;
     const requestedDiscount = Math.max(0, Number(req.body.discount || customer.discount || 0));
     let validatedDiscount = 0;
     let appliedCoupon = null;
+    let appliedCouponRecord = null;
 
     if (rawCouponCode) {
-      if (rawCouponCode === 'DOMIAPP' || rawCouponCode === 'APPGRATIS' || rawCouponCode === 'BIENVENIDA' || rawCouponCode === 'PUNTOSDOMI' || rawCouponCode === 'DISTRICVIP') {
-        if (isDelivery) {
-          validatedDiscount = deliveryFee;
-          appliedCoupon = rawCouponCode;
-        }
-      } else if (rawCouponCode === 'PRIMERPEDIDO') {
-        validatedDiscount = Math.min(normalized.total, Math.round(normalized.total * 0.10));
-        appliedCoupon = rawCouponCode;
-      } else if (rawCouponCode === 'BURGER4K') {
-        validatedDiscount = Math.min(normalized.total, 4000);
-        appliedCoupon = rawCouponCode;
-      } else if (rawCouponCode === 'SUPER10K') {
-        validatedDiscount = Math.min(normalized.total, 10000);
-        appliedCoupon = rawCouponCode;
-      } else if (rawCouponCode === 'FIESTA15K') {
-        validatedDiscount = Math.min(normalized.total, 15000);
-        appliedCoupon = rawCouponCode;
-      } else {
-        try {
-          const { rows: campRows } = await client.query(
-            `SELECT coupon_code FROM pedidos_app_campaigns 
-             WHERE UPPER(coupon_code) = $1 AND is_active = true 
-             LIMIT 1`,
-            [rawCouponCode]
+      try {
+        const { rows: cpnRows } = await client.query(
+          `SELECT * FROM appmobile_coupons 
+           WHERE UPPER(code) = $1 AND is_active = true 
+             AND (expires_at IS NULL OR expires_at > NOW())
+           LIMIT 1`,
+          [rawCouponCode]
+        );
+
+        if (cpnRows.length > 0) {
+          const cpn = cpnRows[0];
+          // Validar redención previa por este usuario (teléfono o ID de cuenta)
+          const redRes = await client.query(
+            `SELECT COUNT(*)::int AS count 
+             FROM appmobile_coupon_redemptions 
+             WHERE (coupon_id = $1 OR UPPER(coupon_code) = $2)
+               AND (customer_phone = $3 OR ($4::text IS NOT NULL AND customer_account_id = $4::text))`,
+            [cpn.id, rawCouponCode, formattedPhone, customerAccountId ? String(customerAccountId) : null]
           );
-          if (campRows.length > 0) {
-            appliedCoupon = rawCouponCode;
-            validatedDiscount = Math.min(normalized.total, requestedDiscount);
+          const usedCount = redRes.rows[0]?.count || 0;
+          if (usedCount >= (cpn.max_uses_per_customer || 1)) {
+            return res.status(400).json({
+              status: 'error',
+              error: `El cupón ${rawCouponCode} ya ha sido utilizado por este usuario.`
+            });
           }
-        } catch (_) {}
+
+          if (cpn.min_order_total > 0 && normalized.total < cpn.min_order_total) {
+            return res.status(400).json({
+              status: 'error',
+              error: `El cupón ${rawCouponCode} requiere un pedido mínimo de $${Number(cpn.min_order_total).toLocaleString('es-CO')}.`
+            });
+          }
+
+          if (cpn.discount_type === 'free_delivery') {
+            if (isDelivery) {
+              validatedDiscount = deliveryFee;
+              appliedCoupon = cpn.code;
+              appliedCouponRecord = cpn;
+            }
+          } else if (cpn.discount_type === 'percentage') {
+            const pct = Math.min(100, Math.max(0, Number(cpn.discount_value || 0)));
+            validatedDiscount = Math.min(normalized.total, Math.round(normalized.total * (pct / 100)));
+            appliedCoupon = cpn.code;
+            appliedCouponRecord = cpn;
+          } else if (cpn.discount_type === 'fixed') {
+            const val = Math.max(0, Number(cpn.discount_value || 0));
+            validatedDiscount = Math.min(normalized.total, Math.round(val));
+            appliedCoupon = cpn.code;
+            appliedCouponRecord = cpn;
+          }
+        }
+      } catch (cpnErr) {
+        console.error('Error validando cupón configurable:', cpnErr.message);
+      }
+
+      // Fallback a promociones y cupones legacy si no existía en appmobile_coupons
+      if (!appliedCoupon) {
+        if (rawCouponCode === 'DOMIAPP' || rawCouponCode === 'APPGRATIS' || rawCouponCode === 'BIENVENIDA' || rawCouponCode === 'PUNTOSDOMI' || rawCouponCode === 'DISTRICVIP') {
+          if (isDelivery) {
+            validatedDiscount = deliveryFee;
+            appliedCoupon = rawCouponCode;
+          }
+        } else if (rawCouponCode === 'PRIMERPEDIDO') {
+          validatedDiscount = Math.min(normalized.total, Math.round(normalized.total * 0.10));
+          appliedCoupon = rawCouponCode;
+        } else if (rawCouponCode === 'BURGER4K') {
+          validatedDiscount = Math.min(normalized.total, 4000);
+          appliedCoupon = rawCouponCode;
+        } else if (rawCouponCode === 'SUPER10K') {
+          validatedDiscount = Math.min(normalized.total, 10000);
+          appliedCoupon = rawCouponCode;
+        } else if (rawCouponCode === 'FIESTA15K') {
+          validatedDiscount = Math.min(normalized.total, 15000);
+          appliedCoupon = rawCouponCode;
+        } else {
+          try {
+            const { rows: campRows } = await client.query(
+              `SELECT coupon_code FROM pedidos_app_campaigns 
+               WHERE UPPER(coupon_code) = $1 AND is_active = true 
+               LIMIT 1`,
+              [rawCouponCode]
+            );
+            if (campRows.length > 0) {
+              appliedCoupon = rawCouponCode;
+              validatedDiscount = Math.min(normalized.total, requestedDiscount);
+            }
+          } catch (_) {}
+        }
       }
     } else if (requestedDiscount > 0) {
       validatedDiscount = Math.min(normalized.total + deliveryFee, requestedDiscount);
@@ -1514,6 +1575,26 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
         await client.query('RELEASE SAVEPOINT crm_refresh_after_order');
       } catch (_refreshErr) {
         await client.query('ROLLBACK TO SAVEPOINT crm_refresh_after_order');
+      }
+    }
+
+    if (appliedCoupon && rows.length > 0) {
+      const cpnId = appliedCouponRecord ? appliedCouponRecord.id : null;
+      try {
+        await client.query(`
+          INSERT INTO appmobile_coupon_redemptions 
+            (coupon_id, coupon_code, customer_account_id, customer_phone, order_id, discount_applied)
+          VALUES ($1, $2, $3, $4, $5, $6)
+        `, [
+          cpnId,
+          appliedCoupon,
+          customerAccountId ? String(customerAccountId) : null,
+          formattedPhone,
+          rows[0].id,
+          validatedDiscount
+        ]);
+      } catch (redemptionErr) {
+        console.error('Error registrando redención de cupón:', redemptionErr.message);
       }
     }
 
@@ -3228,41 +3309,102 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, requirePermissi
 
     // Validación autoritativa y cálculo seguro de cupones / descuentos
     const rawCouponCode = String(req.body.coupon_code || customer.coupon_code || '').trim().toUpperCase();
+    const customerAccountId = req.body.customer_account_id || customer.account_id || customer.customer_account_id || null;
     const requestedDiscount = Math.max(0, Number(req.body.discount || customer.discount || 0));
     let validatedDiscount = 0;
     let appliedCoupon = null;
+    let appliedCouponRecord = null;
 
     if (rawCouponCode) {
-      if (rawCouponCode === 'DOMIAPP' || rawCouponCode === 'APPGRATIS' || rawCouponCode === 'BIENVENIDA' || rawCouponCode === 'PUNTOSDOMI' || rawCouponCode === 'DISTRICVIP') {
-        if (isDelivery) {
-          validatedDiscount = deliveryFee;
-          appliedCoupon = rawCouponCode;
-        }
-      } else if (rawCouponCode === 'PRIMERPEDIDO') {
-        validatedDiscount = Math.min(normalized.total, Math.round(normalized.total * 0.10));
-        appliedCoupon = rawCouponCode;
-      } else if (rawCouponCode === 'BURGER4K') {
-        validatedDiscount = Math.min(normalized.total, 4000);
-        appliedCoupon = rawCouponCode;
-      } else if (rawCouponCode === 'SUPER10K') {
-        validatedDiscount = Math.min(normalized.total, 10000);
-        appliedCoupon = rawCouponCode;
-      } else if (rawCouponCode === 'FIESTA15K') {
-        validatedDiscount = Math.min(normalized.total, 15000);
-        appliedCoupon = rawCouponCode;
-      } else {
-        try {
-          const { rows: campRows } = await client.query(
-            `SELECT coupon_code FROM pedidos_app_campaigns 
-             WHERE UPPER(coupon_code) = $1 AND is_active = true 
-             LIMIT 1`,
-            [rawCouponCode]
+      try {
+        const { rows: cpnRows } = await client.query(
+          `SELECT * FROM appmobile_coupons 
+           WHERE UPPER(code) = $1 AND is_active = true 
+             AND (expires_at IS NULL OR expires_at > NOW())
+           LIMIT 1`,
+          [rawCouponCode]
+        );
+
+        if (cpnRows.length > 0) {
+          const cpn = cpnRows[0];
+          // Validar redención previa por este usuario (teléfono o ID de cuenta)
+          const redRes = await client.query(
+            `SELECT COUNT(*)::int AS count 
+             FROM appmobile_coupon_redemptions 
+             WHERE (coupon_id = $1 OR UPPER(coupon_code) = $2)
+               AND (customer_phone = $3 OR ($4::text IS NOT NULL AND customer_account_id = $4::text))`,
+            [cpn.id, rawCouponCode, formattedPhone, customerAccountId ? String(customerAccountId) : null]
           );
-          if (campRows.length > 0) {
-            appliedCoupon = rawCouponCode;
-            validatedDiscount = Math.min(normalized.total, requestedDiscount);
+          const usedCount = redRes.rows[0]?.count || 0;
+          if (usedCount >= (cpn.max_uses_per_customer || 1)) {
+            return res.status(400).json({
+              status: 'error',
+              error: `El cupón ${rawCouponCode} ya ha sido utilizado por este usuario.`
+            });
           }
-        } catch (_) {}
+
+          if (cpn.min_order_total > 0 && normalized.total < cpn.min_order_total) {
+            return res.status(400).json({
+              status: 'error',
+              error: `El cupón ${rawCouponCode} requiere un pedido mínimo de $${Number(cpn.min_order_total).toLocaleString('es-CO')}.`
+            });
+          }
+
+          if (cpn.discount_type === 'free_delivery') {
+            if (isDelivery) {
+              validatedDiscount = deliveryFee;
+              appliedCoupon = cpn.code;
+              appliedCouponRecord = cpn;
+            }
+          } else if (cpn.discount_type === 'percentage') {
+            const pct = Math.min(100, Math.max(0, Number(cpn.discount_value || 0)));
+            validatedDiscount = Math.min(normalized.total, Math.round(normalized.total * (pct / 100)));
+            appliedCoupon = cpn.code;
+            appliedCouponRecord = cpn;
+          } else if (cpn.discount_type === 'fixed') {
+            const val = Math.max(0, Number(cpn.discount_value || 0));
+            validatedDiscount = Math.min(normalized.total, Math.round(val));
+            appliedCoupon = cpn.code;
+            appliedCouponRecord = cpn;
+          }
+        }
+      } catch (cpnErr) {
+        console.error('Error validando cupón configurable:', cpnErr.message);
+      }
+
+      // Fallback a promociones y cupones legacy si no existía en appmobile_coupons
+      if (!appliedCoupon) {
+        if (rawCouponCode === 'DOMIAPP' || rawCouponCode === 'APPGRATIS' || rawCouponCode === 'BIENVENIDA' || rawCouponCode === 'PUNTOSDOMI' || rawCouponCode === 'DISTRICVIP') {
+          if (isDelivery) {
+            validatedDiscount = deliveryFee;
+            appliedCoupon = rawCouponCode;
+          }
+        } else if (rawCouponCode === 'PRIMERPEDIDO') {
+          validatedDiscount = Math.min(normalized.total, Math.round(normalized.total * 0.10));
+          appliedCoupon = rawCouponCode;
+        } else if (rawCouponCode === 'BURGER4K') {
+          validatedDiscount = Math.min(normalized.total, 4000);
+          appliedCoupon = rawCouponCode;
+        } else if (rawCouponCode === 'SUPER10K') {
+          validatedDiscount = Math.min(normalized.total, 10000);
+          appliedCoupon = rawCouponCode;
+        } else if (rawCouponCode === 'FIESTA15K') {
+          validatedDiscount = Math.min(normalized.total, 15000);
+          appliedCoupon = rawCouponCode;
+        } else {
+          try {
+            const { rows: campRows } = await client.query(
+              `SELECT coupon_code FROM pedidos_app_campaigns 
+               WHERE UPPER(coupon_code) = $1 AND is_active = true 
+               LIMIT 1`,
+              [rawCouponCode]
+            );
+            if (campRows.length > 0) {
+              appliedCoupon = rawCouponCode;
+              validatedDiscount = Math.min(normalized.total, requestedDiscount);
+            }
+          } catch (_) {}
+        }
       }
     } else if (requestedDiscount > 0) {
       validatedDiscount = Math.min(normalized.total + deliveryFee, requestedDiscount);
@@ -3644,7 +3786,7 @@ const SETTINGS_FIELDS = new Set([
   'printer_paper_width', 'print_agent_id', 'print_job_expiry_minutes',
   'app_logo', 'app_name', 'app_page_title', 'app_hero_title', 'app_hero_subtitle',
   'app_primary_color', 'app_background_color', 'app_surface_color', 'app_text_color',
-  'app_font_family', 'app_card_style', 'app_is_active', 'app_maintenance_message',
+  'app_font_family', 'app_card_style', 'app_is_active', 'app_banner_interval', 'app_maintenance_message',
   'app_min_order', 'app_delivery_cost', 'app_min_version', 'app_current_version',
   'app_download_url', 'app_support_phone', 'app_show_chef_3d', 'app_welcome_discount_enabled',
   'app_welcome_discount_text', 'app_allow_cash', 'app_allow_nequi', 'app_allow_transfer'
@@ -4604,6 +4746,187 @@ app.post('/api/pedidos/admin/app-banners', authenticateToken, requirePermission(
       c.display_frequency, 'banner', c.popup_style, 'all', c.priority, c.coupon_code, c.is_active]);
     res.status(201).json({ status: 'ok', banner: announcementForResponse(req, { ...rows[0], has_image: Boolean(rows[0].image_url) }) });
   } catch (error) { sendInternalError(res, error); }
+});
+
+// ==========================================
+// CUPONES CONFIGURABLES Y REDENCIONES
+// ==========================================
+
+// Consulta pública / cliente móvil de cupones disponibles (excluye ya redimidos)
+app.get('/api/pedidos/customer/coupons', async (req, res) => {
+  try {
+    let phone = String(req.query.phone || '').replace(/\D/g, '');
+    if (phone.length === 10) phone = '57' + phone;
+    const accountId = req.query.accountId || req.query.account_id || null;
+
+    const { rows: coupons } = await pool.query(`
+      SELECT 
+        c.id, c.code, c.title, c.description, c.discount_type, 
+        c.discount_value, c.min_order_total, c.max_uses_per_customer, 
+        c.is_active, c.expires_at,
+        COALESCE(r.times_used, 0)::int AS times_used
+      FROM appmobile_coupons c
+      LEFT JOIN (
+        SELECT coupon_id, COUNT(*)::int AS times_used
+        FROM appmobile_coupon_redemptions
+        WHERE ($1::text IS NOT NULL AND customer_phone = $1)
+           OR ($2::text IS NOT NULL AND customer_account_id = $2)
+        GROUP BY coupon_id
+      ) r ON r.coupon_id = c.id
+      WHERE c.is_active = true 
+        AND (c.expires_at IS NULL OR c.expires_at > NOW())
+      ORDER BY c.id ASC
+    `, [phone || null, accountId ? String(accountId) : null]);
+
+    // Filtrar los que ya alcanzaron el límite de uso del cliente
+    const availableCoupons = coupons.filter(c => c.times_used < (c.max_uses_per_customer || 1));
+
+    res.json({
+      status: 'ok',
+      coupons: availableCoupons
+    });
+  } catch (error) {
+    console.error('Error fetching customer coupons:', error);
+    sendInternalError(res, error);
+  }
+});
+
+// Admin: Listar todos los cupones con contador de redenciones
+app.get('/api/pedidos/admin/coupons', authenticateToken, requirePermission('Configuracion', 'ver'), async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        c.id, c.code, c.title, c.description, c.discount_type,
+        c.discount_value, c.min_order_total, c.max_uses_per_customer,
+        c.is_active, c.expires_at, c.created_at, c.updated_at,
+        COUNT(r.id)::int AS total_redemptions
+      FROM appmobile_coupons c
+      LEFT JOIN appmobile_coupon_redemptions r ON r.coupon_id = c.id
+      GROUP BY c.id
+      ORDER BY c.id DESC
+    `);
+    res.json({ status: 'ok', coupons: rows });
+  } catch (error) {
+    console.error('Error fetching admin coupons:', error);
+    sendInternalError(res, error);
+  }
+});
+
+// Admin: Crear cupón
+app.post('/api/pedidos/admin/coupons', authenticateToken, requirePermission('Configuracion', 'editar'), async (req, res) => {
+  try {
+    const { code, title, description, discount_type, discount_value, min_order_total, max_uses_per_customer, is_active, expires_at } = req.body;
+    if (!code || !title || !discount_type) {
+      return res.status(400).json({ status: 'error', error: 'Código, título y tipo de descuento son requeridos.' });
+    }
+    const cleanCode = String(code).trim().toUpperCase();
+    const { rows } = await pool.query(`
+      INSERT INTO appmobile_coupons 
+        (code, title, description, discount_type, discount_value, min_order_total, max_uses_per_customer, is_active, expires_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *
+    `, [
+      cleanCode,
+      String(title).trim(),
+      String(description || '').trim(),
+      discount_type,
+      Number(discount_value || 0),
+      Number(min_order_total || 0),
+      Number(max_uses_per_customer || 1),
+      is_active !== undefined ? Boolean(is_active) : true,
+      expires_at ? new Date(expires_at) : null
+    ]);
+    res.json({ status: 'ok', coupon: rows[0] });
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(400).json({ status: 'error', error: 'Ya existe un cupón con este código.' });
+    }
+    console.error('Error creating coupon:', error);
+    sendInternalError(res, error);
+  }
+});
+
+// Admin: Editar cupón
+app.put('/api/pedidos/admin/coupons/:id', authenticateToken, requirePermission('Configuracion', 'editar'), async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const { code, title, description, discount_type, discount_value, min_order_total, max_uses_per_customer, is_active, expires_at } = req.body;
+    const cleanCode = code ? String(code).trim().toUpperCase() : undefined;
+
+    const { rows } = await pool.query(`
+      UPDATE appmobile_coupons
+      SET 
+        code = COALESCE($1, code),
+        title = COALESCE($2, title),
+        description = COALESCE($3, description),
+        discount_type = COALESCE($4, discount_type),
+        discount_value = COALESCE($5, discount_value),
+        min_order_total = COALESCE($6, min_order_total),
+        max_uses_per_customer = COALESCE($7, max_uses_per_customer),
+        is_active = COALESCE($8, is_active),
+        expires_at = $9,
+        updated_at = NOW()
+      WHERE id = $10
+      RETURNING *
+    `, [
+      cleanCode,
+      title !== undefined ? String(title).trim() : null,
+      description !== undefined ? String(description).trim() : null,
+      discount_type,
+      discount_value !== undefined ? Number(discount_value) : null,
+      min_order_total !== undefined ? Number(min_order_total) : null,
+      max_uses_per_customer !== undefined ? Number(max_uses_per_customer) : null,
+      is_active !== undefined ? Boolean(is_active) : null,
+      expires_at ? new Date(expires_at) : null,
+      id
+    ]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ status: 'error', error: 'Cupón no encontrado.' });
+    }
+    res.json({ status: 'ok', coupon: rows[0] });
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(400).json({ status: 'error', error: 'Ya existe un cupón con este código.' });
+    }
+    console.error('Error updating coupon:', error);
+    sendInternalError(res, error);
+  }
+});
+
+// Admin: Alternar estado activo / inactivo
+app.patch('/api/pedidos/admin/coupons/:id/toggle', authenticateToken, requirePermission('Configuracion', 'editar'), async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const { rows } = await pool.query(`
+      UPDATE appmobile_coupons
+      SET is_active = NOT is_active, updated_at = NOW()
+      WHERE id = $1
+      RETURNING *
+    `, [id]);
+    if (rows.length === 0) {
+      return res.status(404).json({ status: 'error', error: 'Cupón no encontrado.' });
+    }
+    res.json({ status: 'ok', coupon: rows[0] });
+  } catch (error) {
+    console.error('Error toggling coupon:', error);
+    sendInternalError(res, error);
+  }
+});
+
+// Admin: Eliminar cupón
+app.delete('/api/pedidos/admin/coupons/:id', authenticateToken, requirePermission('Configuracion', 'eliminar'), async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const { rowCount } = await pool.query('DELETE FROM appmobile_coupons WHERE id = $1', [id]);
+    if (!rowCount) {
+      return res.status(404).json({ status: 'error', error: 'Cupón no encontrado.' });
+    }
+    res.json({ status: 'ok', message: 'Cupón eliminado correctamente.' });
+  } catch (error) {
+    console.error('Error deleting coupon:', error);
+    sendInternalError(res, error);
+  }
 });
 
 app.delete('/api/pedidos/admin/announcements/:id', authenticateToken, requirePermission('Anuncios', 'eliminar'), async (req, res) => {
