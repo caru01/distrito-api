@@ -1658,9 +1658,11 @@ app.get('/api/pedidos/rastrear/:id', trackingLimiter, async (req, res) => {
              CASE WHEN order_data.delivery_status = 'En camino'
                        AND profile.last_location_at >= COALESCE(order_data.picked_up_at,order_data.on_the_way_at)
                   THEN profile.last_location_at ELSE NULL END AS driver_location_at,
-             CASE WHEN order_data.delivery_status = 'En camino' THEN TRIM(CONCAT(driver.name, ' ', driver.last_name)) ELSE NULL END AS driver_name,
-             CASE WHEN order_data.delivery_status = 'En camino' THEN profile.vehicle_type ELSE NULL END AS vehicle_type,
-             CASE WHEN order_data.delivery_status = 'En camino' THEN profile.plate ELSE NULL END AS plate,
+             CASE WHEN order_data.delivery_status = 'En camino' OR order_data.delivery_status = 'Asignado' THEN TRIM(CONCAT(driver.name, ' ', driver.last_name)) ELSE NULL END AS driver_name,
+             CASE WHEN order_data.delivery_status = 'En camino' OR order_data.delivery_status = 'Asignado' THEN driver.phone ELSE NULL END AS driver_phone,
+             CASE WHEN order_data.delivery_status = 'En camino' OR order_data.delivery_status = 'Asignado' THEN profile.vehicle_type ELSE NULL END AS vehicle_type,
+             CASE WHEN order_data.delivery_status = 'En camino' OR order_data.delivery_status = 'Asignado' THEN profile.plate ELSE NULL END AS plate,
+             settings.phone AS store_phone,
              settings.restaurant_name, COALESCE(settings.kitchen_address, settings.address) AS store_address,
              settings.store_latitude, settings.store_longitude
       FROM pedidos_app_orders order_data
@@ -1818,9 +1820,11 @@ app.get('/api/pedidos/track/:id', trackingLimiter, async (req, res) => {
              CASE WHEN order_data.delivery_status = 'En camino'
                        AND profile.last_location_at >= COALESCE(order_data.picked_up_at,order_data.on_the_way_at)
                   THEN profile.last_location_at ELSE NULL END AS driver_location_at,
-             CASE WHEN order_data.delivery_status = 'En camino' THEN TRIM(CONCAT(driver.name, ' ', driver.last_name)) ELSE NULL END AS driver_name,
-             CASE WHEN order_data.delivery_status = 'En camino' THEN profile.vehicle_type ELSE NULL END AS vehicle_type,
-             CASE WHEN order_data.delivery_status = 'En camino' THEN profile.plate ELSE NULL END AS plate,
+             CASE WHEN order_data.delivery_status = 'En camino' OR order_data.delivery_status = 'Asignado' THEN TRIM(CONCAT(driver.name, ' ', driver.last_name)) ELSE NULL END AS driver_name,
+             CASE WHEN order_data.delivery_status = 'En camino' OR order_data.delivery_status = 'Asignado' THEN driver.phone ELSE NULL END AS driver_phone,
+             CASE WHEN order_data.delivery_status = 'En camino' OR order_data.delivery_status = 'Asignado' THEN profile.vehicle_type ELSE NULL END AS vehicle_type,
+             CASE WHEN order_data.delivery_status = 'En camino' OR order_data.delivery_status = 'Asignado' THEN profile.plate ELSE NULL END AS plate,
+             settings.phone AS store_phone,
              settings.restaurant_name, COALESCE(settings.kitchen_address, settings.address) AS store_address,
              settings.store_latitude, settings.store_longitude
       FROM pedidos_app_orders order_data
@@ -1885,6 +1889,7 @@ app.get('/api/pedidos/track/:id', trackingLimiter, async (req, res) => {
         driver: order.delivery_user_id == null || String(order.delivery_provider_type || '').startsWith('external_') ? null : {
           id: Number(order.delivery_user_id),
           name: order.driver_name,
+          phone: order.driver_phone,
           vehicle_type: order.vehicle_type,
           plate: order.plate,
           latitude: order.driver_latitude == null ? null : Number(order.driver_latitude),
@@ -1892,6 +1897,7 @@ app.get('/api/pedidos/track/:id', trackingLimiter, async (req, res) => {
           updated_at: order.driver_location_at,
           trail: driverTrail,
         },
+        store_phone: order.store_phone || '3104381861',
         has_live_gps: !String(order.delivery_provider_type || '').startsWith('external_')
           && order.driver_latitude != null && order.driver_longitude != null,
       },
@@ -4751,6 +4757,214 @@ app.post('/api/pedidos/admin/app-banners', authenticateToken, requirePermission(
 // ==========================================
 // CUPONES CONFIGURABLES Y REDENCIONES
 // ==========================================
+
+// ==========================================
+// DIRECCIONES GUARDADAS DEL CLIENTE (MÁXIMO 6: 1 PRINCIPAL + 5 ADICIONALES)
+// ==========================================
+app.get('/api/pedidos/customer/addresses', async (req, res) => {
+  try {
+    let phone = null;
+    let customerId = null;
+
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+      try {
+        const token = req.headers.authorization.split(' ')[1];
+        const decoded = jwt.verify(token, JWT_SECRET);
+        if (decoded && decoded.id) customerId = decoded.id;
+        if (decoded && decoded.phone) phone = decoded.phone;
+      } catch (_) {}
+    }
+
+    if (!phone && req.query.phone) {
+      phone = String(req.query.phone).replace(/\D/g, '');
+      if (phone.length === 10) phone = '57' + phone;
+    }
+
+    if (!phone && !customerId) {
+      return res.json({ status: 'ok', addresses: [] });
+    }
+
+    const { rows } = await pool.query(`
+      SELECT id, label, address, detail, barrio,
+             latitude::float AS latitude, longitude::float AS longitude,
+             is_default, created_at
+      FROM appmobile_customer_addresses
+      WHERE ($1::int IS NOT NULL AND customer_account_id = $1)
+         OR ($2::text IS NOT NULL AND phone = $2)
+      ORDER BY is_default DESC, id DESC
+      LIMIT 6
+    `, [customerId, phone]);
+
+    res.json({
+      status: 'ok',
+      addresses: rows.map(r => ({
+        id: String(r.id),
+        label: r.label || 'Casa',
+        address: r.address || '',
+        detail: r.detail || '',
+        barrio: r.barrio || 'Valledupar',
+        latitude: Number(r.latitude) || 10.4631,
+        longitude: Number(r.longitude) || -73.2532,
+        isDefault: Boolean(r.is_default),
+      }))
+    });
+  } catch (error) {
+    console.error('Error fetching customer addresses:', error);
+    sendInternalError(res, error);
+  }
+});
+
+app.post('/api/pedidos/customer/addresses', async (req, res) => {
+  try {
+    let phone = null;
+    let customerId = null;
+
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+      try {
+        const token = req.headers.authorization.split(' ')[1];
+        const decoded = jwt.verify(token, JWT_SECRET);
+        if (decoded && decoded.id) customerId = decoded.id;
+        if (decoded && decoded.phone) phone = decoded.phone;
+      } catch (_) {}
+    }
+
+    if (!phone && req.body.phone) {
+      phone = String(req.body.phone).replace(/\D/g, '');
+      if (phone.length === 10) phone = '57' + phone;
+    }
+
+    const { label, address, detail, barrio, latitude, longitude, isDefault } = req.body;
+    if (!address) {
+      return res.status(400).json({ status: 'error', error: 'La dirección es obligatoria.' });
+    }
+
+    // Comprobar límite de hasta 6 direcciones en total (1 principal + 5 adicionales)
+    const countRes = await pool.query(`
+      SELECT COUNT(*)::int AS total
+      FROM appmobile_customer_addresses
+      WHERE ($1::int IS NOT NULL AND customer_account_id = $1)
+         OR ($2::text IS NOT NULL AND phone = $2)
+    `, [customerId, phone]);
+
+    const totalCurrent = countRes.rows[0]?.total || 0;
+    if (totalCurrent >= 6) {
+      return res.status(400).json({
+        status: 'error',
+        error: 'Has alcanzado el límite máximo de 6 direcciones (1 principal + 5 adicionales).'
+      });
+    }
+
+    if (isDefault) {
+      await pool.query(`
+        UPDATE appmobile_customer_addresses
+        SET is_default = false
+        WHERE ($1::int IS NOT NULL AND customer_account_id = $1)
+           OR ($2::text IS NOT NULL AND phone = $2)
+      `, [customerId, phone]);
+    }
+
+    const { rows } = await pool.query(`
+      INSERT INTO appmobile_customer_addresses
+        (customer_account_id, phone, label, address, detail, barrio, latitude, longitude, is_default)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *
+    `, [
+      customerId,
+      phone,
+      String(label || 'Casa').trim(),
+      String(address).trim(),
+      String(detail || '').trim(),
+      String(barrio || 'Valledupar').trim(),
+      Number(latitude) || 10.4631,
+      Number(longitude) || -73.2532,
+      Boolean(isDefault) || totalCurrent === 0
+    ]);
+
+    res.status(201).json({
+      status: 'ok',
+      address: {
+        id: String(rows[0].id),
+        label: rows[0].label,
+        address: rows[0].address,
+        detail: rows[0].detail,
+        barrio: rows[0].barrio,
+        latitude: Number(rows[0].latitude),
+        longitude: Number(rows[0].longitude),
+        isDefault: Boolean(rows[0].is_default)
+      }
+    });
+  } catch (error) {
+    console.error('Error adding customer address:', error);
+    sendInternalError(res, error);
+  }
+});
+
+app.put('/api/pedidos/customer/addresses/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const { isDefault, label, address, detail, barrio, latitude, longitude } = req.body;
+    let phone = null;
+    let customerId = null;
+
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer ')) {
+      try {
+        const token = req.headers.authorization.split(' ')[1];
+        const decoded = jwt.verify(token, JWT_SECRET);
+        if (decoded && decoded.id) customerId = decoded.id;
+        if (decoded && decoded.phone) phone = decoded.phone;
+      } catch (_) {}
+    }
+
+    if (isDefault) {
+      await pool.query(`
+        UPDATE appmobile_customer_addresses
+        SET is_default = false
+        WHERE ($1::int IS NOT NULL AND customer_account_id = $1)
+           OR ($2::text IS NOT NULL AND phone = $2)
+      `, [customerId, phone]);
+    }
+
+    const { rows } = await pool.query(`
+      UPDATE appmobile_customer_addresses
+      SET 
+        label = COALESCE($1, label),
+        address = COALESCE($2, address),
+        detail = COALESCE($3, detail),
+        barrio = COALESCE($4, barrio),
+        latitude = COALESCE($5, latitude),
+        longitude = COALESCE($6, longitude),
+        is_default = COALESCE($7, is_default),
+        updated_at = NOW()
+      WHERE id = $8
+      RETURNING *
+    `, [
+      label, address, detail, barrio,
+      latitude ? Number(latitude) : null,
+      longitude ? Number(longitude) : null,
+      isDefault !== undefined ? Boolean(isDefault) : null,
+      id
+    ]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ status: 'error', error: 'Dirección no encontrada.' });
+    }
+    res.json({ status: 'ok', address: rows[0] });
+  } catch (error) {
+    console.error('Error updating customer address:', error);
+    sendInternalError(res, error);
+  }
+});
+
+app.delete('/api/pedidos/customer/addresses/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    await pool.query('DELETE FROM appmobile_customer_addresses WHERE id = $1', [id]);
+    res.json({ status: 'ok', message: 'Dirección eliminada correctamente.' });
+  } catch (error) {
+    console.error('Error deleting customer address:', error);
+    sendInternalError(res, error);
+  }
+});
 
 // Consulta pública / cliente móvil de cupones disponibles (excluye ya redimidos)
 app.get('/api/pedidos/customer/coupons', async (req, res) => {
