@@ -558,14 +558,40 @@ async function normalizeOrderCart(client, rawCart, { activeOnly = true } = {}) {
       error.statusCode = 400;
       throw error;
     }
+
+    const rawModifiers = Array.isArray(item.modifiers) ? item.modifiers : (Array.isArray(item.adiciones) ? item.adiciones : []);
+    let additionsTotal = 0;
+    const validatedModifiers = [];
+    for (const mod of rawModifiers) {
+      if (!mod) continue;
+      if (typeof mod === 'string') {
+        validatedModifiers.push({ title: mod, name: mod, price: 0, quantity: 1, total: 0 });
+      } else {
+        const modQty = Math.max(1, Math.min(Number(mod.quantity || mod.qty || 1), 10));
+        const modPrice = Math.max(0, Number(mod.price || mod.unit_price || 0));
+        additionsTotal += modPrice * modQty;
+        validatedModifiers.push({
+          id: String(mod.id || ''),
+          title: String(mod.title || mod.name || ''),
+          name: String(mod.name || mod.title || ''),
+          price: modPrice,
+          quantity: modQty,
+          total: modPrice * modQty,
+        });
+      }
+    }
+
+    const lineUnitPrice = Number(product.price) + additionsTotal;
+
     return {
       id: product.id,
       title: product.title,
-      price: Number(product.price),
+      price: lineUnitPrice,
+      base_price: Number(product.price),
       category: product.category || 'General',
       quantity,
       notes: String(item.notes || item.observations || item.observaciones || '').trim().slice(0, 500),
-      modifiers: Array.isArray(item.modifiers) ? item.modifiers : (Array.isArray(item.adiciones) ? item.adiciones : []),
+      modifiers: validatedModifiers,
     };
   });
 
@@ -1205,7 +1231,50 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
     const isDelivery = normalizedDeliveryType === 'domicilio';
     const settingsResult = await client.query('SELECT COALESCE(delivery_cost, 0)::integer AS delivery_cost FROM pedidos_app_settings WHERE id = 1');
     const deliveryFee = isDelivery ? Math.max(0, Number(settingsResult.rows[0]?.delivery_cost || 0)) : 0;
-    const orderTotal = normalized.total + deliveryFee;
+
+    // Validación autoritativa y cálculo seguro de cupones / descuentos
+    const rawCouponCode = String(req.body.coupon_code || customer.coupon_code || '').trim().toUpperCase();
+    const requestedDiscount = Math.max(0, Number(req.body.discount || customer.discount || 0));
+    let validatedDiscount = 0;
+    let appliedCoupon = null;
+
+    if (rawCouponCode) {
+      if (rawCouponCode === 'DOMIAPP' || rawCouponCode === 'APPGRATIS' || rawCouponCode === 'BIENVENIDA' || rawCouponCode === 'PUNTOSDOMI' || rawCouponCode === 'DISTRICVIP') {
+        if (isDelivery) {
+          validatedDiscount = deliveryFee;
+          appliedCoupon = rawCouponCode;
+        }
+      } else if (rawCouponCode === 'PRIMERPEDIDO') {
+        validatedDiscount = Math.min(normalized.total, Math.round(normalized.total * 0.10));
+        appliedCoupon = rawCouponCode;
+      } else if (rawCouponCode === 'BURGER4K') {
+        validatedDiscount = Math.min(normalized.total, 4000);
+        appliedCoupon = rawCouponCode;
+      } else if (rawCouponCode === 'SUPER10K') {
+        validatedDiscount = Math.min(normalized.total, 10000);
+        appliedCoupon = rawCouponCode;
+      } else if (rawCouponCode === 'FIESTA15K') {
+        validatedDiscount = Math.min(normalized.total, 15000);
+        appliedCoupon = rawCouponCode;
+      } else {
+        try {
+          const { rows: campRows } = await client.query(
+            `SELECT coupon_code FROM pedidos_app_campaigns 
+             WHERE UPPER(coupon_code) = $1 AND is_active = true 
+             LIMIT 1`,
+            [rawCouponCode]
+          );
+          if (campRows.length > 0) {
+            appliedCoupon = rawCouponCode;
+            validatedDiscount = Math.min(normalized.total, requestedDiscount);
+          }
+        } catch (_) {}
+      }
+    } else if (requestedDiscount > 0) {
+      validatedDiscount = Math.min(normalized.total + deliveryFee, requestedDiscount);
+    }
+
+    const orderTotal = Math.max(0, normalized.total + deliveryFee - validatedDiscount);
 
     const rawPaymentMethod = customer.paymentMethod || customer.payment_method || req.body.payment_method;
     let resolvedCashSplit = customer.cash_split !== undefined ? customer.cash_split : (customer.cashSplit !== undefined ? customer.cashSplit : req.body.cash_split);
@@ -1402,9 +1471,9 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
       `INSERT INTO pedidos_app_orders 
        (customer_name, customer_phone, address, barrio, delivery_type, payment_method, total, cart_json, source, notes, voucher_reference, created_at,
         delivery_fee, delivery_reference, change_required, delivery_latitude, delivery_longitude,
-        delivery_place_id, delivery_location_adjusted, delivery_apartment, delivery_tower, delivery_floor, status, crm_contact_id)
+        delivery_place_id, delivery_location_adjusted, delivery_apartment, delivery_tower, delivery_floor, status, crm_contact_id, discount, coupon_code)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12::timestamptz, NOW()),
-         $15, $13, $14, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+         $15, $13, $14, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
        RETURNING id`,
       [
         customer.name,
@@ -1432,7 +1501,9 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
         isDelivery ? String(customer.tower || '').trim().slice(0, 50) || null : null,
         isDelivery ? String(customer.floor || '').trim().slice(0, 30) || null : null,
         finalStatus,
-        resolvedCrmContactId
+        resolvedCrmContactId,
+        validatedDiscount,
+        appliedCoupon
       ]
     );
 
@@ -1461,6 +1532,8 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
       order_id: rows[0].id,
       subtotal: normalized.total,
       delivery_fee: deliveryFee,
+      discount: validatedDiscount,
+      coupon_code: appliedCoupon,
       total: orderTotal,
       change_required: customer.paymentMethod === 'efectivo' && Number(customer.cashAmount) >= orderTotal
         ? Math.round(Number(customer.cashAmount) - orderTotal)
@@ -3152,7 +3225,50 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, requirePermissi
     const isDelivery = normalizedDeliveryType === 'domicilio';
     const settingsResult = await client.query('SELECT COALESCE(delivery_cost, 0)::integer AS delivery_cost FROM pedidos_app_settings WHERE id = 1');
     const deliveryFee = isDelivery ? Math.max(0, Number(settingsResult.rows[0]?.delivery_cost || 0)) : 0;
-    const orderTotal = normalized.total + deliveryFee;
+
+    // Validación autoritativa y cálculo seguro de cupones / descuentos
+    const rawCouponCode = String(req.body.coupon_code || customer.coupon_code || '').trim().toUpperCase();
+    const requestedDiscount = Math.max(0, Number(req.body.discount || customer.discount || 0));
+    let validatedDiscount = 0;
+    let appliedCoupon = null;
+
+    if (rawCouponCode) {
+      if (rawCouponCode === 'DOMIAPP' || rawCouponCode === 'APPGRATIS' || rawCouponCode === 'BIENVENIDA' || rawCouponCode === 'PUNTOSDOMI' || rawCouponCode === 'DISTRICVIP') {
+        if (isDelivery) {
+          validatedDiscount = deliveryFee;
+          appliedCoupon = rawCouponCode;
+        }
+      } else if (rawCouponCode === 'PRIMERPEDIDO') {
+        validatedDiscount = Math.min(normalized.total, Math.round(normalized.total * 0.10));
+        appliedCoupon = rawCouponCode;
+      } else if (rawCouponCode === 'BURGER4K') {
+        validatedDiscount = Math.min(normalized.total, 4000);
+        appliedCoupon = rawCouponCode;
+      } else if (rawCouponCode === 'SUPER10K') {
+        validatedDiscount = Math.min(normalized.total, 10000);
+        appliedCoupon = rawCouponCode;
+      } else if (rawCouponCode === 'FIESTA15K') {
+        validatedDiscount = Math.min(normalized.total, 15000);
+        appliedCoupon = rawCouponCode;
+      } else {
+        try {
+          const { rows: campRows } = await client.query(
+            `SELECT coupon_code FROM pedidos_app_campaigns 
+             WHERE UPPER(coupon_code) = $1 AND is_active = true 
+             LIMIT 1`,
+            [rawCouponCode]
+          );
+          if (campRows.length > 0) {
+            appliedCoupon = rawCouponCode;
+            validatedDiscount = Math.min(normalized.total, requestedDiscount);
+          }
+        } catch (_) {}
+      }
+    } else if (requestedDiscount > 0) {
+      validatedDiscount = Math.min(normalized.total + deliveryFee, requestedDiscount);
+    }
+
+    const orderTotal = Math.max(0, normalized.total + deliveryFee - validatedDiscount);
 
     const rawPaymentMethod = customer.paymentMethod || customer.payment_method || req.body.payment_method || currentOrder.payment_method;
     let resolvedCashSplit = customer.cash_split !== undefined ? customer.cash_split : (customer.cashSplit !== undefined ? customer.cashSplit : req.body.cash_split);

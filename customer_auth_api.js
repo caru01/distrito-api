@@ -732,5 +732,289 @@ module.exports = function configureCustomerAuth(app, { pool, JWT_SECRET, transpo
     res.json({ status: 'ok', message: 'Sesión cerrada exitosamente' });
   });
 
+  // 12. Direcciones Guardadas en la Nube (Estilo Rappi)
+  app.get('/api/pedidos/customer/addresses', authenticateCustomerToken, async (req, res) => {
+    try {
+      const customerId = req.customer.id;
+      const customerPhone = normalizePhone(req.customer.phone);
+      const { rows } = await pool.query(
+        `SELECT id, label, address, detail, barrio, latitude, longitude, is_default, created_at, updated_at
+         FROM appmobile_customer_addresses
+         WHERE customer_account_id = $1 OR (phone = $2 AND $2 <> '')
+         ORDER BY is_default DESC, updated_at DESC, id DESC`,
+        [customerId, customerPhone]
+      );
+      res.json({
+        status: 'ok',
+        addresses: rows.map(r => ({
+          id: String(r.id),
+          label: r.label || 'Casa',
+          address: r.address,
+          detail: r.detail || '',
+          barrio: r.barrio || 'Valledupar',
+          latitude: Number(r.latitude) || 10.4631,
+          longitude: Number(r.longitude) || -73.2532,
+          isDefault: r.is_default === true,
+        })),
+      });
+    } catch (err) {
+      console.error('[customer_addresses] Error listando direcciones:', err);
+      res.status(500).json({ status: 'error', error: 'Error al obtener direcciones' });
+    }
+  });
+
+  app.post('/api/pedidos/customer/addresses', authenticateCustomerToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const customerId = req.customer.id;
+      const customerPhone = normalizePhone(req.customer.phone);
+      const { label, address, detail, barrio, latitude, longitude, isDefault } = req.body;
+
+      if (!address || typeof address !== 'string' || address.trim().length < 3) {
+        return res.status(400).json({ status: 'error', error: 'La dirección es obligatoria' });
+      }
+
+      await client.query('BEGIN');
+      const shouldBeDefault = isDefault === true;
+      if (shouldBeDefault) {
+        await client.query(
+          `UPDATE appmobile_customer_addresses 
+           SET is_default = FALSE 
+           WHERE customer_account_id = $1 OR (phone = $2 AND $2 <> '')`,
+          [customerId, customerPhone]
+        );
+      }
+
+      const { rows } = await client.query(
+        `INSERT INTO appmobile_customer_addresses 
+         (customer_account_id, phone, label, address, detail, barrio, latitude, longitude, is_default, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+         RETURNING id, label, address, detail, barrio, latitude, longitude, is_default, created_at, updated_at`,
+        [
+          customerId,
+          customerPhone || null,
+          String(label || 'Casa').trim().slice(0, 50),
+          String(address).trim(),
+          String(detail || '').trim().slice(0, 255),
+          String(barrio || 'Valledupar').trim().slice(0, 100),
+          Number(latitude) || 10.4631,
+          Number(longitude) || -73.2532,
+          shouldBeDefault,
+        ]
+      );
+      await client.query('COMMIT');
+
+      const saved = rows[0];
+      res.status(201).json({
+        status: 'ok',
+        message: 'Dirección guardada con éxito',
+        address: {
+          id: String(saved.id),
+          label: saved.label,
+          address: saved.address,
+          detail: saved.detail || '',
+          barrio: saved.barrio,
+          latitude: Number(saved.latitude),
+          longitude: Number(saved.longitude),
+          isDefault: saved.is_default === true,
+        },
+      });
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      console.error('[customer_addresses] Error guardando dirección:', err);
+      res.status(500).json({ status: 'error', error: 'Error al guardar la dirección' });
+    } finally {
+      client.release();
+    }
+  });
+
+  app.put('/api/pedidos/customer/addresses/:id', authenticateCustomerToken, async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const addressId = parseInt(req.params.id, 10);
+      const customerId = req.customer.id;
+      const customerPhone = normalizePhone(req.customer.phone);
+      const { label, address, detail, barrio, latitude, longitude, isDefault } = req.body;
+
+      if (!addressId || isNaN(addressId)) {
+        return res.status(400).json({ status: 'error', error: 'ID de dirección inválido' });
+      }
+
+      await client.query('BEGIN');
+      if (isDefault === true) {
+        await client.query(
+          `UPDATE appmobile_customer_addresses 
+           SET is_default = FALSE 
+           WHERE customer_account_id = $1 OR (phone = $2 AND $2 <> '')`,
+          [customerId, customerPhone]
+        );
+      }
+
+      const { rows } = await client.query(
+        `UPDATE appmobile_customer_addresses
+         SET label = COALESCE($1, label),
+             address = COALESCE($2, address),
+             detail = COALESCE($3, detail),
+             barrio = COALESCE($4, barrio),
+             latitude = COALESCE($5, latitude),
+             longitude = COALESCE($6, longitude),
+             is_default = COALESCE($7, is_default),
+             updated_at = NOW()
+         WHERE id = $8 AND (customer_account_id = $9 OR (phone = $10 AND $10 <> ''))
+         RETURNING id, label, address, detail, barrio, latitude, longitude, is_default`,
+        [
+          label ? String(label).trim().slice(0, 50) : null,
+          address ? String(address).trim() : null,
+          detail !== undefined ? String(detail).trim().slice(0, 255) : null,
+          barrio ? String(barrio).trim().slice(0, 100) : null,
+          latitude !== undefined ? Number(latitude) : null,
+          longitude !== undefined ? Number(longitude) : null,
+          isDefault !== undefined ? isDefault === true : null,
+          addressId,
+          customerId,
+          customerPhone
+        ]
+      );
+      await client.query('COMMIT');
+
+      if (rows.length === 0) {
+        return res.status(404).json({ status: 'error', error: 'Dirección no encontrada' });
+      }
+
+      const saved = rows[0];
+      res.json({
+        status: 'ok',
+        address: {
+          id: String(saved.id),
+          label: saved.label,
+          address: saved.address,
+          detail: saved.detail || '',
+          barrio: saved.barrio,
+          latitude: Number(saved.latitude),
+          longitude: Number(saved.longitude),
+          isDefault: saved.is_default === true,
+        },
+      });
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      console.error('[customer_addresses] Error actualizando dirección:', err);
+      res.status(500).json({ status: 'error', error: 'Error al actualizar dirección' });
+    } finally {
+      client.release();
+    }
+  });
+
+  app.delete('/api/pedidos/customer/addresses/:id', authenticateCustomerToken, async (req, res) => {
+    try {
+      const addressId = parseInt(req.params.id, 10);
+      const customerId = req.customer.id;
+      const customerPhone = normalizePhone(req.customer.phone);
+
+      const result = await pool.query(
+        `DELETE FROM appmobile_customer_addresses
+         WHERE id = $1 AND (customer_account_id = $2 OR (phone = $3 AND $3 <> ''))
+         RETURNING id`,
+        [addressId, customerId, customerPhone]
+      );
+
+      if (result.rowCount === 0) {
+        return res.status(404).json({ status: 'error', error: 'Dirección no encontrada' });
+      }
+      res.json({ status: 'ok', message: 'Dirección eliminada exitosamente' });
+    } catch (err) {
+      console.error('[customer_addresses] Error eliminando dirección:', err);
+      res.status(500).json({ status: 'error', error: 'Error al eliminar dirección' });
+    }
+  });
+
+  // 13. Elegibilidad de Fidelización: Primer Domicilio Gratis
+  app.get('/api/pedidos/customer/benefits/free-delivery-eligibility', async (req, res) => {
+    try {
+      const rawPhone = req.query.phone || (req.customer && req.customer.phone);
+      const installationId = req.query.installation_id || '';
+      const phone = normalizePhone(rawPhone);
+
+      if (!phone || phone.length < 10) {
+        return res.json({ eligible: false, reason: 'Teléfono requerido para verificar elegibilidad' });
+      }
+
+      // 1. Revisar si el teléfono o instalación ya redimió el beneficio en appmobile_customer_benefits
+      const { rows: benefitRows } = await pool.query(
+        `SELECT id, status, benefit_type, redeemed_at 
+         FROM appmobile_customer_benefits
+         WHERE (phone = $1 OR (installation_id = $2 AND $2 <> ''))
+           AND status = 'REDEEMED'
+         LIMIT 1`,
+        [phone, installationId]
+      );
+      if (benefitRows.length > 0) {
+        return res.json({
+          eligible: false,
+          reason: 'Este número de teléfono o dispositivo ya utilizó su domicilio gratis de bienvenida.',
+        });
+      }
+
+      // 2. Revisar si el teléfono ya tiene pedidos históricos en pedidos_app_orders
+      const { rows: orderRows } = await pool.query(
+        `SELECT id FROM pedidos_app_orders 
+         WHERE (customer_phone = $1 OR customer_phone = $2 OR customer_phone_e164 = $3)
+           AND status NOT IN ('Cancelado')
+         LIMIT 1`,
+        [phone, phone.replace(/^57/, ''), '+' + phone]
+      );
+      if (orderRows.length > 0) {
+        return res.json({
+          eligible: false,
+          reason: 'Promoción válida exclusivamente para el primer pedido de clientes nuevos.',
+        });
+      }
+
+      return res.json({
+        eligible: true,
+        coupon_code: 'DOMIAPP',
+        benefit_title: '🎁 Domicilio Gratis de Bienvenida',
+        description: 'Válido para tu primera compra desde la App Oficial Distric House.',
+      });
+    } catch (err) {
+      console.error('[customer_benefits] Error verificando elegibilidad:', err);
+      res.status(500).json({ eligible: false, error: 'Error al verificar elegibilidad' });
+    }
+  });
+
+  // 14. Telemetría de Dispositivos e Instalación de la App
+  app.post('/api/pedidos/customer/telemetry/device-open', async (req, res) => {
+    try {
+      const { device_id, platform, app_version, device_model, phone } = req.body;
+      if (!device_id || typeof device_id !== 'string') {
+        return res.status(400).json({ status: 'error', error: 'device_id requerido' });
+      }
+
+      const cleanPhone = phone ? normalizePhone(phone) : null;
+      await pool.query(
+        `INSERT INTO appmobile_device_telemetry (device_id, platform, app_version, device_model, phone, first_open_at, last_open_at, open_count)
+         VALUES ($1, $2, $3, $4, $5, NOW(), NOW(), 1)
+         ON CONFLICT (device_id) DO UPDATE SET
+           platform = COALESCE(EXCLUDED.platform, appmobile_device_telemetry.platform),
+           app_version = COALESCE(EXCLUDED.app_version, appmobile_device_telemetry.app_version),
+           device_model = COALESCE(EXCLUDED.device_model, appmobile_device_telemetry.device_model),
+           phone = COALESCE(EXCLUDED.phone, appmobile_device_telemetry.phone),
+           last_open_at = NOW(),
+           open_count = appmobile_device_telemetry.open_count + 1`,
+        [
+          device_id.trim().slice(0, 120),
+          (platform || 'android').trim().slice(0, 20),
+          (app_version || '1.0.0').trim().slice(0, 50),
+          (device_model || '').trim().slice(0, 100),
+          cleanPhone
+        ]
+      );
+
+      res.json({ status: 'ok', recorded: true });
+    } catch (err) {
+      console.error('[customer_telemetry] Error registrando apertura:', err);
+      res.status(500).json({ status: 'error', error: 'Error registrando telemetría' });
+    }
+  });
+
   return { authenticateCustomerToken };
 };
