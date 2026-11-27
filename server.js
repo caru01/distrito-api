@@ -1556,13 +1556,13 @@ app.post('/api/pedidos/checkout', checkoutLimiter, async (req, res) => {
 
       if (rawSrc) {
         const s = String(rawSrc).toLowerCase().trim();
+        if (s.includes('whatsapp')) return 'WhatsApp';
         // Si el cliente pide APP, verificar si es nativo o user-agent móvil
-        if (s === 'app' || s === 'mobile' || s.includes('app') || s.includes('movil') || s.includes('móvil')) {
+        if (s === 'app' || s === 'mobile' || s.startsWith('app') || s.includes('movil') || s.includes('móvil')) {
           const ua = String(req.headers['user-agent'] || '').toLowerCase();
           const isMobilePlatform = clientPlatform === 'android' || clientPlatform === 'ios' || ua.includes('capacitor') || ua.includes('android') || ua.includes('iphone') || ua.includes('ipad');
           return isMobilePlatform ? 'APP' : 'Web';
         }
-        if (s.includes('whatsapp')) return 'WhatsApp';
         if (s === 'mostrador' || s === 'presencial') return 'Mostrador';
         if (s.includes('tel') || s === 'telefono') return 'Teléfono';
         if (s === 'web') return 'Web';
@@ -3513,7 +3513,7 @@ app.put('/api/pedidos/admin/orders/:id/edit', authenticateToken, requirePermissi
           let src = req.body.source || customer.source || currentOrder.source || 'Web';
           if (src === 'WhatsApp CRM' || String(src).toLowerCase().includes('whatsapp')) return 'WhatsApp';
           const s = String(src).toLowerCase().trim();
-          if (s === 'app' || s === 'mobile' || s.includes('app') || s.includes('movil') || s.includes('móvil')) return 'APP';
+          if (s === 'app' || s === 'mobile' || s.startsWith('app') || s.includes('movil') || s.includes('móvil')) return 'APP';
           if (s === 'mostrador' || s === 'presencial') return 'Mostrador';
           if (s.includes('tel') || s === 'telefono') return 'Teléfono';
           if (s === 'web') return 'Web';
