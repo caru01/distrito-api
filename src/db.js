@@ -23,18 +23,23 @@ function normalizedConnectionString(connectionString) {
   return url.toString();
 }
 
+const PROD_HOST_SIGNATURES = [
+  'ep-round-lake-at22joot',
+  'ep-winter-darkness-b4bnsal3',
+  'neon.tech',
+];
+
 function validateDatabaseEnvironment(connectionString) {
-  const isTestMode = process.env.NODE_ENV === 'test' || process.env.DATABASE_ENV === 'test' || process.env.ENV_FILE === '.env.test';
+  const isTestMode = process.env.NODE_ENV === 'test' || process.env.DATABASE_ENV === 'test' || process.env.ENV_FILE === '.env.test' || process.argv.some(a => a.includes('test'));
   try {
     const url = new URL(connectionString);
     const host = url.hostname;
-    const PROD_HOST_SIGNATURE = 'ep-round-lake-at22joot';
 
-    if (isTestMode && host.includes(PROD_HOST_SIGNATURE)) {
-      console.error('\n🚨 [FATAL ERROR] DATABASE ENVIRONMENT MISMATCH!');
-      console.error('El servidor está en MODO TEST pero detectó la base de datos de PRODUCCIÓN: ' + host);
-      console.error('Deteniendo el proceso para proteger los datos de producción.\n');
-      throw new Error('DATABASE ENVIRONMENT MISMATCH: Intento de conectar entorno de pruebas a producción.');
+    if (isTestMode && PROD_HOST_SIGNATURES.some(sig => host.includes(sig)) && process.env.ALLOW_PROD_TESTS !== 'true') {
+      console.error('\n🚨 [PROTECCIÓN DE PRODUCCIÓN ACTIVA]');
+      console.error('Se detectó intento de ejecutar pruebas en la base de datos de PRODUCCIÓN: ' + host);
+      console.error('Para proteger la numeración consecutiva de pedidos reales, use: npm run test:contracts\n');
+      throw new Error('DATABASE ENVIRONMENT MISMATCH: Bloqueado para proteger el consecutivo de pedidos de producción.');
     }
   } catch (e) {
     if (e.message.includes('MISMATCH')) throw e;

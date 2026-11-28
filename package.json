@@ -11,6 +11,7 @@
     "db:analyze": "node scripts/analyze-db.js",
     "db:prune": "node scripts/prune-delivery-locations.js",
     "db:prune-delivery": "node scripts/prune-delivery-locations.js",
+    "test:contracts": "node --test test/source.contract.test.js test/order-messages.test.js test/order-rules.test.js",
     "test": "node --test test/schema.contract.test.js test/source.contract.test.js test/order-messages.test.js test/database.flows.test.js test/order-rules.test.js test/delivery-domain.test.js test/delivery-concurrency.test.js test/delivery-http.e2e.test.js test/crm-domain.test.js test/crm-database.test.js test/crm-http.e2e.test.js test/print-agent.test.js"
   },
   "dependencies": {
