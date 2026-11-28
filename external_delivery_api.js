@@ -102,7 +102,9 @@ function buildDriverDeliveryMessage(fullOrder) {
   const totalFmt = '$' + Number(fullOrder.total || 0).toLocaleString('es-CO');
   const changeInfo = fullOrder.change_required ? `\n🔄 *Cambio para:* $${Number(fullOrder.change_required).toLocaleString('es-CO')}` : '';
   const detailInfo = [fullOrder.delivery_apartment ? `Apto: ${fullOrder.delivery_apartment}` : '', fullOrder.delivery_tower ? `Torre: ${fullOrder.delivery_tower}` : '', fullOrder.delivery_floor ? `Piso: ${fullOrder.delivery_floor}` : ''].filter(Boolean).join(' · ');
-  const addressStr = `${fullOrder.address || ''}${fullOrder.barrio ? `, ${fullOrder.barrio}` : ''}`;
+  const address = (fullOrder.address || 'No registrada').toString().trim();
+  const barrio = (fullOrder.barrio || '').toString().trim();
+  const reference = (fullOrder.delivery_reference || fullOrder.reference || fullOrder.deliveryReference || '').toString().trim();
 
   return `🛵 *NUEVO DOMICILIO ASIGNADO*
 🏠 *Distric House*
@@ -110,15 +112,15 @@ function buildDriverDeliveryMessage(fullOrder) {
 📋 *Pedido:* #${orderNum}
 👤 *Cliente:* ${fullOrder.customer_name || 'Cliente'}
 📱 *Teléfono:* ${fullOrder.customer_phone || 'No registrado'}
-📍 *Dirección:* ${addressStr}
-${detailInfo ? `🏢 *Detalle:* ${detailInfo}\n` : ''}
+📍 *Dirección:* ${address}
+${barrio ? `🏘️ *Barrio:* ${barrio}\n` : ''}${reference ? `📌 *Referencia:* ${reference}\n` : ''}${detailInfo ? `🏢 *Detalle:* ${detailInfo}\n` : ''}
 🍔 *PRODUCTOS A ENTREGAR:*
 ${itemsList || ' • Ver en factura física'}
 
 💰 *DATOS DE COBRO:*
 💵 *Total a cobrar:* ${totalFmt}
 💳 *Método de pago:* ${fullOrder.payment_method || 'Efectivo'}${changeInfo}
-${fullOrder.notes ? `📝 *Observaciones:* ${fullOrder.notes}\n` : ''}━━━━━━━━━━━━━━━━━━
+${fullOrder.notes ? `📝 *Observaciones:* ${fullOrder.notes}\n` : ''}${fullOrder.external_delivery_notes ? `📌 *Observación logística:* ${fullOrder.external_delivery_notes}\n` : ''}━━━━━━━━━━━━━━━━━━
 ¡Conduce con precaución! 🛵💨`;
 }
 
